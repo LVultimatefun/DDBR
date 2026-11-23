@@ -1,0 +1,211 @@
+schema_version: "1.0"
+version: 1
+categories:
+  - idle
+  - failure_recovery
+  - inefficiency
+  - failure
+  - necessary_skill
+  - terminal
+  - unknown
+
+labels:
+  - id: boundary_idle
+    name: Boundary Idle
+    category: idle
+    status: active
+    version: 1
+    default_training_role: badcase
+    default_splice_policy: cut_clean
+    collector_ui:
+      title: Leading or Trailing Idle
+      hint: Full-scene stationary waiting period before manipulation begins or after the task has completely finished.
+    vlm_semantics:
+      definition: Preparation stillness at the very start of the episode before task execution begins, or trailing global stillness after completion and arm retraction.
+      counter_examples:
+        - Brief mid-task pause while aligning a part with a target slot
+        - One arm steadily holding an object while the other arm manipulates it
+      visual_cues:
+        - Both arms, end-effectors, and manipulated objects show virtually zero displacement
+        - Occurs at the very beginning or very end of the trajectory with no active task progression
+
+  - id: mid_idle_freeze
+    name: Mid-Episode Freeze
+    category: idle
+    status: active
+    version: 1
+    default_training_role: badcase
+    default_splice_policy: cut_clean
+    collector_ui:
+      title: Mid-Task Freeze or Stall
+      hint: Both arms freeze rigidly mid-task without advancing the subtask or performing fine alignment.
+    vlm_semantics:
+      definition: Abnormal stall in the middle of task execution where both arms remain motionless or hovering without advancing the subtask or making fine adjustments.
+      counter_examples:
+        - Slow, deliberate alignment during insertion or precision contact (precision_fine_adjust)
+        - One hand stably holding an object to support the other hand (bimanual_assist_hold)
+      visual_cues:
+        - Multiple consecutive frames show zero visible movement of wrists, fingers, and target objects
+        - Motion resumes only after the freeze (splice safety is verified downstream by the guardrail)
+
+  - id: missed_grasp_retry
+    name: Missed Grasp Retry
+    category: failure_recovery
+    status: active
+    version: 1
+    default_training_role: recovery
+    default_splice_policy: mask_loss
+    collector_ui:
+      title: Missed Grasp or Re-Grasp Retry
+      hint: Gripper closes on empty space or nudges the object off target, then opens, retreats, and attempts to grasp again.
+    vlm_semantics:
+      definition: The hand approaches and closes on the target object without securing it (whiffing or knocking it aside), then re-opens, retracts, and re-aligns to grasp again.
+      counter_examples:
+        - Clean single-pass approach and stable grasp on the first attempt
+        - Minor in-hand re-positioning without releasing and re-approaching
+      visual_cues:
+        - Fingers close without lifting the target object or push it off position
+        - Hand opens, pulls back, and reaches toward the same object again
+
+  - id: object_slip_recovery
+    name: Object Slip Recovery
+    category: failure_recovery
+    status: active
+    version: 1
+    default_training_role: recovery
+    default_splice_policy: mask_loss
+    collector_ui:
+      title: Object Slip or Drop Recovery
+      hint: A grasped object slips, tips, or drops from the hand, and the robot recovers it to continue the task.
+    vlm_semantics:
+      definition: An already-grasped or transported object noticeably slips, tilts, or drops, and the robot executes a corrective action to re-grasp or right it and continue.
+      counter_examples:
+        - Object drops out of reach and causes unrecovered task failure (label as terminal_failure)
+        - Object remains securely held without slipping
+      visual_cues:
+        - Object abruptly slides downward, tilts, or falls out of the gripper
+        - Arm immediately chases, re-grasps, or rights the object and resumes task progression
+
+  - id: placement_redo
+    name: Placement Redo
+    category: failure_recovery
+    status: active
+    version: 1
+    default_training_role: recovery
+    default_splice_policy: mask_loss
+    collector_ui:
+      title: Misaligned Placement or Insertion Redo
+      hint: Object fails to seat or lands crooked during placement/insertion, requiring pull-back and re-alignment.
+    vlm_semantics:
+      definition: An attempt to insert an object into a slot/container, place a lid, or set it at the target fails or lands misaligned, requiring clear withdrawal and a repeated attempt.
+      counter_examples:
+        - Continuous monotonic insertion or small twisting adjustment completed in one pass (precision_fine_adjust)
+      visual_cues:
+        - Object catches on a rim/edge or rests crookedly outside the target
+        - Arm clearly withdraws upward or backward before attempting placement or insertion again
+
+  - id: hesitation_oscillation
+    name: Hesitation Oscillation
+    category: inefficiency
+    status: active
+    version: 1
+    default_training_role: badcase
+    default_splice_policy: mask_loss
+    collector_ui:
+      title: Hesitation or Aimless Oscillation
+      hint: Repeated back-and-forth probing, circling, or jitter without monotonic progress toward the subtask.
+    vlm_semantics:
+      definition: Arm or hand oscillates repeatedly, hovers in circles, or probes back and forth without making substantive forward progress on the current subtask.
+      counter_examples:
+        - Intentional repetitive task motions such as wiping a surface or stirring
+        - Small monotonic micro-adjustments directly before insertion
+      visual_cues:
+        - End-effector repeatedly approaches and retreats or sways while object state makes no progress
+        - Clearly distinct from task-required periodic motions
+
+  - id: collision_or_knock
+    name: Collision or Knock
+    category: failure
+    status: active
+    version: 1
+    default_training_role: badcase
+    default_splice_policy: mask_loss
+    collector_ui:
+      title: Unintended Collision or Knock
+      hint: Arm or held object accidentally strikes a bystander object, container, or table fixture, shifting or knocking it over.
+    vlm_semantics:
+      definition: The robot arm, hand, or held object unintentionally collides with the tabletop, non-target containers, or fixtures, visibly displacing, shaking, or toppling them.
+      counter_examples:
+        - Intentional contact with the target object or pressing an active fixture
+      visual_cues:
+        - Non-target container or nearby object visibly shifts, bounces, or tips upon impact
+        - Arm visibly catches or recoils at the moment of contact
+
+  - id: precision_fine_adjust
+    name: Precision Fine Adjust
+    category: necessary_skill
+    status: active
+    version: 1
+    default_training_role: necessary
+    default_splice_policy: keep_positive
+    collector_ui:
+      title: Precision Fine Adjustment (Positive Skill)
+      hint: Slow, careful, monotonically converging alignment for tight insertions, small objects, or delicate mating.
+    vlm_semantics:
+      definition: Slow, cautious, yet effective and monotonically converging fine-alignment phase for tight insertions, small-object grasping, or delicate assembly; a high-value positive skill.
+      counter_examples:
+        - Clear withdrawal and retry after a failed attempt (placement_redo)
+        - Aimless swaying without convergence (hesitation_oscillation)
+      visual_cues:
+        - Motion is slow but directionally consistent as the object converges onto the target pose
+
+  - id: bimanual_assist_hold
+    name: Bimanual Assist Hold
+    category: necessary_skill
+    status: active
+    version: 1
+    default_training_role: necessary
+    default_splice_policy: keep_positive
+    collector_ui:
+      title: Bimanual Stabilizing Hold (Positive Skill)
+      hint: One hand stably holds or braces an object or container while the other hand actively manipulates it.
+    vlm_semantics:
+      definition: In bimanual coordination, one hand steadily holds, presses, or braces the target object or container, appearing stationary while providing essential physical support for the active arm.
+      counter_examples:
+        - Both hands simultaneously idle away from task objects (mid_idle_freeze)
+      visual_cues:
+        - One hand maintains firm stabilizing contact while the opposite hand pulls, inserts, or manipulates
+
+  - id: terminal_failure
+    name: Terminal Failure
+    category: terminal
+    status: active
+    version: 1
+    default_training_role: terminal_fail
+    default_splice_policy: mask_loss
+    collector_ui:
+      title: Unrecoverable Terminal Failure
+      hint: Severe mistake (dropped out of workspace, spilled/tipped container, jammed tool) that leaves the episode failed.
+    vlm_semantics:
+      definition: Severe unrecovered mistake causing the overall episode to fail, such as dropping a key object off the table, spilling/toppling a container, jamming a tool, or ending incomplete.
+      counter_examples:
+        - Object slips and is promptly recovered to finish the task (object_slip_recovery)
+      visual_cues:
+        - Target container topples, key object falls out of reach, or episode terminates in an irreversible failed state
+
+  - id: unknown_anomaly
+    name: Unknown Anomaly
+    category: unknown
+    status: active
+    version: 1
+    default_training_role: badcase
+    default_splice_policy: mask_loss
+    collector_ui:
+      title: Other Unknown Anomaly
+      hint: Clearly abnormal stall, occlusion, or unexpected behavior not covered by any existing label.
+    vlm_semantics:
+      definition: Visually unmistakable manipulation anomaly, environmental interference, or hardware fault that does not fit any active label and should be triaged in VLM Lab.
+      counter_examples:
+        - Normal slow task execution
+      visual_cues:
+        - Undefined manipulation error, severe unexpected camera occlusion, or atypical fault; explain in unknown_note

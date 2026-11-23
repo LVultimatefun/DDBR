@@ -1,0 +1,99 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robo_vlm_qc"
+version = "0.1.0"
+description = "VLM-native embodied trajectory quality control, dual-role human review, and multi-format robotics data platform"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "robo_vlm_qc Contributors" },
+]
+requires-python = ">=3.12"
+keywords = [
+    "robotics",
+    "embodied-ai",
+    "vlm",
+    "quality-control",
+    "imitation-learning",
+    "lerobot",
+    "dataset-curation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "pydantic>=2.10,<3.0",
+    "pyyaml>=6.0",
+    "click>=8.1",
+    "rich>=13.0",
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "h5py>=3.11",
+    "pyarrow>=16.0",
+    "pandas>=2.2",
+    "opencv-python>=4.10",
+    "pillow>=11.0",
+    "imageio>=2.35",
+    "imageio-ffmpeg>=0.5",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "python-multipart>=0.0.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/LVultimatefun/DDBR"
+Repository = "https://github.com/LVultimatefun/DDBR"
+Documentation = "https://github.com/LVultimatefun/DDBR/tree/main/docs"
+Issues = "https://github.com/LVultimatefun/DDBR/issues"
+
+[project.scripts]
+robo-vlm-qc = "robo_vlm_qc.cli:main"
+
+[tool.setuptools]
+packages = [
+    "robo_vlm_qc",
+    "robo_vlm_qc.api",
+    "robo_vlm_qc.api.routers",
+    "robo_vlm_qc.export",
+    "robo_vlm_qc.guardrail",
+    "robo_vlm_qc.io",
+    "robo_vlm_qc.lab",
+    "robo_vlm_qc.models",
+    "robo_vlm_qc.store",
+    "robo_vlm_qc.vlm",
+    "robo_vlm_qc._bundled_configs",
+]
+
+[tool.setuptools.package-dir]
+robo_vlm_qc = "robo_vlm_qc"
+"robo_vlm_qc._bundled_configs" = "configs"
+
+[tool.setuptools.package-data]
+"robo_vlm_qc._bundled_configs" = [
+    "*.yaml",
+    "prompts/*.yaml",
+    "tasks/*.yaml",
+    "presets/*.yaml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

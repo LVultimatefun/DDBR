@@ -1,0 +1,17 @@
+task_id: _default
+version: "1.0.0"
+match: []
+aliases: []
+title: General Manipulation Task
+description: Fallback quality-control specification when no task-specific template matches.
+goal: Safely and reliably complete the intended tabletop or mobile manipulation task.
+criteria:
+  - Target object reaches the intended goal state or placement.
+  - No unrecovered drops or damage occur, and robot arms return to a safe or completed pose.
+steps:
+  - Approach and grasp the target object or tool.
+  - Transport, align, and execute the core manipulation step.
+  - Complete placement or handover and retract the arms safely.
+task_prompt: |
+  No task-specific template is matched. Use open-vocabulary recognition to identify the actively manipulated objects and containers, and objectively describe actions and final completion state.
+grounding_objects: []

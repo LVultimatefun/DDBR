@@ -1,0 +1,24 @@
+# Preset: Alibaba Cloud DashScope (Qwen-VL)
+# Copy to <workspace>/configs_override/default.yaml to activate.
+vlm:
+  provider: "openai_compat"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key_env: "DASHSCOPE_API_KEY"
+  key_file: ".env"
+  thinking_mode: "dashscope"
+  stage_models:
+    s1_grounding: "qwen-vl-max"
+    s2_macro: "qwen-vl-max"
+    s3_discover: "qwen-vl-max"
+    s4_verify: "qwen-vl-max"
+    s5_success: "qwen-vl-max"
+  s1_grounding:
+    thinking: true
+  s2_macro:
+    thinking: true
+  s3_discover:
+    thinking: true
+  s4_verify:
+    thinking: true
+  s5_success:
+    thinking: true

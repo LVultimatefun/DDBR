@@ -1,0 +1,148 @@
+schema_version: "1.0"
+
+vlm:
+  provider: "openai_compat"          # openai_compat | gemini
+  base_url: "https://api.openai.com/v1"
+  api_key_env: "OPENAI_API_KEY"
+  key_file: ".env"                   # searched in workspace -> cwd -> repo_root
+  thinking_mode: "auto"              # auto | dashscope | disabled
+  timeout_s: 180.0
+  retries: 3
+  retry_min_wait_s: 1.0
+  retry_max_wait_s: 16.0
+  concurrency: 32                    # global parallel VLM API requests
+  episode_concurrency: 4
+  decode_concurrency: 6
+  input_mode: "interleaved"
+
+  # Stage-level heterogeneous model routing
+  stage_models:
+    s1_grounding: "gpt-4o"
+    s2_macro: "gpt-4o"
+    s3_discover: "gpt-4o"
+    s4_verify: "gpt-4o"
+    s5_success: "gpt-4o"
+
+  # Dynamic duration token budget
+  budget:
+    tokens_per_second: 5000          # ceil(duration_s * 5000)
+    min_episode_tokens: 200000
+    max_tokens_per_episode: null     # null = dynamic scaling without fixed cap; int = hard cap
+    unlimited: false
+
+  s1_grounding:
+    enabled: true
+    interval_s: 2.5
+    max_keyframes: 36
+    hard_max_keyframes: 72
+    ego_height: 540
+    jpeg_quality: 80
+    ref_width: 1280
+    ref_height: 720
+    min_box_px: 12
+    thinking: false
+    thinking_budget: 768
+    max_tokens: 800
+    static_container_min_frames: 5
+    static_jitter_tol_px_1280: 85.0
+
+  s2_macro:
+    interval_s: 2.0
+    max_frames: 48
+    long_episode_threshold_s: 96.0
+    long_episode_max_frames: 64
+    cell_w: 320
+    cell_h: 180
+    quality: 70
+    thinking: false
+    thinking_budget: 1536
+    max_tokens: 4096
+
+  s3_discover:
+    window_s: 16.0
+    window_stride_s: 12.0
+    window_step_s: 0.8
+    cell_w: 360
+    cell_h: 202
+    quality: 72
+    thinking: false
+    thinking_budget: 1536
+    max_tokens: 3200
+    few_shot_top_k: 4
+    few_shot_max_tokens: 4000
+
+  s4_verify:
+    merge_thinking_budget: 1536
+    merge_max_tokens: 6144
+    refine_margin_s: 1.5
+    refine_step_s: 0.5
+    refine_max_frames: 18
+    cell_w: 384
+    cell_h: 216
+    quality: 76
+    thinking: false
+    refine_thinking_budget: 1280
+    refine_max_tokens: 1536
+
+  s5_success:
+    enabled: true
+    tail_s: 10.0
+    body_frames: 14
+    tail_frames: 11
+    control_ratio: 0.30
+    control_frames: 10
+    cell_w: 360
+    cell_h: 202
+    quality: 74
+    thinking: false
+    thinking_budget: 1024
+    max_tokens: 1536
+
+io:
+  target_fps: 30.0
+  h5:
+    hand_mapping:
+      left: "hand_a"
+      right: "hand_b"
+    min_invalid_gap_s: 0.5           # real-timestamp gap >= this marks force valid_mask False
+    camera_roles:
+      main: "head_rgbd"
+      front: "torso_rgbd"
+      wide: "head_stereo_left"
+      wide_right: "head_stereo_right"
+  video_dir:
+    default_fps: 30.0
+    camera_roles:
+      main: "main"
+
+guardrail:
+  splice_gate:
+    search_margin_s: 1.0             # [t_start+-1.0s, t_end+-1.0s]
+    boundary_edge_tol_s: 0.5         # boundary_idle within this of 0 or duration_s passes directly
+    max_pos_jump_m: 0.02             # 2.0 cm
+    max_rot_jump_rad: 0.10           # 0.10 rad
+    max_hand_jump_rad: 0.30          # 0.30 rad
+    max_torso_jump_rad: 0.05         # 0.05 rad
+    max_chassis_pos_jump_m: 0.02     # 2.0 cm
+    max_chassis_yaw_jump_rad: 0.05   # 0.05 rad
+    max_other_arm_disp_m: 0.03       # 3.0 cm (bimanual coupling limit)
+  hallucination:
+    enabled: true
+    idle_arm_disp_m: 0.15            # >15 cm monotonic motion on both arms contradicts idle_freeze
+  visual_gate:
+    min_crop_ssim: 0.85
+    max_l1_diff: 0.12
+
+review:
+  claim_ttl_s: 120.0
+  min_watch_coverage: 0.95
+  require_confirmed_success: true
+
+export:
+  robot_type: "bimanual_robot"
+  mode: "pieces"
+  chunk_size: null
+  min_piece_s: 0.1
+  tail_frames: null
+  smooth_tail: "on_jump"             # on_jump | always | never
+  lerobot_v3_max_file_mb: 100

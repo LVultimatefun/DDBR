@@ -1,0 +1,24 @@
+# Preset: OpenAI (gpt-4o)
+# Copy to <workspace>/configs_override/default.yaml to activate.
+vlm:
+  provider: "openai_compat"
+  base_url: "https://api.openai.com/v1"
+  api_key_env: "OPENAI_API_KEY"
+  key_file: ".env"
+  thinking_mode: "disabled"
+  stage_models:
+    s1_grounding: "gpt-4o"
+    s2_macro: "gpt-4o"
+    s3_discover: "gpt-4o"
+    s4_verify: "gpt-4o"
+    s5_success: "gpt-4o"
+  s1_grounding:
+    thinking: false
+  s2_macro:
+    thinking: false
+  s3_discover:
+    thinking: false
+  s4_verify:
+    thinking: false
+  s5_success:
+    thinking: false

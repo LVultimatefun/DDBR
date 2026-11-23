@@ -1,0 +1,40 @@
+task_id: bimanual_handover
+version: "1.0.0"
+match:
+  - "*bimanual_handover*"
+  - "*handover*"
+  - "*bimanual*"
+aliases:
+  - handover
+  - bimanual handover
+  - two_arm_handover
+title: Bimanual Object Handover
+description: Pick up an object with one arm, transfer it cleanly to the opposite arm in mid-air or over the workspace, and place it onto the target tray.
+goal: Coordinate both arms to pick up the object, complete a stable bimanual handover without dropping, and place the object onto the destination tray.
+criteria:
+  - First arm grasps and presents the object stably to the receiving arm.
+  - Receiving arm establishes a secure grasp before the donor arm releases, with no unrecovered drop.
+  - Object is placed stably onto the target tray and both arms clear the target area.
+steps:
+  - Donor arm approaches and grasps the object from the source tray.
+  - Both arms converge toward the central handover zone.
+  - Receiving arm grasps the object while donor arm stabilizes and then releases.
+  - Receiving arm transports and places the object onto the target tray.
+task_prompt: |
+  Pay close attention to bimanual coordination during the transfer: one arm holding steadily while the other grasps is a positive bimanual_assist_hold, whereas dropping or fumbling during release is object_slip_recovery or terminal_failure.
+grounding_objects:
+  - id: handover_object
+    name: Handover Object
+    desc: Object transferred between left and right arms
+    tag_pos: top
+    is_static: false
+  - id: source_tray
+    name: Source Tray
+    desc: Starting tray or zone where the object originates
+    tag_pos: bottom
+    is_static: true
+  - id: target_tray
+    name: Target Tray
+    desc: Destination tray where the receiving arm places the object
+    tag_pos: bottom
+    is_static: true

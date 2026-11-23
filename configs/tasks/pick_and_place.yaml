@@ -1,0 +1,35 @@
+task_id: pick_and_place
+version: "1.0.0"
+match:
+  - "*pick_and_place*"
+  - "*pick-and-place*"
+  - "*pick_place*"
+aliases:
+  - pick_place
+  - pick and place
+  - tabletop_pick_and_place
+title: Tabletop Pick and Place
+description: Pick a target object from the workspace and place it cleanly inside the target bin or tray.
+goal: Grasp the target object cleanly, transport it over the target bin, release it stably inside, and retract the arm.
+criteria:
+  - Target object is lifted cleanly from its starting position without knocking over surrounding items.
+  - Target object rests stably inside the target bin or designated drop zone at the end of the episode.
+  - Gripper releases the object and retracts cleanly without dragging or dislodging it.
+steps:
+  - Reach toward and align gripper with the target object.
+  - Grasp and lift the target object clear of the tabletop.
+  - Move the object over the target bin and lower it into place.
+  - Release the object and retract the arm to a clear pose.
+task_prompt: |
+  Focus on grasp contact quality at lift-off, mid-air slip during transport, and whether the object lands cleanly inside the target bin after release.
+grounding_objects:
+  - id: target_object
+    name: Target Object
+    desc: Primary object being picked up and placed
+    tag_pos: top
+    is_static: false
+  - id: target_bin
+    name: Target Bin
+    desc: Destination bin, tray, or marked placement zone on the table
+    tag_pos: bottom
+    is_static: true

@@ -1,0 +1,16 @@
+stage: "s2_macro"
+version: "1.0.0"
+description: "Stage 2 macro task backbone stages and dual-arm state timeline"
+system_template: |
+  You are an embodied robot teleoperation task segmentation expert.
+  Inspect the full trajectory's multi-view 2x2 composite keyframes, partition the episode into contiguous macro subtask stages (macro_stages),
+  and summarize both left-arm and right-arm state timelines (arm_timelines; states must be one of idle|work|hold|anom|mask|good).
+  Output strict JSON only: {"macro_stages": [{"stage_id": "S1", "t_start": float, "t_end": float, "label": str, "label_en": str, "summary": str}], "arm_timelines": {"left": [{"t_start": float, "t_end": float, "state": "idle|work|hold|anom|mask|good", "desc": str}], "right": [{"t_start": float, "t_end": float, "state": "idle|work|hold|anom|mask|good", "desc": str}]}}.
+user_template: |
+  Task: {{ task_id }} (duration {{ duration_s }}s)
+  Goal: {{ task_goal }}
+  Reference steps:
+  {{ expected_steps }}
+  Camera layout: {{ camera_layout_desc }}
+  Task guidance: {{ task_prompt }}
+  Segment the macro stages observed in the video (stage_id such as S1/S2/..., covering 0.0s to {{ duration_s }}s) and annotate both arm timelines.
