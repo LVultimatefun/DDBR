@@ -18,6 +18,7 @@ demo_data/
 *.h5
 *.hdf5
 *.mp4
+!docs/assets/*.mp4
 *.mov
 *.mkv
 *.avi

@@ -1,68 +1,128 @@
-# `robo_vlm_qc`
+<p align="center">
+  <img src="docs/assets/hero_banner.svg" alt="DDBR / robo_vlm_qc — 原生 VLM 具身轨迹质检与多格式数据平台" width="100%" />
+</p>
 
-**原生 VLM 具身轨迹质检、双角色人工审核与多格式机器人数据平台**
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache 2.0" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.12%2B-3776ab.svg" alt="Python 3.12+" /></a>
+  <a href="web/package.json"><img src="https://img.shields.io/badge/Node-22%2B-339933.svg" alt="Node 22+" /></a>
+  <a href="https://github.com/LVultimatefun/DDBR/actions/workflows/ci.yml"><img src="https://github.com/LVultimatefun/DDBR/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="docs/architecture.md"><img src="https://img.shields.io/badge/I%2FO-3--In_%C3%97_4--Out-0ea5e9.svg" alt="3-In x 4-Out" /></a>
+</p>
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
-[![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen.svg)](web/package.json)
-[![CI](https://github.com/LVultimatefun/DDBR/actions/workflows/ci.yml/badge.svg)](https://github.com/LVultimatefun/DDBR/actions/workflows/ci.yml)
-
-[English](README.md) | 简体中文
+<p align="center">
+  <a href="README.md">English</a> · <strong>简体中文</strong>
+  &nbsp;|&nbsp;
+  <a href="#演示视频效果展示">演示视频</a> ·
+  <a href="#web-studio-界面一览">Web Studio</a> ·
+  <a href="#系统架构">系统架构</a> ·
+  <a href="#30-秒合成-demo-快速体验">快速体验</a> ·
+  <a href="#docker-一键部署">Docker 部署</a>
+</p>
 
 ---
 
-`robo_vlm_qc` 是一个独立、跨构型的具身操作轨迹质检与训练数据策展平台。平台彻底摒弃脆弱的 30 Hz 运动学规则阈值检测器，采用**因果多阶段视觉语言模型（VLM）DAG** 结合**轻量级切段安全护栏**、**统一双角色 Web Studio（`Reviewer` 与 `Lead`）**、**纯上下文（In-Context）`VLM Lab` 迭代闭环**（**不包含任何 VLM SFT/DPO/LoRA 微调导出**），以及可插拔的 **3-In × 4-Out** 数据 I/O 架构。
+**DDBR（`robo_vlm_qc`）** — *Don't Describe Before Rule* — 是一个独立、跨构型的具身操作轨迹质检与训练数据策展平台。平台彻底摒弃脆弱的 30 Hz 运动学规则阈值检测器，采用**因果多阶段视觉语言模型（VLM）DAG** 结合**轻量级切段安全护栏**、**统一双角色 NLE Web Studio（`Reviewer` 与 `Lead`）**、**纯上下文（In-Context）`VLM Lab` 迭代闭环**（**不包含任何 VLM SFT/DPO/LoRA 微调导出**），以及可插拔的 **3-In × 4-Out** 数据 I/O 内核。
+
+---
+
+## 演示视频效果展示
+
+以下演示视频直接由本平台 `robo-vlm-qc render-mp4`（`viz_mp4` 1080p@30fps Studio HUD 渲染器）基于开源 HuggingFace LeRobot ALOHA 双臂多相机数据集（[`lerobot/aloha_static_cups_open`](https://huggingface.co/datasets/lerobot/aloha_static_cups_open) 与 [`lerobot/aloha_static_pro_pencil`](https://huggingface.co/datasets/lerobot/aloha_static_pro_pencil)）生成。
+
+### 1. 双臂协同开杯盖（`aloha_static_cups_open`）— `cut_clean` · `mask_loss` · `keep_positive`
+
+<p align="center">
+  <a href="docs/assets/demo_aloha_cups_hud.mp4">
+    <img src="docs/assets/demo_aloha_cups_hud.gif" alt="DDBR Studio HUD 演示 — ALOHA 双臂开杯盖" width="100%" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/demo_aloha_cups_hud.mp4"><strong>观看 / 下载完整 720p@30fps MP4（825 KB）</strong></a> ·
+  展示 <code>HEAD + L-WRIST + R-WRIST</code> 多视角画中画、实时 2D 目标定位框、起始 <code>boundary_idle</code>（<code>cut_clean</code> 闭环切除）、右臂 <code>missed_grasp_retry</code>（紫色斜线 <code>mask_loss</code> 掩码）、正向 <code>bimanual_assist_hold</code>（<code>keep_positive</code> 保护）以及终态完成标准实时核验。
+</p>
+
+### 2. 双臂空中交接（`aloha_static_pro_pencil`）— 正向精细动作保护与 GT 冻结
+
+<p align="center">
+  <a href="docs/assets/demo_aloha_handover_hud.mp4">
+    <img src="docs/assets/demo_aloha_handover_hud.gif" alt="DDBR Studio HUD 演示 — ALOHA 双臂空中交接" width="100%" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/demo_aloha_handover_hud.mp4"><strong>观看 / 下载完整 720p@30fps MP4（741 KB）</strong></a> ·
+  展示精准优先（Precision-First）主干保护对慢速收敛双臂交接动作（<code>precision_fine_adjust</code> → <code>keep_positive</code>）的无误删保护、四轨同步时间轴与 <code>GT_FROZEN (HUMAN REVIEWED)</code> 基准状态。
+</p>
+
+---
+
+## Web Studio 界面一览
+
+单一 FastAPI + React 19 + TypeScript + Vite 单页应用同时服务 `Reviewer` 与 `Lead` 双角色，内置深浅双主题、SSE 实时异步任务流与严格三层人工编辑（`qc_segments`、`success`、`macro_stages`）：
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/assets/studio_review_dark.png">
+        <img src="docs/assets/studio_review_dark.png" alt="双角色 NLE 审核 Studio（深色主题）" width="100%" />
+      </a>
+      <br />
+      <strong>双角色 NLE 审核 Studio（深色）</strong> — 多视角 PiP 同步播放、交互式 2D Grounding 叠加画布、起止帧 SSIM 切段安全实时核验与四轨时间轴。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/assets/studio_vlm_lab.png">
+        <img src="docs/assets/studio_vlm_lab.png" alt="VLM Lab 纯上下文迭代闭环" width="100%" />
+      </a>
+      <br />
+      <strong>VLM Lab（纯上下文迭代闭环）</strong> — 6 桶错因诊断、2×2 视觉错题本 Few-Shot 管理、未知异常归类、版本化配置 Diff/回滚与 GT 回归评测沙盒。
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/assets/studio_queue_light.png">
+        <img src="docs/assets/studio_queue_light.png" alt="审核队列与批量编排（浅色主题）" width="100%" />
+      </a>
+      <br />
+      <strong>任务队列与批量编排（浅色）</strong> — 支持深浅双主题切换、SQLite 认领租约锁、剪切/掩码占比统计、多维筛选与只读目录接入。
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/assets/studio_export.png">
+        <img src="docs/assets/studio_export.png" alt="4-Out 事务型导出中心" width="100%" />
+      </a>
+      <br />
+      <strong>4-Out 事务型导出中心</strong> — 基于原子 <code>_staging → rename</code> 支持 <code>lerobot_v3</code>、<code>h5_clean</code>、<code>zero_copy_index</code>、<code>viz_mp4</code> 四种格式与三种训练配方。
+    </td>
+  </tr>
+</table>
+
+---
+
+## 系统架构
+
+<p align="center">
+  <img src="docs/assets/architecture_overview.svg" alt="DDBR / robo_vlm_qc 系统架构总览" width="100%" />
+</p>
+
+### 因果 VLM DAG、`StageCache` 隔离与三策略护栏漏斗
+
+<p align="center">
+  <img src="docs/assets/vlm_dag_guardrail.svg" alt="因果 VLM DAG 缓存隔离与三策略切段护栏漏斗" width="100%" />
+</p>
+
+完整架构设计决策（D1–D8）、Pydantic v2 数据契约、SQLite WAL 表结构、缓存键隔离公式与导出器协议请参阅 [`docs/architecture.md`](docs/architecture.md)。
 
 ---
 
 ## 核心特性
 
-- **3-In 可插拔只读 I/O 内核（[`robo_vlm_qc/io/`](robo_vlm_qc/io/)）**：严格只读接入 3 种内置 `InputAdapter`（`h5_raw_v3`、`lerobot` v2/v3、`video_dir` 纯视频无运动学模式），抽象统一 `MediaSource` 与可选 `KinematicsTrack`，并支持按相机角色自适应拼图（`wrist_2x2`、`torso_head_2x2`、`single_1x2`）。
-- **因果 VLM DAG 与轻量护栏（[`robo_vlm_qc/vlm/`](robo_vlm_qc/vlm/)、[`robo_vlm_qc/guardrail/`](robo_vlm_qc/guardrail/)）**：基于 `httpx` 的多提供商 `VlmClient`（OpenAI 兼容接口、DashScope、Gemini、本地 vLLM），支持按阶段路由模型、动态时长 Token 预算、内容寻址 `StageCache`（`stage_cache/<sha256[:2]>/<sha256>.json`），以及三级并发 DAG：`S0 → S1 → (S2 ∥ S5) → S3 → S4A → S4B → Guardrail → Store`。轻量护栏（`hallucination`、`splice_gate`、`visual_gate`）不主动产生标签，仅在切段跳变超限时将不安全的 `cut_clean` 自动降级为 `mask_loss`。
+- **3-In 可插拔只读 I/O 内核（[`robo_vlm_qc/io/`](robo_vlm_qc/io/)）**：严格只读接入 `h5_raw_v3`（5 流 30 Hz 同步、Slerp、触觉断帧修复、SBS 立体裁切）、`lerobot`（v2/v3 Parquet + MP4）及 `video_dir`（纯视频 `kinematics=None`），支持按相机角色自适应拼图（`wrist_2x2`、`torso_head_2x2`、`single_1x2`）。
+- **因果 VLM DAG 与轻量护栏（[`robo_vlm_qc/vlm/`](robo_vlm_qc/vlm/)、[`robo_vlm_qc/guardrail/`](robo_vlm_qc/guardrail/)）**：基于 `httpx` 的多提供商 `VlmClient`（OpenAI 兼容接口、DashScope、Gemini、本地 vLLM），支持按阶段路由模型、动态时长 Token 预算、内容寻址 `StageCache`，以及三级并发 DAG `S0 → S1 → (S2 ∥ S5) → S3 → S4A → S4B`。轻量护栏（`hallucination`、`splice_gate`、`visual_gate`）不主动产生标签，仅在切段跳变超限时将不安全的 `cut_clean` 自动降级为 `mask_loss`。
 - **11 个纯视觉核心标签（[`configs/labels.yaml`](configs/labels.yaml)）**：纯视觉语义分类与切段策略解耦，配合精准优先（Precision-First）阶段提示词（[`configs/prompts/`](configs/prompts/)）与通用任务模板（[`configs/tasks/`](configs/tasks/)）。
 - **单一真相存储（[`robo_vlm_qc/store/`](robo_vlm_qc/store/)）**：由 Pydantic v2 强类型契约（`VlmRunArtifact`、`HumanReviewArtifact`、`ResolvedEpisode`）驱动，底层采用 SQLite WAL（`robo_vlm_qc.db`）、不可变 JSON 制品（`artifacts/`）以及 `.history/` 配置变更快照。
-- **统一双角色 Studio（[`robo_vlm_qc/api/`](robo_vlm_qc/api/)、[`web/src/`](web/src/)）**：单个 FastAPI + React 19 + TypeScript + Vite 单页应用同时服务 `Reviewer` 与 `Lead`，共用同一套 `StudioPlayer`（2D Grounding 叠加画布）和 `FourTrackTimeline`。人工编辑严格限定在 3 个可编辑层（`qc_segments`、`success`、`macro_stages`），`arm_timelines`、`grounding` 与 `raw_vlm_segments` 始终保持只读。
-- **`VLM Lab` 纯上下文迭代闭环（[`robo_vlm_qc/lab/`](robo_vlm_qc/lab/)）**：自动化 6 桶错因诊断（`VLM 原始输出 vs 人工 GT`）、一键 2×2 视觉/文本错题本 Few-Shot 注入 S3/S4、未知异常归类（`merge` 合并 / `promote` 晋升新标签）、带 `.history/` 差异对比与回滚的版本化配置热更新、辅助 Prompt 改写建议（`prompt_assist`），以及 100% 复用 S1/S2/S5 缓存的 GT 回归评测沙盒（**严格纯 In-Context，零 VLM SFT/DPO/LoRA 微调导出**）。
+- **`VLM Lab` 纯上下文迭代闭环（[`robo_vlm_qc/lab/`](robo_vlm_qc/lab/)）**：自动化 6 桶错因诊断（`VLM 原始输出 vs 人工 GT`）、一键 2×2 视觉/文本错题本 Few-Shot 注入 S3/S4、未知异常归类（`merge` / `promote`）、`.history/` 差异对比与一键回滚、辅助 Prompt 改写建议（`prompt_assist`），以及 100% 复用 S1/S2/S5 缓存的 GT 回归评测沙盒（**严格纯 In-Context，零 VLM SFT/DPO/LoRA 微调导出**）。
 - **4-Out 事务型导出器（[`robo_vlm_qc/export/`](robo_vlm_qc/export/)）**：共享 `PieceSlicer`（Smoothstep + SO(3) 测地线尾段平滑、`is_tail`、`action_loss_mask`、`subtask_index`、标准 81 维运动学布局）与原子 `_staging → rename` 导出器（`lerobot_v3`、`h5_clean`、`zero_copy_index`、`viz_mp4`），支持 3 种训练配方（`bc_clean`、`recovery_plus`、`badcase_pairs`）。
-
----
-
-## 系统架构概览
-
-```mermaid
-flowchart LR
-    subgraph IN["3-In 只读数据源"]
-        I1["h5_raw_v3 (.h5)"]
-        I2["lerobot (v2/v3)"]
-        I3["video_dir (MP4)"]
-    end
-
-    subgraph CORE["因果 VLM DAG 与存储"]
-        DAG["S1 Grounding -> S2||S5 -> S3 Discover -> S4 Verify"]
-        GRD["轻量安全护栏 (splice_gate / visual_gate)"]
-        DB["SQLite WAL + 不可变制品 + StageCache"]
-    end
-
-    subgraph UI["统一双角色 Studio 与 VLM Lab"]
-        STUDIO["Reviewer & Lead Studio (三层人工编辑)"]
-        LAB["VLM Lab 纯上下文闭环 (诊断 / Few-Shot / GT 评测)"]
-    end
-
-    subgraph OUT["4-Out 事务型导出"]
-        O1["lerobot_v3"]
-        O2["h5_clean"]
-        O3["zero_copy_index"]
-        O4["viz_mp4 (1080p HUD)"]
-    end
-
-    I1 & I2 & I3 --> DAG --> GRD --> DB
-    DB <--> STUDIO
-    STUDIO --> LAB
-    LAB -- "上下文规则与 Few-Shot" --> DAG
-    DB --> O1 & O2 & O3 & O4
-```
-
-完整系统设计、Pydantic 模型定义、缓存隔离策略与导出协议请参阅 [`docs/architecture.md`](docs/architecture.md)。
 
 ---
 
@@ -109,8 +169,6 @@ robo-vlm-qc -w ./workspace serve --no-auth
 ## 完整 VLM 质检与导出流程
 
 ### 1. 配置密钥与模型预设
-
-复制 [`.env.example`](.env.example) 为 `.env` 并填写对应 API Key：
 
 ```bash
 cp .env.example .env
@@ -193,10 +251,10 @@ docker compose up --build
 
 ## 文档与社区
 
-- **[`docs/architecture.md`](docs/architecture.md)** — 系统架构决策、Mermaid 拓扑/DAG/状态机图示、Pydantic v2 与 SQLite WAL 表结构、`StageCache` 隔离、护栏阈值与导出协议。
+- **[`docs/architecture.md`](docs/architecture.md)** — 系统架构决策、可视化架构图、Pydantic v2 与 SQLite WAL 表结构、`StageCache` 隔离、护栏阈值与导出协议。
 - **[`docs/operations.md`](docs/operations.md)** — 完整 CLI 手册、YAML 配置与提供商预设、FastAPI REST/SSE 与 RBAC 契约、双角色 Studio 与 `VLM Lab` 操作指南。
 - **[`AGENTS.md`](AGENTS.md)** — 仓库模块索引、开发/测试/构建工具链、数据安全与架构红线及文档同步规范。
 - **[`CONTRIBUTING.md`](CONTRIBUTING.md)** — 贡献指南、测试流程与 PR 检查清单。
 - **[`SECURITY.md`](SECURITY.md)** — 安全漏洞报告流程与部署加固建议。
 - **[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)** — 社区行为准则（Contributor Covenant v2.1）。
-- **[`LICENSE`](LICENSE)** — Apache License 2.0（`Copyright 2026 robo_vlm_qc Contributors`）。
+- **[`LICENSE`](LICENSE)** — Apache License 2.0。

@@ -24,44 +24,58 @@
 
 ### 2.1 End-to-End 3-In × DAG × Store × Studio × Lab × 4-Out Pipeline
 
+<p align="center">
+  <img src="assets/architecture_overview.svg" alt="DDBR / robo_vlm_qc System Architecture Overview" width="100%" />
+</p>
+
+<details>
+<summary>View editable Mermaid source diagram</summary>
+
 ```mermaid
 flowchart TB
+    classDef source fill:#0c4a6e,stroke:#38bdf8,stroke-width:1.5px,color:#e0f2fe
+    classDef io fill:#0f172a,stroke:#38bdf8,stroke-width:1.5px,color:#bae6fd
+    classDef vlm fill:#1e1b4b,stroke:#818cf8,stroke-width:1.5px,color:#e0e7ff
+    classDef store fill:#064e3b,stroke:#34d399,stroke-width:1.5px,color:#d1fae5
+    classDef studio fill:#3b0764,stroke:#c084fc,stroke-width:1.5px,color:#f3e8ff
+    classDef exp fill:#78350f,stroke:#fbbf24,stroke-width:1.5px,color:#fef3c7
+
     subgraph RO["Strict Read-Only Sources"]
-        I1["h5_raw_v3 (.h5)"]
-        I2["lerobot (v2/v3 Parquet + MP4)"]
-        I3["video_dir (Multi-Cam MP4, kinematics=None)"]
+        I1["h5_raw_v3 (.h5)"]:::source
+        I2["lerobot (v2/v3 Parquet + MP4)"]:::source
+        I3["video_dir (Multi-Cam MP4, kinematics=None)"]:::source
     end
 
     subgraph IO["3-In Pluggable I/O Kernel (robo_vlm_qc/io/)"]
-        REG_IN["InputAdapter Registry"]
-        VIEW["EpisodeView (EpisodeMeta + MediaSource + Optional KinematicsTrack)"]
-        TILER["Adaptive 2x2 / 1x2 Tile Composer"]
+        REG_IN["InputAdapter Registry"]:::io
+        VIEW["EpisodeView (EpisodeMeta + MediaSource + Optional KinematicsTrack)"]:::io
+        TILER["Adaptive 2x2 / 1x2 Tile Composer"]:::io
     end
 
     subgraph VLM["Causal VLM Engine & Guardrails (vlm/ + guardrail/)"]
-        CACHE["StageCache (stage_cache/prefix/sha256.json)"]
-        DAG["VlmDag: S0 -> S1 -> (S2 || S5) -> S3 -> S4A -> S4B"]
-        GUARD["Light Guardrails (splice_gate + hallucination | visual_gate)"]
+        CACHE["StageCache (stage_cache/prefix/sha256.json)"]:::vlm
+        DAG["VlmDag: S0 -> S1 -> (S2 || S5) -> S3 -> S4A -> S4B"]:::vlm
+        GUARD["Light Guardrails (splice_gate + hallucination | visual_gate)"]:::vlm
     end
 
     subgraph STORE["Single-Truth Store (store/)"]
-        DB["SQLite WAL (robo_vlm_qc.db: 6 tables + claim leases)"]
-        ART["Immutable JSON Artifacts (vlm_runs / reviews / few_shots / previews)"]
-        HIST[".history/ Config Snapshots + configs_override/"]
+        DB["SQLite WAL (robo_vlm_qc.db: 6 tables + claim leases)"]:::store
+        ART["Immutable JSON Artifacts (vlm_runs / reviews / few_shots / previews)"]:::store
+        HIST[".history/ Config Snapshots + configs_override/"]:::store
     end
 
     subgraph STUDIO["Unified Dual-Role Studio & VLM Lab (api/ + web/ + lab/)"]
-        REV["Reviewer View (Claim, Watch >=95%, Edit 3 Layers, Submit/Flag)"]
-        LEAD["Lead View (DiffOverlay, Arbitrate, Approve, Freeze GT)"]
-        LAB["VLM Lab In-Context Loop (Diagnosis, 2x2 Few-Shot, Unknown Triage, GT Eval)"]
+        REV["Reviewer View (Claim, Watch >=95%, Edit 3 Layers, Submit/Flag)"]:::studio
+        LEAD["Lead View (DiffOverlay, Arbitrate, Approve, Freeze GT)"]:::studio
+        LAB["VLM Lab In-Context Loop (Diagnosis, 2x2 Few-Shot, Unknown Triage, GT Eval)"]:::studio
     end
 
     subgraph EXPORT["4-Out Transactional Exporters (export/)"]
-        SLICER["PieceSlicer (3 recipes, Smoothstep+SO(3) tail, 81-D, Loss Mask, Subtasks)"]
-        O1["lerobot_v3 (_staging -> rename)"]
-        O2["h5_clean (_staging -> rename)"]
-        O3["zero_copy_index (_staging -> rename)"]
-        O4["viz_mp4 (1920x1080@30fps Studio HUD)"]
+        SLICER["PieceSlicer (3 recipes, Smoothstep+SO(3) tail, 81-D, Loss Mask, Subtasks)"]:::exp
+        O1["lerobot_v3 (_staging -> rename)"]:::exp
+        O2["h5_clean (_staging -> rename)"]:::exp
+        O3["zero_copy_index (_staging -> rename)"]:::exp
+        O4["viz_mp4 (1920x1080@30fps Studio HUD)"]:::exp
     end
 
     I1 & I2 & I3 --> REG_IN --> VIEW --> TILER
@@ -78,33 +92,54 @@ flowchart TB
     SLICER --> O1 & O2 & O3 & O4
 ```
 
-### 2.2 Causal VLM DAG Execution Topology
+</details>
+
+### 2.2 Causal VLM DAG Execution Topology & Guardrail Funnel
+
+<p align="center">
+  <img src="assets/vlm_dag_guardrail.svg" alt="Causal VLM DAG StageCache Isolation and Three-Policy Guardrail Funnel" width="100%" />
+</p>
+
+<details>
+<summary>View editable Mermaid source diagram</summary>
 
 ```mermaid
 flowchart LR
-    S0["S0: Open EpisodeView & Adaptive Layout"] --> S1["S1: 2D Grounding (0..1000 + Static Container Median)"]
-    S1 --> S2["S2: Macro Backbone (macro_stages + L/R arm_timelines)"]
-    S1 --> S5["S5: Dense-Tail Success + 30% Anti-FP Control Check"]
-    S2 --> S3["S3: Sliding-Window QC Discovery (S2 Protected + Precision-First + Few-Shot)"]
-    S3 --> S4A["S4A: Global Deduplication & Merge"]
-    S4A --> S4B["S4B: 0.5s Start-vs-End CoV Diff Refinement"]
-    S4B --> GRD["Guardrails: hallucination + splice_gate | visual_gate"]
-    S2 & S5 & GRD --> OUT["Persist VlmRunArtifact + SQLite Index"]
+    classDef cached fill:#064e3b,stroke:#34d399,stroke-width:1.5px,color:#d1fae5
+    classDef iter fill:#1e1b4b,stroke:#818cf8,stroke-width:1.5px,color:#e0e7ff
+    classDef guard fill:#78350f,stroke:#fbbf24,stroke-width:1.5px,color:#fef3c7
+
+    S0["S0: Open EpisodeView & Adaptive Layout"]:::cached --> S1["S1: 2D Grounding (0..1000 + Static Container Median)"]:::cached
+    S1 --> S2["S2: Macro Backbone (macro_stages + L/R arm_timelines)"]:::cached
+    S1 --> S5["S5: Dense-Tail Success + 30% Anti-FP Control Check"]:::cached
+    S2 --> S3["S3: Sliding-Window QC Discovery (S2 Protected + Precision-First + Few-Shot)"]:::iter
+    S3 --> S4A["S4A: Global Deduplication & Merge"]:::iter
+    S4A --> S4B["S4B: 0.5s Start-vs-End CoV Diff Refinement"]:::iter
+    S4B --> GRD["Guardrails: hallucination + splice_gate | visual_gate"]:::guard
+    S2 & S5 & GRD --> OUT["Persist VlmRunArtifact + SQLite Index"]:::cached
 ```
+
+</details>
 
 ### 2.3 Episode Status State Machine (`EpisodeStatus`)
 
 ```mermaid
 flowchart TB
-    ING["ingested (Scanned from read-only source)"]
-    QUE["vlm_queued (Batch job queued)"]
-    RUN["vlm_running (DAG executing)"]
-    RDY["vlm_ready (VLM + Guardrail complete)"]
-    CLM["claimed (SQLite lease lock, TTL=120s)"]
-    REV["reviewed (Reviewer submitted 3-layer edits)"]
-    FLG["flagged (Reviewer flagged issue / unknown)"]
-    APP["approved (Lead approved)"]
-    GTF["gt_frozen (Immutable GT benchmark)"]
+    classDef neutral fill:#1e293b,stroke:#64748b,stroke-width:1.5px,color:#f1f5f9
+    classDef active fill:#0c4a6e,stroke:#38bdf8,stroke-width:1.5px,color:#e0f2fe
+    classDef warn fill:#78350f,stroke:#f59e0b,stroke-width:1.5px,color:#fef3c7
+    classDef good fill:#064e3b,stroke:#10b981,stroke-width:1.5px,color:#d1fae5
+    classDef frozen fill:#3b0764,stroke:#c084fc,stroke-width:1.5px,color:#f3e8ff
+
+    ING["ingested (Scanned from read-only source)"]:::neutral
+    QUE["vlm_queued (Batch job queued)"]:::neutral
+    RUN["vlm_running (DAG executing)"]:::active
+    RDY["vlm_ready (VLM + Guardrail complete)"]:::active
+    CLM["claimed (SQLite lease lock, TTL=120s)"]:::warn
+    REV["reviewed (Reviewer submitted 3-layer edits)"]:::active
+    FLG["flagged (Reviewer flagged issue / unknown)"]:::warn
+    APP["approved (Lead approved)"]:::good
+    GTF["gt_frozen (Immutable GT benchmark)"]:::frozen
 
     ING -- "batch_vlm / run-vlm" --> QUE
     ING -- "run-vlm direct" --> RUN
