@@ -1,0 +1,997 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Lock, Plus, Scissors, ShieldAlert, ShieldCheck } from "lucide-react";
+import type {
+  ArmState,
+  ArmTimelines,
+  MacroStage,
+  QcSegment,
+  SplicePolicy,
+  WatchCoverage,
+} from "../api/types";
+import { computeUnwatchedIntervals } from "../stores/reviewHistoryStore";
+
+export interface StageSpanUpdate {
+  stageId: string;
+  tStart: number;
+  tEnd: number;
+}
+
+export interface FourTrackTimelineProps {
+  durationS: number;
+  currentTime: number;
+  macroStages: MacroStage[];
+  armTimelines: ArmTimelines;
+  qcSegments: QcSegment[];
+  rawVlmSegments?: QcSegment[];
+  watchCoverage?: WatchCoverage;
+  showDiffTrack?: boolean;
+  readOnly?: boolean;
+  selectedSegmentId: string | null;
+  selectedStageId: string | null;
+  onSeek: (tS: number) => void;
+  onSelectSegment: (segId: string | null) => void;
+  onSelectStage: (stageId: string | null) => void;
+  onAddSegment: () => void;
+  onAddMacroStage: () => void;
+  onCreateSegmentSpan?: (tStart: number, tEnd: number) => void;
+  onSplitMacroStage?: () => void;
+  onUpdateSegmentSpan?: (segId: string, tStart: number, tEnd: number) => void;
+  onUpdateStageSpan?: (stageId: string, tStart: number, tEnd: number) => void;
+  onUpdateStageSpans?: (updates: StageSpanUpdate[]) => void;
+}
+
+type ActiveDrag =
+  | {
+      kind: "segment";
+      segId: string;
+      edge: "left" | "right";
+      tStart: number;
+      tEnd: number;
+      origStart: number;
+      origEnd: number;
+    }
+  | {
+      kind: "stage";
+      stageId: string;
+      edge: "left" | "right";
+      tStart: number;
+      tEnd: number;
+      origStart: number;
+      origEnd: number;
+      neighbor?: {
+        stageId: string;
+        tStart: number;
+        tEnd: number;
+        origStart: number;
+        origEnd: number;
+        linked: boolean;
+      };
+    }
+  | {
+      kind: "brush";
+      anchorT: number;
+      tStart: number;
+      tEnd: number;
+    };
+
+const ARM_STATE_COLORS: Record<ArmState, string> = {
+  idle: "#64748b",
+  work: "#2563eb",
+  hold: "#0d9488",
+  anom: "#ef4444",
+  mask: "#f59e0b",
+  good: "#16a34a",
+};
+
+const POLICY_CLASS: Record<SplicePolicy, string> = {
+  keep_positive: "seg-keep",
+  mask_loss: "seg-mask",
+  cut_clean: "seg-cut",
+};
+
+const MIN_SPAN_S = 0.1;
+const MAGNETIC_GAP_S = 0.05;
+const MIN_BRUSH_SPAN_S = 0.2;
+
+function pct(t: number, durationS: number): number {
+  if (durationS <= 0) return 0;
+  return Math.max(0, Math.min(100, (t / durationS) * 100));
+}
+
+function roundTime(t: number): number {
+  return Number(t.toFixed(2));
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function rgbCss(rgb: [number, number, number]): string {
+  return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+}
+
+function clientXToTime(clientX: number, targetEl: HTMLElement | null, durationS: number): number {
+  if (!targetEl || durationS <= 0) return 0;
+  const rect = targetEl.getBoundingClientRect();
+  if (rect.width <= 0) return 0;
+  const ratio = clamp((clientX - rect.left) / rect.width, 0, 1);
+  return Number((ratio * durationS).toFixed(3));
+}
+
+export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
+  durationS,
+  currentTime,
+  macroStages,
+  armTimelines,
+  qcSegments,
+  rawVlmSegments = [],
+  watchCoverage,
+  showDiffTrack = false,
+  readOnly = false,
+  selectedSegmentId,
+  selectedStageId,
+  onSeek,
+  onSelectSegment,
+  onSelectStage,
+  onAddSegment,
+  onAddMacroStage,
+  onCreateSegmentSpan,
+  onSplitMacroStage,
+  onUpdateSegmentSpan,
+  onUpdateStageSpan,
+  onUpdateStageSpans,
+}) => {
+  const [zoom, setZoom] = useState<number>(1);
+  const [activeDrag, setActiveDrag] = useState<ActiveDrag | null>(null);
+
+  const rulerRef = useRef<HTMLDivElement | null>(null);
+  const macroLaneRef = useRef<HTMLDivElement | null>(null);
+  const qcLaneRef = useRef<HTMLDivElement | null>(null);
+  const rafIdRef = useRef<number | null>(null);
+  const pendingSeekRef = useRef<number | null>(null);
+  const suppressClickRef = useRef<boolean>(false);
+  const cleanupDragListenersRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      cleanupDragListenersRef.current?.();
+      if (rafIdRef.current !== null) {
+        window.cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+    };
+  }, []);
+
+  const scheduleSeek = (tS: number) => {
+    pendingSeekRef.current = tS;
+    if (rafIdRef.current !== null) return;
+    rafIdRef.current = window.requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      if (pendingSeekRef.current !== null) {
+        const nextT = pendingSeekRef.current;
+        pendingSeekRef.current = null;
+        onSeek(nextT);
+      }
+    });
+  };
+
+  const flushSeek = (tS: number) => {
+    if (rafIdRef.current !== null) {
+      window.cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    pendingSeekRef.current = null;
+    onSeek(tS);
+  };
+
+  const markSuppressNextClick = () => {
+    suppressClickRef.current = true;
+    window.setTimeout(() => {
+      suppressClickRef.current = false;
+    }, 0);
+  };
+
+  const ticks = useMemo(() => {
+    const count = Math.max(4, Math.min(16, Math.ceil(durationS / 5) + 1));
+    const arr: number[] = [];
+    for (let i = 0; i <= count; i += 1) {
+      arr.push((durationS * i) / count);
+    }
+    return arr;
+  }, [durationS]);
+
+  const watchedIntervals = watchCoverage?.watched_intervals ?? [];
+  const unwatchedGaps = useMemo(
+    () => computeUnwatchedIntervals(watchedIntervals, durationS),
+    [watchedIntervals, durationS],
+  );
+
+  const canSplitStage = useMemo(
+    () =>
+      !readOnly &&
+      macroStages.some(
+        (st) => currentTime >= st.t_start + MIN_SPAN_S && currentTime <= st.t_end - MIN_SPAN_S,
+      ),
+    [currentTime, macroStages, readOnly],
+  );
+
+  const seekFromClientX = (clientX: number, targetEl: HTMLElement | null) => {
+    if (!targetEl || durationS <= 0) return;
+    onSeek(clientXToTime(clientX, targetEl, durationS));
+  };
+
+  const startSegmentEdgeDrag = (
+    e: React.PointerEvent<HTMLDivElement>,
+    seg: QcSegment,
+    edge: "left" | "right",
+  ) => {
+    if (readOnly || e.button !== 0 || !onUpdateSegmentSpan) return;
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+    } catch {
+      // jsdom does not implement pointer capture
+    }
+    onSelectSegment(seg.seg_id);
+    onSelectStage(null);
+
+    let latest: Extract<ActiveDrag, { kind: "segment" }> = {
+      kind: "segment",
+      segId: seg.seg_id,
+      edge,
+      tStart: seg.t_start,
+      tEnd: seg.t_end,
+      origStart: seg.t_start,
+      origEnd: seg.t_end,
+    };
+    setActiveDrag(latest);
+
+    const onMove = (ev: PointerEvent) => {
+      const t = clientXToTime(ev.clientX, qcLaneRef.current, durationS);
+      if (edge === "left") {
+        const nextStart = clamp(t, 0, Math.max(0, latest.origEnd - MIN_SPAN_S));
+        latest = { ...latest, tStart: nextStart, tEnd: latest.origEnd };
+        setActiveDrag({ ...latest });
+        scheduleSeek(nextStart);
+      } else {
+        const nextEnd = clamp(t, Math.min(durationS, latest.origStart + MIN_SPAN_S), durationS);
+        latest = { ...latest, tStart: latest.origStart, tEnd: nextEnd };
+        setActiveDrag({ ...latest });
+        scheduleSeek(nextEnd);
+      }
+    };
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      cleanupDragListenersRef.current = null;
+    };
+
+    const onUp = () => {
+      cleanup();
+      setActiveDrag(null);
+      markSuppressNextClick();
+      const finalEdge = latest.edge === "left" ? latest.tStart : latest.tEnd;
+      flushSeek(finalEdge);
+      const changed =
+        Math.abs(latest.tStart - latest.origStart) > 1e-4 ||
+        Math.abs(latest.tEnd - latest.origEnd) > 1e-4;
+      if (changed) {
+        onUpdateSegmentSpan(seg.seg_id, roundTime(latest.tStart), roundTime(latest.tEnd));
+      }
+    };
+
+    cleanupDragListenersRef.current?.();
+    cleanupDragListenersRef.current = cleanup;
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  };
+
+  const startStageEdgeDrag = (
+    e: React.PointerEvent<HTMLDivElement>,
+    stage: MacroStage,
+    edge: "left" | "right",
+  ) => {
+    if (readOnly || e.button !== 0 || (!onUpdateStageSpan && !onUpdateStageSpans)) return;
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+    } catch {
+      // jsdom does not implement pointer capture
+    }
+    onSelectStage(stage.stage_id);
+    onSelectSegment(null);
+
+    // Find magnetic neighbor touching this edge (< 0.05s gap)
+    let neighborStage: MacroStage | null = null;
+    let bestGap = MAGNETIC_GAP_S;
+    for (const candidate of macroStages) {
+      if (candidate.stage_id === stage.stage_id) continue;
+      const gap =
+        edge === "right"
+          ? Math.abs(candidate.t_start - stage.t_end)
+          : Math.abs(candidate.t_end - stage.t_start);
+      if (gap < bestGap) {
+        bestGap = gap;
+        neighborStage = candidate;
+      }
+    }
+
+    let latest: Extract<ActiveDrag, { kind: "stage" }> = {
+      kind: "stage",
+      stageId: stage.stage_id,
+      edge,
+      tStart: stage.t_start,
+      tEnd: stage.t_end,
+      origStart: stage.t_start,
+      origEnd: stage.t_end,
+      neighbor: neighborStage
+        ? {
+            stageId: neighborStage.stage_id,
+            tStart: neighborStage.t_start,
+            tEnd: neighborStage.t_end,
+            origStart: neighborStage.t_start,
+            origEnd: neighborStage.t_end,
+            linked: !e.altKey,
+          }
+        : undefined,
+    };
+    setActiveDrag(latest);
+
+    const onMove = (ev: PointerEvent) => {
+      const t = clientXToTime(ev.clientX, macroLaneRef.current, durationS);
+      const linked = Boolean(latest.neighbor) && !ev.altKey;
+
+      if (edge === "right") {
+        const maxEnd =
+          linked && latest.neighbor
+            ? Math.min(durationS, latest.neighbor.origEnd - MIN_SPAN_S)
+            : durationS;
+        const nextEnd = clamp(t, Math.min(maxEnd, latest.origStart + MIN_SPAN_S), maxEnd);
+        latest = {
+          ...latest,
+          tStart: latest.origStart,
+          tEnd: nextEnd,
+          neighbor: latest.neighbor
+            ? {
+                ...latest.neighbor,
+                linked,
+                tStart: linked ? nextEnd : latest.neighbor.origStart,
+                tEnd: latest.neighbor.origEnd,
+              }
+            : undefined,
+        };
+        setActiveDrag({ ...latest });
+        scheduleSeek(nextEnd);
+      } else {
+        const minStart =
+          linked && latest.neighbor ? Math.max(0, latest.neighbor.origStart + MIN_SPAN_S) : 0;
+        const nextStart = clamp(t, minStart, Math.max(minStart, latest.origEnd - MIN_SPAN_S));
+        latest = {
+          ...latest,
+          tStart: nextStart,
+          tEnd: latest.origEnd,
+          neighbor: latest.neighbor
+            ? {
+                ...latest.neighbor,
+                linked,
+                tStart: latest.neighbor.origStart,
+                tEnd: linked ? nextStart : latest.neighbor.origEnd,
+              }
+            : undefined,
+        };
+        setActiveDrag({ ...latest });
+        scheduleSeek(nextStart);
+      }
+    };
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      cleanupDragListenersRef.current = null;
+    };
+
+    const onUp = () => {
+      cleanup();
+      setActiveDrag(null);
+      markSuppressNextClick();
+      const finalEdge = latest.edge === "left" ? latest.tStart : latest.tEnd;
+      flushSeek(finalEdge);
+
+      const primaryChanged =
+        Math.abs(latest.tStart - latest.origStart) > 1e-4 ||
+        Math.abs(latest.tEnd - latest.origEnd) > 1e-4;
+      const neighborChanged = Boolean(
+        latest.neighbor &&
+          latest.neighbor.linked &&
+          (Math.abs(latest.neighbor.tStart - latest.neighbor.origStart) > 1e-4 ||
+            Math.abs(latest.neighbor.tEnd - latest.neighbor.origEnd) > 1e-4),
+      );
+
+      if (!primaryChanged && !neighborChanged) return;
+
+      const updates: StageSpanUpdate[] = [
+        {
+          stageId: stage.stage_id,
+          tStart: roundTime(latest.tStart),
+          tEnd: roundTime(latest.tEnd),
+        },
+      ];
+      if (neighborChanged && latest.neighbor) {
+        updates.push({
+          stageId: latest.neighbor.stageId,
+          tStart: roundTime(latest.neighbor.tStart),
+          tEnd: roundTime(latest.neighbor.tEnd),
+        });
+      }
+
+      if (updates.length > 1 && onUpdateStageSpans) {
+        onUpdateStageSpans(updates);
+      } else if (onUpdateStageSpan) {
+        onUpdateStageSpan(updates[0].stageId, updates[0].tStart, updates[0].tEnd);
+        if (updates.length > 1) {
+          onUpdateStageSpan(updates[1].stageId, updates[1].tStart, updates[1].tEnd);
+        }
+      } else if (onUpdateStageSpans) {
+        onUpdateStageSpans(updates);
+      }
+    };
+
+    cleanupDragListenersRef.current?.();
+    cleanupDragListenersRef.current = cleanup;
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  };
+
+  const startQcLaneBrush = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (readOnly || e.button !== 0 || e.target !== e.currentTarget) return;
+    e.preventDefault();
+    const laneEl = qcLaneRef.current ?? e.currentTarget;
+    const anchorT = clientXToTime(e.clientX, laneEl, durationS);
+
+    let latest: Extract<ActiveDrag, { kind: "brush" }> = {
+      kind: "brush",
+      anchorT,
+      tStart: anchorT,
+      tEnd: anchorT,
+    };
+    setActiveDrag(latest);
+
+    const onMove = (ev: PointerEvent) => {
+      const curT = clientXToTime(ev.clientX, laneEl, durationS);
+      latest = {
+        kind: "brush",
+        anchorT,
+        tStart: Math.min(anchorT, curT),
+        tEnd: Math.max(anchorT, curT),
+      };
+      setActiveDrag({ ...latest });
+      scheduleSeek(curT);
+    };
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      cleanupDragListenersRef.current = null;
+    };
+
+    const onUp = () => {
+      cleanup();
+      setActiveDrag(null);
+      markSuppressNextClick();
+      if (latest.tEnd - latest.tStart >= MIN_BRUSH_SPAN_S && onCreateSegmentSpan) {
+        const s0 = roundTime(latest.tStart);
+        const s1 = roundTime(latest.tEnd);
+        flushSeek(s0);
+        onCreateSegmentSpan(s0, s1);
+      } else {
+        flushSeek(anchorT);
+      }
+    };
+
+    cleanupDragListenersRef.current?.();
+    cleanupDragListenersRef.current = cleanup;
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  };
+
+  const getStageRenderBounds = (stage: MacroStage): { tStart: number; tEnd: number; dragging: boolean; magneticLinked: boolean } => {
+    if (activeDrag?.kind === "stage") {
+      if (activeDrag.stageId === stage.stage_id) {
+        return {
+          tStart: activeDrag.tStart,
+          tEnd: activeDrag.tEnd,
+          dragging: true,
+          magneticLinked: Boolean(activeDrag.neighbor?.linked),
+        };
+      }
+      if (activeDrag.neighbor && activeDrag.neighbor.stageId === stage.stage_id) {
+        return {
+          tStart: activeDrag.neighbor.tStart,
+          tEnd: activeDrag.neighbor.tEnd,
+          dragging: false,
+          magneticLinked: activeDrag.neighbor.linked,
+        };
+      }
+    }
+    return { tStart: stage.t_start, tEnd: stage.t_end, dragging: false, magneticLinked: false };
+  };
+
+  const getSegmentRenderBounds = (seg: QcSegment): { tStart: number; tEnd: number; dragging: boolean } => {
+    if (activeDrag?.kind === "segment" && activeDrag.segId === seg.seg_id) {
+      return { tStart: activeDrag.tStart, tEnd: activeDrag.tEnd, dragging: true };
+    }
+    return { tStart: seg.t_start, tEnd: seg.t_end, dragging: false };
+  };
+
+  const playheadLeft = `${pct(currentTime, durationS)}%`;
+
+  return (
+    <div className="four-track-timeline" data-testid="four-track-timeline">
+      <div className="timeline-toolbar">
+        <div className="timeline-title">Four-Track Synchronized Timeline</div>
+        <div className="timeline-actions">
+          {!readOnly && (
+            <>
+              {onSplitMacroStage && (
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={!canSplitStage}
+                  onClick={onSplitMacroStage}
+                  data-testid="split-macro-stage-btn"
+                  title="Split macro stage at playhead (S)"
+                >
+                  <Scissors size={13} /> Split Stage (S)
+                </button>
+              )}
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={onAddMacroStage}
+                data-testid="add-macro-stage-btn"
+              >
+                <Plus size={13} /> Add Macro Stage
+              </button>
+              <button
+                type="button"
+                className="mini-btn primary"
+                onClick={onAddSegment}
+                data-testid="add-qc-segment-btn"
+              >
+                <Plus size={13} /> Add QC Segment
+              </button>
+            </>
+          )}
+          <div className="zoom-group">
+            {[1, 2, 4].map((z) => (
+              <button
+                key={z}
+                type="button"
+                className={`zoom-btn ${zoom === z ? "active" : ""}`}
+                onClick={() => setZoom(z)}
+              >
+                {z}x
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="timeline-scroll">
+        <div className="timeline-canvas" style={{ width: `${zoom * 100}%` }}>
+          {/* Time Ruler */}
+          <div className="track-row ruler-row">
+            <div className="track-label ruler-label">Timeline</div>
+            <div
+              ref={rulerRef}
+              className="timeline-ruler"
+              onClick={(e) => seekFromClientX(e.clientX, e.currentTarget)}
+              role="slider"
+              aria-label="Playback timeline"
+              aria-valuemin={0}
+              aria-valuemax={durationS}
+              aria-valuenow={currentTime}
+            >
+              {ticks.map((t, idx) => (
+                <span
+                  key={idx}
+                  className="ruler-tick"
+                  style={{ left: `${pct(t, durationS)}%` }}
+                >
+                  {t.toFixed(1)}s
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {/* 4px Watched / Unwatched Heatmap Bar beneath Time Ruler */}
+          <div className="track-row heatmap-row" data-testid="watch-heatmap-row">
+            <div className="track-label heatmap-label">Watch Map</div>
+            <div
+              className="watch-heatmap-track"
+              data-testid="watch-heatmap-bar"
+              onClick={(e) => seekFromClientX(e.clientX, e.currentTarget)}
+              title="Teal = watched intervals, dashed red = unwatched gaps (click an unwatched gap to seek)"
+            >
+              <div className="watch-heatmap-bg" />
+              {watchedIntervals.map(([a, b], idx) => {
+                const left = pct(a, durationS);
+                const width = Math.max(0.4, pct(b, durationS) - left);
+                return (
+                  <div
+                    key={`w-${idx}`}
+                    className="heatmap-watched"
+                    data-testid={`heatmap-watched-${idx}`}
+                    style={{ left: `${left}%`, width: `${width}%` }}
+                  />
+                );
+              })}
+              {unwatchedGaps.map(([g0, g1], idx) => {
+                const left = pct(g0, durationS);
+                const width = Math.max(0.8, pct(g1, durationS) - left);
+                return (
+                  <button
+                    key={`u-${idx}`}
+                    type="button"
+                    className="heatmap-unwatched-gap"
+                    data-testid={`heatmap-unwatched-gap-${idx}`}
+                    style={{ left: `${left}%`, width: `${width}%` }}
+                    aria-label={`Jump to unwatched gap ${g0.toFixed(1)}s to ${g1.toFixed(1)}s`}
+                    title={`Unwatched gap ${g0.toFixed(1)}s–${g1.toFixed(1)}s, click to seek`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSeek(g0);
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Track 1: Macro Stages (Editable + Edge Resize + Magnetic Ripple) */}
+          <div className="track-row" data-testid="track-macro-stages">
+            <div className="track-label">
+              <span>1. Macro Stages</span>
+              <span className="track-badge editable">Editable</span>
+            </div>
+            <div
+              ref={macroLaneRef}
+              className="track-lane"
+              data-testid="macro-track-lane"
+              onClick={(e) => {
+                if (suppressClickRef.current) return;
+                if (e.target === e.currentTarget) {
+                  seekFromClientX(e.clientX, e.currentTarget);
+                }
+              }}
+            >
+              {macroStages.map((stage) => {
+                const bounds = getStageRenderBounds(stage);
+                const left = pct(bounds.tStart, durationS);
+                const width = Math.max(1.2, pct(bounds.tEnd, durationS) - left);
+                const isSelected = selectedStageId === stage.stage_id;
+                return (
+                  <div
+                    key={stage.stage_id}
+                    role="button"
+                    tabIndex={0}
+                    data-testid={`macro-stage-${stage.stage_id}`}
+                    className={`track-block macro-block nle-resizable ${isSelected ? "selected" : ""} ${bounds.dragging ? "dragging" : ""} ${bounds.magneticLinked ? "magnetic-linked" : ""}`}
+                    style={{
+                      left: `${left}%`,
+                      width: `${width}%`,
+                      backgroundColor: rgbCss(stage.color_rgb),
+                    }}
+                    title={`${stage.label} (${bounds.tStart.toFixed(2)}s - ${bounds.tEnd.toFixed(2)}s)`}
+                    onClick={(e) => {
+                      if (suppressClickRef.current) return;
+                      e.stopPropagation();
+                      onSelectStage(stage.stage_id);
+                      onSelectSegment(null);
+                      onSeek(stage.t_start);
+                    }}
+                  >
+                    {!readOnly && (onUpdateStageSpan || onUpdateStageSpans) && (
+                      <div
+                        className="resize-handle resize-handle-left"
+                        data-testid={`resize-left-stage-${stage.stage_id}`}
+                        title="Drag to adjust stage start (adjacent edges snap magnetically; hold Alt to detach)"
+                        onPointerDown={(e) => startStageEdgeDrag(e, stage, "left")}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    )}
+                    <span className="block-text">{stage.label}</span>
+                    {!readOnly && onUpdateStageSpan && isSelected && (
+                      <span className="nudge-controls">
+                        <button
+                          type="button"
+                          className="nudge-btn"
+                          title="Start -0.2s"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onUpdateStageSpan(
+                              stage.stage_id,
+                              Math.max(0, roundTime(stage.t_start - 0.2)),
+                              stage.t_end,
+                            );
+                          }}
+                        >
+                          ◀
+                        </button>
+                        <button
+                          type="button"
+                          className="nudge-btn"
+                          title="End +0.2s"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onUpdateStageSpan(
+                              stage.stage_id,
+                              stage.t_start,
+                              Math.min(durationS, roundTime(stage.t_end + 0.2)),
+                            );
+                          }}
+                        >
+                          ▶
+                        </button>
+                      </span>
+                    )}
+                    {!readOnly && (onUpdateStageSpan || onUpdateStageSpans) && (
+                      <div
+                        className="resize-handle resize-handle-right"
+                        data-testid={`resize-right-stage-${stage.stage_id}`}
+                        title="Drag to adjust stage end (adjacent edges snap magnetically; hold Alt to detach)"
+                        onPointerDown={(e) => startStageEdgeDrag(e, stage, "right")}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Track 2: Arm Timelines (Strictly READ-ONLY, zero buttons) */}
+          <div className="track-row readonly-row" data-testid="track-arm-timelines">
+            <div className="track-label">
+              <span>2. Arm States</span>
+              <span className="track-badge readonly" data-testid="arm-timelines-readonly">
+                <Lock size={11} /> Read-Only
+              </span>
+            </div>
+            <div className="track-lane dual-sublane" aria-readonly="true">
+              <div className="sublane" data-testid="arm-lane-left">
+                <span className="sublane-tag">L</span>
+                {armTimelines.left.map((span, i) => {
+                  const left = pct(span.t_start, durationS);
+                  const width = Math.max(0.8, pct(span.t_end, durationS) - left);
+                  return (
+                    <div
+                      key={`L-${i}`}
+                      className="arm-span-block"
+                      style={{
+                        left: `${left}%`,
+                        width: `${width}%`,
+                        backgroundColor: ARM_STATE_COLORS[span.state],
+                      }}
+                      title={`Left Arm [${span.state}] ${span.t_start.toFixed(2)}s-${span.t_end.toFixed(2)}s ${span.desc}`}
+                    >
+                      <span>{span.state}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="sublane" data-testid="arm-lane-right">
+                <span className="sublane-tag">R</span>
+                {armTimelines.right.map((span, i) => {
+                  const left = pct(span.t_start, durationS);
+                  const width = Math.max(0.8, pct(span.t_end, durationS) - left);
+                  return (
+                    <div
+                      key={`R-${i}`}
+                      className="arm-span-block"
+                      style={{
+                        left: `${left}%`,
+                        width: `${width}%`,
+                        backgroundColor: ARM_STATE_COLORS[span.state],
+                      }}
+                      title={`Right Arm [${span.state}] ${span.t_start.toFixed(2)}s-${span.t_end.toFixed(2)}s ${span.desc}`}
+                    >
+                      <span>{span.state}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Track 3: QC Segments (Editable + Edge Resize + Drag-to-Create Brush) */}
+          <div className="track-row" data-testid="track-qc-segments">
+            <div className="track-label">
+              <span>3. QC Segments</span>
+              <span className="track-badge editable">Editable</span>
+            </div>
+            <div
+              ref={qcLaneRef}
+              className={`track-lane ${!readOnly && onCreateSegmentSpan ? "qc-brushable" : ""}`}
+              data-testid="qc-track-lane"
+              onPointerDown={startQcLaneBrush}
+              onClick={(e) => {
+                if (suppressClickRef.current) return;
+                if (e.target === e.currentTarget) {
+                  seekFromClientX(e.clientX, e.currentTarget);
+                }
+              }}
+            >
+              {activeDrag?.kind === "brush" && activeDrag.tEnd - activeDrag.tStart >= 0.05 && (
+                <div
+                  className="qc-brush-preview"
+                  data-testid="qc-brush-preview"
+                  style={{
+                    left: `${pct(activeDrag.tStart, durationS)}%`,
+                    width: `${Math.max(0.6, pct(activeDrag.tEnd, durationS) - pct(activeDrag.tStart, durationS))}%`,
+                  }}
+                >
+                  {activeDrag.tStart.toFixed(2)}s – {activeDrag.tEnd.toFixed(2)}s
+                </div>
+              )}
+
+              {qcSegments.map((seg) => {
+                const bounds = getSegmentRenderBounds(seg);
+                const left = pct(bounds.tStart, durationS);
+                const width = Math.max(1.4, pct(bounds.tEnd, durationS) - left);
+                const isSelected = selectedSegmentId === seg.seg_id;
+                const maskCode =
+                  seg.splice_policy === "mask_loss"
+                    ? seg.mask_side === "left"
+                      ? "L"
+                      : seg.mask_side === "right"
+                        ? "R"
+                        : "LR"
+                    : null;
+
+                return (
+                  <div
+                    key={seg.seg_id}
+                    role="button"
+                    tabIndex={0}
+                    data-testid={`qc-seg-${seg.seg_id}`}
+                    className={`track-block qc-block nle-resizable ${POLICY_CLASS[seg.splice_policy]} ${isSelected ? "selected" : ""} ${bounds.dragging ? "dragging" : ""}`}
+                    style={{ left: `${left}%`, width: `${width}%` }}
+                    title={`${seg.name || seg.label_id} (${seg.splice_policy}) ${bounds.tStart.toFixed(2)}s-${bounds.tEnd.toFixed(2)}s`}
+                    onClick={(e) => {
+                      if (suppressClickRef.current) return;
+                      e.stopPropagation();
+                      onSelectSegment(seg.seg_id);
+                      onSelectStage(null);
+                      onSeek(seg.t_start);
+                    }}
+                  >
+                    {!readOnly && onUpdateSegmentSpan && (
+                      <div
+                        className="resize-handle resize-handle-left"
+                        data-testid={`resize-left-seg-${seg.seg_id}`}
+                        title="Drag to adjust segment start"
+                        onPointerDown={(e) => startSegmentEdgeDrag(e, seg, "left")}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    )}
+                    <span className="block-text">{seg.name || seg.label_id}</span>
+                    {maskCode && <span className="mask-chip">{maskCode}</span>}
+                    {seg.guardrail.downgraded && (
+                      <span
+                        className="guardrail-chip downgraded"
+                        data-testid={`guardrail-downgraded-${seg.seg_id}`}
+                        title={seg.guardrail.downgrade_reason ?? "Guardrail downgraded to mask_loss"}
+                      >
+                        <ShieldAlert size={11} /> Downgraded
+                      </span>
+                    )}
+                    {!seg.guardrail.downgraded && seg.guardrail.gate_type === "splice_gate" && (
+                      <span className="guardrail-chip passed" title="Splice guardrail passed">
+                        <ShieldCheck size={11} />
+                      </span>
+                    )}
+                    {seg.guardrail.guardrail_override && (
+                      <span
+                        className="guardrail-chip override"
+                        title={seg.guardrail.override_reason ?? "Guardrail override"}
+                      >
+                        <AlertTriangle size={11} />
+                      </span>
+                    )}
+                    {!readOnly && onUpdateSegmentSpan && isSelected && (
+                      <span className="nudge-controls">
+                        <button
+                          type="button"
+                          className="nudge-btn"
+                          title="Start -0.1s"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onUpdateSegmentSpan(
+                              seg.seg_id,
+                              Math.max(0, roundTime(seg.t_start - 0.1)),
+                              seg.t_end,
+                            );
+                          }}
+                        >
+                          ◀
+                        </button>
+                        <button
+                          type="button"
+                          className="nudge-btn"
+                          title="End +0.1s"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onUpdateSegmentSpan(
+                              seg.seg_id,
+                              seg.t_start,
+                              Math.min(durationS, roundTime(seg.t_end + 0.1)),
+                            );
+                          }}
+                        >
+                          ▶
+                        </button>
+                      </span>
+                    )}
+                    {!readOnly && onUpdateSegmentSpan && (
+                      <div
+                        className="resize-handle resize-handle-right"
+                        data-testid={`resize-right-seg-${seg.seg_id}`}
+                        title="Drag to adjust segment end"
+                        onPointerDown={(e) => startSegmentEdgeDrag(e, seg, "right")}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Track 4: Lead-only Ghost VLM Diff Track */}
+          {showDiffTrack && (
+            <div className="track-row diff-row" data-testid="track-ghost-vlm">
+              <div className="track-label">
+                <span>4. VLM Raw Ref</span>
+                <span className="track-badge readonly">
+                  <Lock size={11} /> Ghost Diff
+                </span>
+              </div>
+              <div className="track-lane">
+                {rawVlmSegments.map((seg) => {
+                  const left = pct(seg.t_start, durationS);
+                  const width = Math.max(1.2, pct(seg.t_end, durationS) - left);
+                  return (
+                    <div
+                      key={`ghost-${seg.seg_id}`}
+                      className={`track-block ghost-block ${POLICY_CLASS[seg.splice_policy]}`}
+                      style={{ left: `${left}%`, width: `${width}%` }}
+                      title={`VLM Raw: ${seg.name || seg.label_id} (${seg.splice_policy}) ${seg.t_start.toFixed(2)}-${seg.t_end.toFixed(2)}s`}
+                      onClick={() => onSeek(seg.t_start)}
+                    >
+                      <span className="block-text">VLM: {seg.name || seg.label_id}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Synchronized Playhead aligned with .track-lane */}
+          <div className="timeline-playhead-overlay">
+            <div className="timeline-playhead" style={{ left: playheadLeft }} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};

@@ -1,0 +1,26 @@
+services:
+  studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${ROBO_VLM_QC_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ROBO_VLM_QC_WEB_DIST: /app/web/dist
+    volumes:
+      - ./workspace:/workspace
+      - ./data:/data:ro
+    command:
+      - robo-vlm-qc
+      - -w
+      - /workspace
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --allowed-data-roots
+      - /data
