@@ -42,14 +42,28 @@ function upsertJobList(prev: JobStatus[], incoming: JobStatus): JobStatus[] {
 }
 
 export const JobProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { isLead, token, authProbing } = useAuth();
+  const { isLead, token, noAuth, authProbing } = useAuth();
   const { showToast } = useToast();
 
   const [jobs, setJobs] = useState<JobStatus[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const prevStatusRef = useRef<Map<string, JobStatus["status"]>>(new Map());
 
-  const canSubscribe = isLead && Boolean(token) && !authProbing;
+  const canSubscribe = isLead && (Boolean(token) || noAuth) && !authProbing;
+
+  const notifyJobCancelled = useCallback(
+    (job: JobStatus) => {
+      showToast({
+        message:
+          job.job_type === "batch_vlm"
+            ? `Job ${job.job_id} cancelled; unfinished episode statuses reverted`
+            : `Job ${job.job_id} (${job.job_type}) cancelled`,
+        variant: "warning",
+        testId: `job-cancelled-toast-${job.job_id}`,
+      });
+    },
+    [showToast],
+  );
 
   const refreshJobs = useCallback(async () => {
     if (!canSubscribe) {
@@ -108,20 +122,34 @@ export const JobProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           message: `Job ${incoming.job_id} (${incoming.job_type}) failed`,
           variant: "error",
         });
+      } else if (wasActive && incoming.status === "cancelled") {
+        notifyJobCancelled(incoming);
       }
     },
   });
 
-  const handleCancelJob = useCallback(async (jobId: string): Promise<JobStatus | null> => {
-    try {
-      const updated = await apiCancelJob(jobId);
-      prevStatusRef.current.set(updated.job_id, updated.status);
-      setJobs((prev) => upsertJobList(prev, updated));
-      return updated;
-    } catch {
-      return null;
-    }
-  }, []);
+  const handleCancelJob = useCallback(
+    async (jobId: string): Promise<JobStatus | null> => {
+      const prevStatusBeforeCall = prevStatusRef.current.get(jobId);
+      try {
+        const updated = await apiCancelJob(jobId);
+        const latestPrev = prevStatusRef.current.get(updated.job_id) ?? prevStatusBeforeCall;
+        prevStatusRef.current.set(updated.job_id, updated.status);
+        setJobs((prev) => upsertJobList(prev, updated));
+        if (updated.status === "cancelled" && latestPrev !== "cancelled") {
+          notifyJobCancelled(updated);
+        }
+        return updated;
+      } catch (err) {
+        showToast({
+          message: err instanceof Error ? `Failed to cancel job: ${err.message}` : "Failed to cancel job",
+          variant: "error",
+        });
+        return null;
+      }
+    },
+    [notifyJobCancelled, showToast],
+  );
 
   const artifactDownloadUrl = useCallback(
     (jobId: string, index = 0) => jobArtifactUrl(jobId, index, token),

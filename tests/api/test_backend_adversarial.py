@@ -181,7 +181,7 @@ def test_ieee754_edge_tol_boundary_in_vlm_and_guardrails() -> None:
 def test_dag_failed_rerun_preserves_status_and_fresh_stages_invalidates_downstream(
     tmp_path: Path,
 ) -> None:
-    """Failed VlmDag re-run restores prior status (VLM_READY/VLM_QUEUED); fresh_stages cascades downstream."""
+    """Failed VlmDag re-run restores stable status (INGESTED/VLM_READY, never stuck in VLM_QUEUED); fresh_stages cascades downstream."""
     ds_dir = tmp_path / "data" / "ds"
     _write_mp4(ds_dir / "ep0.mp4", n_frames=30, fps=30.0)
     handle = auto_detect(ds_dir)[0]
@@ -216,7 +216,7 @@ def test_dag_failed_rerun_preserves_status_and_fresh_stages_invalidates_downstre
                 dag_fail.run_episode(view, fresh=True)
             assert (
                 repo.get_episode_row(view.meta.episode_id)["status"]
-                == EpisodeStatus.VLM_QUEUED.value
+                == EpisodeStatus.INGESTED.value
             )
 
             repo.save_vlm_run_artifact(
@@ -285,18 +285,57 @@ def test_dag_failed_rerun_preserves_status_and_fresh_stages_invalidates_downstre
                     return
 
             dag_ok = VlmDag(workspace=ws, client=_OkClient(), repo=repo)  # type: ignore[arg-type]
-            dag_ok.run_episode(view, fresh=True)
+            art_warm = dag_ok.run_episode(view, fresh=True)
             seen_stages.clear()
             dag_ok.run_episode(view, fresh_stages={"s3_discover"})
             assert "s3_discover" in seen_stages
             assert any(s.startswith("s4") for s in seen_stages)
             assert "s1_grounding" not in seen_stages
             assert "s2_macro" not in seen_stages
+            assert not any(s.startswith("s5") for s in seen_stages)
 
+            # S2 still cascades downstream to S3 and S4 without re-running S1 or S5
             seen_stages.clear()
-            dag_ok.run_episode(view, fresh_stages={"s1_grounding"})
-            assert {"s1_grounding", "s2_macro", "s3_discover"}.issubset(set(seen_stages))
+            dag_ok.run_episode(view, fresh_stages={"s2_macro"})
+            assert {"s2_macro", "s3_discover"}.issubset(set(seen_stages))
             assert any(s.startswith("s4") for s in seen_stages)
+            assert "s1_grounding" not in seen_stages
+            assert not any(s.startswith("s5") for s in seen_stages)
+
+            # Refresh art_warm reference after S2 cascade (S3/S4 keys updated)
+            art_after_s2 = dag_ok.run_episode(view, fresh=False)
+
+            # S1-only rerun MUST re-run ONLY s1_grounding and reuse S2-S5 caches (0 S2-S5 VLM calls)
+            seen_stages.clear()
+            art_s1 = dag_ok.run_episode(view, fresh_stages={"s1_grounding"})
+            assert set(seen_stages) == {"s1_grounding"}
+            assert art_s1.stage_refs.s2_macro == art_after_s2.stage_refs.s2_macro
+            assert art_s1.stage_refs.s3_discover == art_after_s2.stage_refs.s3_discover
+            assert art_s1.stage_refs.s4_verify == art_after_s2.stage_refs.s4_verify
+            assert art_s1.stage_refs.s5_success == art_after_s2.stage_refs.s5_success
+
+            # Changing S1 config/prompt invalidates ONLY S1 cache key, leaving S2-S5 cache keys intact
+            ov_dir = ws / "configs_override"
+            (ov_dir / "prompts").mkdir(parents=True, exist_ok=True)
+            (ov_dir / "default.yaml").write_text(
+                "vlm:\n  s1_grounding:\n    max_tokens: 1234\n",
+                encoding="utf-8",
+            )
+            (ov_dir / "prompts" / "s1_grounding.yaml").write_text(
+                (dag_ok.cfg.config_dir / "prompts" / "s1_grounding.yaml").read_text(encoding="utf-8")
+                + "\n# s1 prompt tweak for cache isolation test\n",
+                encoding="utf-8",
+            )
+            dag_ok.cfg.reload()
+            seen_stages.clear()
+            art_s1_cfg = dag_ok.run_episode(view, fresh=False)
+            assert set(seen_stages) == {"s1_grounding"}
+            assert art_s1_cfg.stage_refs.s1_grounding != art_s1.stage_refs.s1_grounding
+            assert art_s1_cfg.stage_refs.s2_macro == art_s1.stage_refs.s2_macro
+            assert art_s1_cfg.stage_refs.s3_discover == art_s1.stage_refs.s3_discover
+            assert art_s1_cfg.stage_refs.s4_verify == art_s1.stage_refs.s4_verify
+            assert art_s1_cfg.stage_refs.s5_success == art_s1.stage_refs.s5_success
+            assert art_warm.episode_id == art_s1_cfg.episode_id
     finally:
         repo.close()
 

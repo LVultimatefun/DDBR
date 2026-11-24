@@ -92,6 +92,54 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
   const segPolicy = selectedSegment?.splice_policy ?? "keep_positive";
   const segArm = selectedSegment?.affected_arm ?? "both";
 
+  const stageId = selectedStage?.stage_id ?? null;
+  const stageStart = selectedStage?.t_start ?? 0;
+  const stageEnd = selectedStage?.t_end ?? 0;
+
+  const [segStartDraft, setSegStartDraft] = useState<string>(String(segStart));
+  const [segEndDraft, setSegEndDraft] = useState<string>(String(segEnd));
+  const [stageStartDraft, setStageStartDraft] = useState<string>(String(stageStart));
+  const [stageEndDraft, setStageEndDraft] = useState<string>(String(stageEnd));
+
+  useEffect(() => {
+    setSegStartDraft(String(segStart));
+  }, [segId, segStart]);
+
+  useEffect(() => {
+    setSegEndDraft(String(segEnd));
+  }, [segId, segEnd]);
+
+  useEffect(() => {
+    setStageStartDraft(String(stageStart));
+  }, [stageId, stageStart]);
+
+  useEffect(() => {
+    setStageEndDraft(String(stageEnd));
+  }, [stageId, stageEnd]);
+
+  // Reset Few-Shot form & frame lightbox when switching segment or episode
+  useEffect(() => {
+    setFewShotOpen(false);
+    setFsScope("global");
+    setFsErrorType("fp_overflag");
+    setFsRationale("");
+    setFsStatusMsg(null);
+    setFrameLightboxOpen(false);
+  }, [segId, episodeId]);
+
+  // Close frame compare lightbox on Escape
+  useEffect(() => {
+    if (!frameLightboxOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setFrameLightboxOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [frameLightboxOpen]);
+
   // Debounced 250ms live checkSplice backend call on cut_clean or boundary edits
   useEffect(() => {
     if (!hasSelectedSeg || !segId || segEnd <= segStart) {
@@ -155,7 +203,9 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
           }
         })
         .catch(() => {
-          // Keep graceful fallback to existing seg.guardrail on offline/error
+          if (seq !== checkSeqRef.current) return;
+          setLiveCheck(null);
+          setLiveCheckSegId(null);
         })
         .finally(() => {
           if (seq === checkSeqRef.current) {
@@ -201,6 +251,11 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
             disabled={readOnly}
             value={selectedStage.label}
             onChange={(e) => onUpdateStage({ ...selectedStage, label: e.target.value })}
+            onBlur={() => {
+              if (!selectedStage.label.trim()) {
+                onUpdateStage({ ...selectedStage, label: "Untitled Stage" });
+              }
+            }}
           />
         </label>
 
@@ -219,30 +274,44 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
             <span>Start (s)</span>
             <input
               type="number"
+              aria-label="Stage start"
               step={0.05}
               min={0}
               max={durationS}
               disabled={readOnly}
-              value={selectedStage.t_start}
+              value={stageStartDraft}
               onChange={(e) => {
-                const v = Math.max(0, Math.min(selectedStage.t_end - 0.05, Number(e.target.value)));
-                onUpdateStage({ ...selectedStage, t_start: v });
+                const raw = e.target.value;
+                setStageStartDraft(raw);
+                if (raw.trim() === "") return;
+                const parsed = Number(raw);
+                if (!Number.isFinite(parsed)) return;
+                const v = Math.max(0, Math.min(selectedStage.t_end - 0.05, parsed));
+                onUpdateStage({ ...selectedStage, t_start: Number(v.toFixed(2)) });
               }}
+              onBlur={() => setStageStartDraft(String(selectedStage.t_start))}
             />
           </label>
           <label className="field-group">
             <span>End (s)</span>
             <input
               type="number"
+              aria-label="Stage end"
               step={0.05}
               min={0.05}
               max={durationS}
               disabled={readOnly}
-              value={selectedStage.t_end}
+              value={stageEndDraft}
               onChange={(e) => {
-                const v = Math.min(durationS, Math.max(selectedStage.t_start + 0.05, Number(e.target.value)));
-                onUpdateStage({ ...selectedStage, t_end: v });
+                const raw = e.target.value;
+                setStageEndDraft(raw);
+                if (raw.trim() === "") return;
+                const parsed = Number(raw);
+                if (!Number.isFinite(parsed)) return;
+                const v = Math.min(durationS, Math.max(selectedStage.t_start + 0.05, parsed));
+                onUpdateStage({ ...selectedStage, t_end: Number(v.toFixed(2)) });
               }}
+              onBlur={() => setStageEndDraft(String(selectedStage.t_end))}
             />
           </label>
         </div>
@@ -268,6 +337,10 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
   const optEnd = activeLiveCheck?.opt_t_end ?? seg.guardrail.opt_t_end;
   const canSnapOpt = optStart !== null && optEnd !== null && optEnd > optStart;
 
+  const isHallucinationOverride =
+    Boolean(activeLiveCheck) &&
+    activeLiveCheck!.effective_splice_policy === "keep_positive" &&
+    seg.splice_policy !== "keep_positive";
   const effectivePassed = activeLiveCheck ? activeLiveCheck.passed : seg.guardrail.passed;
   const effectiveDowngraded = activeLiveCheck ? activeLiveCheck.downgraded : seg.guardrail.downgraded;
   const effectiveReason = activeLiveCheck?.downgrade_reason ?? seg.guardrail.downgrade_reason;
@@ -427,7 +500,13 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
       {showLiveSpliceBar && (
         <div
           className={`live-splice-bar ${
-            checkingSplice ? "checking" : effectivePassed && !effectiveDowngraded ? "pass" : "warn"
+            checkingSplice
+              ? "checking"
+              : isHallucinationOverride
+                ? "warn"
+                : effectivePassed && !effectiveDowngraded
+                  ? "pass"
+                  : "warn"
           }`}
           data-testid="live-splice-badge"
         >
@@ -435,6 +514,10 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
             {checkingSplice ? (
               <>
                 <Loader2 size={13} /> Recalculating splice guardrail...
+              </>
+            ) : isHallucinationOverride ? (
+              <>
+                <AlertTriangle size={13} /> Hallucination override: protected as keep_positive
               </>
             ) : effectivePassed && !effectiveDowngraded ? (
               <>
@@ -514,11 +597,17 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
               min={0}
               max={durationS}
               disabled={readOnly}
-              value={seg.t_start}
+              value={segStartDraft}
               onChange={(e) => {
-                const v = Math.max(0, Math.min(seg.t_end - 0.05, Number(e.target.value)));
-                applyPatch({ t_start: v });
+                const raw = e.target.value;
+                setSegStartDraft(raw);
+                if (raw.trim() === "") return;
+                const parsed = Number(raw);
+                if (!Number.isFinite(parsed)) return;
+                const v = Math.max(0, Math.min(seg.t_end - 0.05, parsed));
+                applyPatch({ t_start: Number(v.toFixed(2)) });
               }}
+              onBlur={() => setSegStartDraft(String(seg.t_start))}
             />
             {!readOnly && (
               <button
@@ -549,11 +638,17 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
               min={0.05}
               max={durationS}
               disabled={readOnly}
-              value={seg.t_end}
+              value={segEndDraft}
               onChange={(e) => {
-                const v = Math.min(durationS, Math.max(seg.t_start + 0.05, Number(e.target.value)));
-                applyPatch({ t_end: v });
+                const raw = e.target.value;
+                setSegEndDraft(raw);
+                if (raw.trim() === "") return;
+                const parsed = Number(raw);
+                if (!Number.isFinite(parsed)) return;
+                const v = Math.min(durationS, Math.max(seg.t_start + 0.05, parsed));
+                applyPatch({ t_end: Number(v.toFixed(2)) });
               }}
+              onBlur={() => setSegEndDraft(String(seg.t_end))}
             />
             {!readOnly && (
               <button

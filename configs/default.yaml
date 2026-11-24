@@ -32,8 +32,9 @@ vlm:
 
   s1_grounding:
     enabled: true
+    batch_size: 8
     interval_s: 2.5
-    max_keyframes: 36
+    max_keyframes: 32
     hard_max_keyframes: 72
     ego_height: 540
     jpeg_quality: 80
@@ -42,9 +43,25 @@ vlm:
     min_box_px: 12
     thinking: false
     thinking_budget: 768
-    max_tokens: 800
+    max_tokens: 2400
     static_container_min_frames: 5
     static_jitter_tol_px_1280: 85.0
+    tracking:
+      enabled: true
+      track_fps: 15.0
+      short_native_fps_max_s: 15.0
+      track_width: 320
+      flow_preset: "ultrafast"
+      ncc_stride: 2
+      ncc_min_score: 0.55
+      fb_max_err_px: 2.5
+      occlusion_conf_thresh: 0.25
+      occlusion_min_frames: 4
+      smooth_window: 5
+      camera_motion_threshold_norm: 25.0
+      outlier_jump_norm: 250.0
+      adaptive_reanchor_max_calls: 0
+      adaptive_disagree_ratio: 0.65
 
   s2_macro:
     interval_s: 2.0

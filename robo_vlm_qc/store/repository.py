@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -650,7 +650,94 @@ class Repository:
             )
             return new_status
 
-    def save_vlm_run_artifact(self, artifact: VlmRunArtifact) -> Path:
+    def queue_vlm_episodes(
+        self,
+        episode_ids: Sequence[str],
+        *,
+        now: float | None = None,
+    ) -> list[tuple[str, EpisodeStatus]]:
+        """Atomically move eligible (ingested, vlm_ready) episodes to vlm_queued.
+
+        Returns [(episode_id, prev_status), ...] for episodes actually transitioned;
+        protected review states and already-active episodes are left untouched.
+        """
+        unique_ids = list(dict.fromkeys(str(e) for e in episode_ids if e))
+        if not unique_ids:
+            return []
+        ts_now = time.time() if now is None else float(now)
+        eligible = {EpisodeStatus.INGESTED.value, EpisodeStatus.VLM_READY.value}
+        queued: list[tuple[str, EpisodeStatus]] = []
+        with self.db.transaction() as conn:
+            for ep_id in unique_ids:
+                row = conn.execute(
+                    "SELECT status FROM episodes WHERE episode_id = ?", (ep_id,)
+                ).fetchone()
+                if row is None or row["status"] not in eligible:
+                    continue
+                prev_st = EpisodeStatus(row["status"])
+                conn.execute(
+                    "UPDATE episodes SET status = ?, updated_at = ? WHERE episode_id = ?",
+                    (EpisodeStatus.VLM_QUEUED.value, ts_now, ep_id),
+                )
+                queued.append((ep_id, prev_st))
+        return queued
+
+    def restore_vlm_episodes_on_cancel(
+        self,
+        episode_ids: Sequence[str],
+        prev_statuses: dict[str, str | EpisodeStatus] | None = None,
+        *,
+        now: float | None = None,
+    ) -> list[tuple[str, EpisodeStatus]]:
+        """Atomically revert episodes currently in vlm_queued/vlm_running back to pre-job status.
+
+        Only touches episodes whose DB status is still vlm_queued or vlm_running (never
+        clobbers completed vlm_ready or protected review statuses). Restores to prev_statuses
+        if in {ingested, vlm_ready}, else vlm_ready when active_run_id is set, else ingested.
+        Returns [(episode_id, restored_status), ...] for episodes actually updated.
+        """
+        unique_ids = list(dict.fromkeys(str(e) for e in episode_ids if e))
+        if not unique_ids:
+            return []
+        ts_now = time.time() if now is None else float(now)
+        transient = {EpisodeStatus.VLM_QUEUED.value, EpisodeStatus.VLM_RUNNING.value}
+        restorable = {EpisodeStatus.INGESTED.value, EpisodeStatus.VLM_READY.value}
+        restored: list[tuple[str, EpisodeStatus]] = []
+        with self.db.transaction() as conn:
+            for ep_id in unique_ids:
+                row = conn.execute(
+                    "SELECT status, active_run_id FROM episodes WHERE episode_id = ?",
+                    (ep_id,),
+                ).fetchone()
+                if row is None or row["status"] not in transient:
+                    continue
+                raw_prev = (prev_statuses or {}).get(ep_id)
+                prev_val = (
+                    raw_prev.value
+                    if isinstance(raw_prev, EpisodeStatus)
+                    else (str(raw_prev) if raw_prev is not None else None)
+                )
+                if prev_val in restorable:
+                    target = EpisodeStatus(prev_val)
+                else:
+                    target = (
+                        EpisodeStatus.VLM_READY
+                        if row["active_run_id"]
+                        else EpisodeStatus.INGESTED
+                    )
+                conn.execute(
+                    "UPDATE episodes SET status = ?, updated_at = ? WHERE episode_id = ?",
+                    (target.value, ts_now, ep_id),
+                )
+                restored.append((ep_id, target))
+        return restored
+
+    def save_vlm_run_artifact(
+        self,
+        artifact: VlmRunArtifact,
+        *,
+        before_commit_check: Callable[[], None] | None = None,
+    ) -> Path:
         meta = self.get_episode_meta(artifact.episode_id)
         row = self.get_episode_row(artifact.episode_id)
         if not artifact.is_eval_sandbox and row["status"] == EpisodeStatus.GT_FROZEN.value:
@@ -671,6 +758,8 @@ class Repository:
         fp = artifact.config_fingerprint
 
         with self.db.transaction() as conn:
+            if before_commit_check is not None:
+                before_commit_check()
             cur_row = conn.execute(
                 "SELECT status, duration_s FROM episodes WHERE episode_id = ?",
                 (artifact.episode_id,),
@@ -1097,6 +1186,14 @@ class Repository:
             cur_status = EpisodeStatus(ep_row["status"])
             if cur_status == EpisodeStatus.GT_FROZEN:
                 raise GtFrozenError(f"Episode {episode_id!r} is gt_frozen")
+            if cur_status in {
+                EpisodeStatus.INGESTED,
+                EpisodeStatus.VLM_QUEUED,
+                EpisodeStatus.VLM_RUNNING,
+            }:
+                raise InvalidTransitionError(
+                    f"Episode {episode_id!r} in status {cur_status.value!r} cannot be reviewed while VLM is not ready"
+                )
             if cur_status == EpisodeStatus.CLAIMED:
                 claimer = ep_row["claimed_by"]
                 exp = float(ep_row["claim_expires_at"] or 0.0)
@@ -1406,6 +1503,28 @@ class Repository:
         rows = self.db.connect().execute(sql, params).fetchall()
         return [self._job_row_to_dict(r) for r in rows]
 
+    def count_jobs(
+        self,
+        *,
+        status: str | None = None,
+        job_type: str | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if job_type is not None:
+            clauses.append("job_type = ?")
+            params.append(job_type)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = (
+            self.db.connect()
+            .execute(f"SELECT COUNT(*) AS cnt FROM jobs {where_sql}", params)
+            .fetchone()
+        )
+        return int(row["cnt"]) if row is not None else 0
+
     def update_job(
         self,
         job_id: str,
@@ -1421,6 +1540,8 @@ class Repository:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
             if row is None:
                 raise NotFoundError(f"Job not found: {job_id!r}")
+            if row["status"] == "cancelled":
+                return self._job_row_to_dict(row)
             sets: list[str] = ["updated_at = ?"]
             vals: list[Any] = [ts_now]
             if status is not None:

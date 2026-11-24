@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -114,9 +115,22 @@ def create_app(
     # Validate config eagerly on startup so misconfigured directories fail fast.
     app_state.get_config()
 
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            with contextlib.suppress(Exception):
+                app_state.cancel_all_jobs()
+            with contextlib.suppress(Exception):
+                executor.shutdown(wait=False)
+            with contextlib.suppress(Exception):
+                repo.close()
+
     app = FastAPI(
         title="robo_vlm_qc Studio API",
         version="0.1.0",
+        lifespan=_lifespan,
     )
     app.state.ctx = app_state
 
@@ -134,8 +148,11 @@ def create_app(
         return {"status": "ok"}
 
     @app.get("/api/auth/me")
-    def auth_me(auth: AuthContext = Depends(require_auth)) -> dict[str, str]:
-        return {"role": auth.role, "user": auth.user}
+    def auth_me(
+        auth: AuthContext = Depends(require_auth),
+        state: AppState = Depends(get_app_state),
+    ) -> dict[str, Any]:
+        return {"role": auth.role, "user": auth.user, "no_auth": state.auth.no_auth}
 
     @app.get("/api/labels")
     def shared_labels(

@@ -110,21 +110,25 @@ def test_auth_me_shared_labels_and_no_auth(
 
     me_rev = client.get("/api/auth/me", headers={"X-Auth-Token": "r-tok", "X-User": "alice"})
     assert me_rev.status_code == 200
-    assert me_rev.json() == {"role": "reviewer", "user": "alice"}
+    assert me_rev.json() == {"role": "reviewer", "user": "alice", "no_auth": False}
 
     me_lead = client.get("/api/auth/me?token=l-tok")
     assert me_lead.status_code == 200
-    assert me_lead.json() == {"role": "lead", "user": "lead"}
+    assert me_lead.json() == {"role": "lead", "user": "lead", "no_auth": False}
 
     # Shared studio /api/labels works for Reviewer while /api/lab/labels is Lead-only
     assert client.get("/api/labels", headers={"X-Auth-Token": "r-tok"}).status_code == 200
     assert client.get("/api/lab/labels", headers={"X-Auth-Token": "r-tok"}).status_code == 403
     assert client.get("/api/lab/labels", headers={"X-Auth-Token": "l-tok"}).status_code == 200
 
-    # no_auth mode grants lead access without token
+    # no_auth mode grants lead access without token and exposes no_auth=True
     app_noauth = create_app(ws, no_auth=True)
     c_noauth = TestClient(app_noauth)
-    assert c_noauth.get("/api/auth/me").json()["role"] == "lead"
+    assert c_noauth.get("/api/auth/me").json() == {
+        "role": "lead",
+        "user": "lead",
+        "no_auth": True,
+    }
 
     # Partial token config must NOT silently fall back to default "lead-token" / "rev-token"
     c_rev_only = TestClient(create_app(ws, reviewer_token="custom-rev-only"))

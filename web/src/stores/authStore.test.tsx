@@ -447,4 +447,117 @@ describe("authStore", () => {
     expect(userInput.value).toBe("alice");
     expect(roleSelect.value).toBe("lead");
   });
+
+  it("auto-probes /api/auth/me in --no-auth mode with empty token, adopts Lead role, hydrates jobs and connects SSE without AuthModal", async () => {
+    const sseUrls: string[] = [];
+    class MockEventSource {
+      url: string;
+      onopen: (() => void) | null = null;
+      onmessage: ((evt: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      close = vi.fn();
+      constructor(url: string) {
+        this.url = url;
+        sseUrls.push(url);
+      }
+    }
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    const requestedUrls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        requestedUrls.push(url);
+        if (url.includes("/api/auth/me")) {
+          return new Response(
+            JSON.stringify({ role: "lead", user: "reviewer_1", no_auth: true }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/jobs")) {
+          return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+        }
+        if (url.includes("/api/episodes")) {
+          return new Response(
+            JSON.stringify({
+              items: [makeEpisodeListItem({ episode_id: "ds/no_auth_ep1", status: "ingested" })],
+              total: 1,
+              status_counts: { ingested: 1 },
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    render(
+      <AuthProvider>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("current-role-badge")).toHaveTextContent("Lead: reviewer_1"),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("episode-row-ds/no_auth_ep1")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("lead-status-strip")).toBeInTheDocument();
+    expect(screen.getByTestId("live-job-pill")).toBeInTheDocument();
+    expect(screen.queryByTestId("auth-modal")).toBeNull();
+    // Should never send a Reviewer-scoped status=vlm_ready query during boot
+    expect(requestedUrls.some((u) => u.includes("status=vlm_ready"))).toBe(false);
+    // Should hydrate jobs and subscribe to /api/events with no ?token= param
+    expect(requestedUrls.some((u) => u.includes("/api/jobs?limit=20"))).toBe(true);
+    expect(sseUrls.filter((u) => u === "/api/events").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("keeps empty token as reviewer without SSE or /api/jobs when /api/auth/me returns 401 or lacks no_auth=true", async () => {
+    const sseUrls: string[] = [];
+    class MockEventSource {
+      url: string;
+      onopen: (() => void) | null = null;
+      onmessage: ((evt: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      close = vi.fn();
+      constructor(url: string) {
+        this.url = url;
+        sseUrls.push(url);
+      }
+    }
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    const requestedUrls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        requestedUrls.push(url);
+        if (url.includes("/api/auth/me")) {
+          return new Response(JSON.stringify({ detail: "Unauthorized" }), { status: 401 });
+        }
+        if (url.includes("/api/episodes")) {
+          return new Response(JSON.stringify({ detail: "Unauthorized" }), { status: 401 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    render(
+      <AuthProvider>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("auth-modal")).toBeInTheDocument());
+    expect(screen.getByTestId("current-role-badge")).toHaveTextContent("Reviewer:");
+    expect(requestedUrls.some((u) => u.startsWith("/api/jobs"))).toBe(false);
+    expect(sseUrls).toHaveLength(0);
+  });
 });

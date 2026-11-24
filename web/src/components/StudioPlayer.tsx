@@ -16,12 +16,19 @@ import {
 import { frameUrl, previewVideoUrl } from "../api/client";
 import type {
   CameraSpec,
-  GroundingKeyframe,
   GroundingResult,
   GroundingStatusKind,
   QcSegment,
 } from "../api/types";
 import { useAuth } from "../stores/authStore";
+import {
+  computeContainRect,
+  computeLabelPlacement,
+  projectNormBoxToRect,
+  resolveGroundedCameraName,
+  resolveMediaDimensions,
+  sampleTrackBoxAt,
+} from "../utils/groundingProjection";
 
 export type PlayerViewMode = "single" | "pip" | "grid";
 
@@ -60,18 +67,47 @@ const STATUS_COLORS: Record<GroundingStatusKind, string> = {
 
 const PLAYBACK_RATES = [0.5, 1, 1.5, 2, 3] as const;
 
-function pickNearestKeyframe(keyframes: GroundingKeyframe[], tS: number): GroundingKeyframe | null {
-  if (!keyframes || keyframes.length === 0) return null;
-  let best = keyframes[0];
-  let bestDiff = Math.abs(best.time_s - tS);
-  for (let i = 1; i < keyframes.length; i += 1) {
-    const diff = Math.abs(keyframes[i].time_s - tS);
-    if (diff < bestDiff) {
-      best = keyframes[i];
-      bestDiff = diff;
-    }
-  }
-  return best;
+type VideoFrameCallbackLike = (now: number, metadata?: { mediaTime?: number }) => void;
+
+type VideoElementWithRVFC = {
+  requestVideoFrameCallback?: (callback: VideoFrameCallbackLike) => number;
+  cancelVideoFrameCallback?: (handle: number) => void;
+};
+
+function drawCornerBrackets(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  color: string,
+  lineWidth: number,
+) {
+  if (typeof ctx.moveTo !== "function" || typeof ctx.lineTo !== "function") return;
+  const arm = Math.max(4, Math.min(14, Math.min(w, h) * 0.24));
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineWidth;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  // Top-left
+  ctx.moveTo(x, y + arm);
+  ctx.lineTo(x, y);
+  ctx.lineTo(x + arm, y);
+  // Top-right
+  ctx.moveTo(x + w - arm, y);
+  ctx.lineTo(x + w, y);
+  ctx.lineTo(x + w, y + arm);
+  // Bottom-right
+  ctx.moveTo(x + w, y + h - arm);
+  ctx.lineTo(x + w, y + h);
+  ctx.lineTo(x + w - arm, y + h);
+  // Bottom-left
+  ctx.moveTo(x + arm, y + h);
+  ctx.lineTo(x, y + h);
+  ctx.lineTo(x, y + h - arm);
+  ctx.stroke();
+  ctx.restore();
 }
 
 export const StudioPlayer: React.FC<StudioPlayerProps> = ({
@@ -129,15 +165,34 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
   );
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const hdImgRef = useRef<HTMLImageElement | null>(null);
   const secondaryVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
   const primaryPaneRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const lastTrackedTimeRef = useRef<number>(currentTime);
   const currentTimeRef = useRef<number>(currentTime);
+  const playingRef = useRef<boolean>(playing);
+  const hdFrameModeRef = useRef<boolean>(hdFrameMode);
+  const videoFailedRef = useRef<boolean>(videoFailed);
+  const showGroundingRef = useRef<boolean>(showGrounding);
+  const groundingRef = useRef<GroundingResult>(grounding);
+  const selectedCameraRef = useRef<string>(selectedCamera);
+  const primaryCameraRef = useRef<string>(primaryCamera);
+  const primaryCameraSpecRef = useRef<CameraSpec | null>(null);
+  const prevCameraRef = useRef<string>(selectedCamera);
+  const restoringTimeRef = useRef<number | null>(null);
+  const shouldResumeAfterLoadRef = useRef<boolean>(false);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevHdTimeRef = useRef<number>(currentTime);
 
   currentTimeRef.current = currentTime;
+  playingRef.current = playing;
+  hdFrameModeRef.current = hdFrameMode;
+  videoFailedRef.current = videoFailed;
+  showGroundingRef.current = showGrounding;
+  groundingRef.current = grounding;
+  selectedCameraRef.current = selectedCamera;
+  primaryCameraRef.current = primaryCamera;
 
   useEffect(() => {
     if (!cameras.some((c) => c.name === selectedCamera)) {
@@ -145,10 +200,27 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     }
   }, [cameras, primaryCamera, selectedCamera]);
 
+  // Reset playback cleanly when switching to a different episode
   useEffect(() => {
+    setPlaying(false);
     setVideoFailed(false);
     setFailedSecondary({});
-  }, [episodeId, selectedCamera]);
+    restoringTimeRef.current = null;
+    shouldResumeAfterLoadRef.current = false;
+    if (videoRef.current && !videoRef.current.paused) {
+      videoRef.current.pause();
+    }
+  }, [episodeId]);
+
+  // Preserve playhead & playback state when switching cameras on the same episode
+  useEffect(() => {
+    if (prevCameraRef.current !== selectedCamera) {
+      prevCameraRef.current = selectedCamera;
+      restoringTimeRef.current = currentTimeRef.current;
+      shouldResumeAfterLoadRef.current = playingRef.current;
+      setVideoFailed(false);
+    }
+  }, [selectedCamera]);
 
   useEffect(() => {
     return () => {
@@ -167,6 +239,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     () => cameras.find((c) => c.name === selectedCamera) ?? cameras[0] ?? null,
     [cameras, selectedCamera],
   );
+  primaryCameraSpecRef.current = primaryCameraSpec;
 
   const pipCamera = secondaryCameras[0] ?? null;
   const gridSecondaryCameras = useMemo(() => secondaryCameras.slice(0, 3), [secondaryCameras]);
@@ -242,7 +315,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     (tS: number) => {
       const clamped = Math.max(0, Math.min(durationS, Number(tS.toFixed(4))));
       const vid = videoRef.current;
-      if (vid && Math.abs(vid.currentTime - clamped) > 0.04) {
+      if (vid && Math.abs(vid.currentTime - clamped) > 0.005) {
         try {
           vid.currentTime = clamped;
         } catch {
@@ -256,11 +329,12 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     [durationS, onTimeUpdate, playbackRate, syncSecondaryVideos],
   );
 
-  // Sync external seek into primary & secondary <video> elements
+  // Sync external seek into primary & secondary <video> elements (frame-accurate when paused)
   useEffect(() => {
     const clamped = Math.max(0, Math.min(durationS, currentTime));
     const vid = videoRef.current;
-    if (vid && Math.abs(vid.currentTime - clamped) > 0.08) {
+    const seekThreshold = playingRef.current ? 0.12 : 0.005;
+    if (vid && Math.abs(vid.currentTime - clamped) > seekThreshold) {
       try {
         vid.currentTime = clamped;
       } catch {
@@ -484,68 +558,229 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     loopSegment,
   ]);
 
-  // Draw read-only 2D grounding canvas strictly aligned to primary camera pane
-  const drawGrounding = useCallback(() => {
+  const getEffectiveDrawTime = useCallback((): number => {
+    const vid = videoRef.current;
+    if (
+      playingRef.current &&
+      !hdFrameModeRef.current &&
+      !videoFailedRef.current &&
+      vid &&
+      !vid.paused &&
+      restoringTimeRef.current === null
+    ) {
+      return vid.currentTime;
+    }
+    return currentTimeRef.current;
+  }, []);
+
+  // Draw read-only 2D grounding canvas strictly aligned to displayed video rect inside object-fit: contain
+  const drawGroundingAt = useCallback((tS: number) => {
     const canvas = canvasRef.current;
     const pane = primaryPaneRef.current;
     if (!canvas || !pane) return;
-    const width = pane.clientWidth || 640;
-    const height = pane.clientHeight || 360;
-    if (canvas.width !== width) canvas.width = width;
-    if (canvas.height !== height) canvas.height = height;
+
+    const paneDomRect = typeof pane.getBoundingClientRect === "function" ? pane.getBoundingClientRect() : null;
+    const cssWidth = (paneDomRect && paneDomRect.width > 0 ? paneDomRect.width : pane.clientWidth) || 640;
+    const cssHeight = (paneDomRect && paneDomRect.height > 0 ? paneDomRect.height : pane.clientHeight) || 360;
+    const dpr = typeof window !== "undefined" ? Math.min(Math.max(window.devicePixelRatio || 1, 1), 2) : 1;
+    const backingW = Math.max(1, Math.round(cssWidth * dpr));
+    const backingH = Math.max(1, Math.round(cssHeight * dpr));
+
+    if (canvas.width !== backingW) canvas.width = backingW;
+    if (canvas.height !== backingH) canvas.height = backingH;
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.clearRect(0, 0, width, height);
+    if (typeof ctx.setTransform === "function") {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-    if (!showGrounding || !grounding?.object_tracks_2d) return;
+    const g = groundingRef.current;
+    if (!showGroundingRef.current || !g?.object_tracks_2d) return;
 
-    const tracks = Object.values(grounding.object_tracks_2d);
+    // Camera matching (F4): only render boxes when selected camera matches grounded camera
+    const groundedCam = resolveGroundedCameraName(g, primaryCameraRef.current);
+    if (selectedCameraRef.current !== groundedCam) return;
+
+    // Resolve natural media dimensions & exact object-fit: contain content rectangle (F2)
+    const [mediaW, mediaH] = resolveMediaDimensions({
+      videoEl: videoRef.current,
+      imgEl: hdImgRef.current,
+      hdFrameMode: hdFrameModeRef.current,
+      videoFailed: videoFailedRef.current,
+      cameraSpec: primaryCameraSpecRef.current,
+      grounding: g,
+      fallbackW: cssWidth,
+      fallbackH: cssHeight,
+    });
+    const contentRect = computeContainRect(cssWidth, cssHeight, mediaW, mediaH);
+    const rectSig = `${contentRect.x.toFixed(1)},${contentRect.y.toFixed(1)},${contentRect.width.toFixed(1)},${contentRect.height.toFixed(1)}`;
+    if (canvas.dataset.contentRect !== rectSig) {
+      canvas.dataset.contentRect = rectSig;
+    }
+
+    const tracks = Object.values(g.object_tracks_2d);
+    const compactPane = contentRect.width < 360;
+    const fontSize = compactPane ? 11 : 12;
+    const pillH = compactPane ? 17 : 19;
+
     for (const track of tracks) {
-      const kf = pickNearestKeyframe(track.keyframes, currentTime);
-      if (!kf || !kf.visible) continue;
-      const [nx1, ny1, nx2, ny2] = kf.bbox_norm_1000;
-      const x1 = (nx1 / 1000) * width;
-      const y1 = (ny1 / 1000) * height;
-      const bw = Math.max(2, ((nx2 - nx1) / 1000) * width);
-      const bh = Math.max(2, ((ny2 - ny1) / 1000) * height);
+      const sample = sampleTrackBoxAt(g, track, tS);
+      if (!sample) continue;
 
-      const color = STATUS_COLORS[kf.status_kind] ?? STATUS_COLORS.neutral;
+      const box = projectNormBoxToRect(sample.bbox, contentRect);
+      const color = STATUS_COLORS[sample.statusKind] ?? STATUS_COLORS.neutral;
+      const isStaticLocked = sample.provenance === "static_locked";
+      const isAnchor = sample.provenance === "vlm_anchor";
+      const isLowConf = sample.provenance === "tracked" && sample.confPct !== null && sample.confPct < 70;
+
       ctx.save();
       ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.setLineDash(track.is_static_container ? [6, 4] : []);
-      ctx.strokeRect(x1, y1, bw, bh);
+      ctx.lineWidth = isAnchor ? 2 : 1.75;
+      ctx.globalAlpha = isStaticLocked ? 0.86 : isLowConf ? 0.82 : 1;
+      ctx.shadowColor = "rgba(15, 23, 42, 0.72)";
+      ctx.shadowBlur = 3;
+      ctx.setLineDash(isStaticLocked ? [6, 4] : isLowConf ? [5, 2] : []);
+      ctx.strokeRect(box.x, box.y, box.width, box.height);
+      ctx.shadowBlur = 0;
 
-      const label = `${track.name || track.object_id}${kf.state ? ` · ${kf.state}` : ""}`;
-      ctx.font = "12px system-ui, sans-serif";
-      const textW = ctx.measureText(label).width + 10;
-      const labelY =
-        track.tag_pos === "bottom" ? Math.min(height - 18, y1 + bh + 2) : Math.max(0, y1 - 20);
-      ctx.fillStyle = "rgba(15, 23, 42, 0.82)";
-      ctx.fillRect(x1, labelY, textW, 18);
+      // Crisp corner brackets on active VLM anchors & tracked objects
+      if (!isStaticLocked) {
+        drawCornerBrackets(ctx, box.x, box.y, box.width, box.height, color, isAnchor ? 3 : 2.5);
+      }
+
+      const prefix = isAnchor ? "◆ " : isStaticLocked ? "▪ " : "";
+      const baseName = track.name || track.object_id;
+      const statePart = sample.state ? ` · ${sample.state}` : "";
+      const confPart =
+        sample.provenance === "tracked" && sample.confPct !== null && !compactPane
+          ? ` ${sample.confPct}%`
+          : "";
+      const label = `${prefix}${baseName}${statePart}${confPart}`;
+
+      ctx.globalAlpha = 1;
+      ctx.setLineDash([]);
+      ctx.font = `600 ${fontSize}px system-ui, -apple-system, sans-serif`;
+      const textW = Math.ceil(ctx.measureText(label).width) + 13;
+      const pill = computeLabelPlacement(box, contentRect, textW, pillH, track.tag_pos);
+
+      ctx.fillStyle = "rgba(15, 23, 42, 0.86)";
+      ctx.fillRect(pill.x, pill.y, textW, pillH);
+      ctx.fillStyle = color;
+      ctx.fillRect(pill.x, pill.y, 2.5, pillH);
       ctx.fillStyle = "#f8fafc";
-      ctx.fillText(label, x1 + 5, labelY + 13);
+      ctx.fillText(label, pill.x + 6, pill.y + pillH - 5);
       ctx.restore();
     }
-  }, [currentTime, grounding, showGrounding]);
+  }, []);
 
-  useEffect(() => {
-    drawGrounding();
-  }, [drawGrounding, viewMode]);
+  const drawGroundingAtRef = useRef(drawGroundingAt);
+  drawGroundingAtRef.current = drawGroundingAt;
 
+  // Immediate redraw on scrub, mode switch, camera switch, grounding data update, or toggle
   useEffect(() => {
-    const el = primaryPaneRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => drawGrounding());
-    ro.observe(el);
+    drawGroundingAt(getEffectiveDrawTime());
+  }, [
+    currentTime,
+    grounding,
+    showGrounding,
+    selectedCamera,
+    primaryCamera,
+    primaryCameraSpec,
+    viewMode,
+    hdFrameMode,
+    videoFailed,
+    drawGroundingAt,
+    getEffectiveDrawTime,
+  ]);
+
+  // True 30fps video frame sync via requestVideoFrameCallback (with requestAnimationFrame fallback)
+  useEffect(() => {
+    if (!playing || hdFrameMode || videoFailed) return;
+    const vid = videoRef.current;
+    if (!vid) return;
+
+    let cancelled = false;
+    let rvfcHandle: number | null = null;
+    let rafHandle: number | null = null;
+    const rvfcVid = vid as unknown as VideoElementWithRVFC;
+
+    if (typeof rvfcVid.requestVideoFrameCallback === "function") {
+      const onVideoFrame: VideoFrameCallbackLike = (_now, metadata) => {
+        if (cancelled) return;
+        const mediaT =
+          typeof metadata?.mediaTime === "number" && Number.isFinite(metadata.mediaTime)
+            ? metadata.mediaTime
+            : vid.currentTime;
+        drawGroundingAtRef.current(mediaT);
+        if (playingRef.current && !vid.ended) {
+          rvfcHandle = rvfcVid.requestVideoFrameCallback!(onVideoFrame);
+        } else {
+          rvfcHandle = null;
+        }
+      };
+      rvfcHandle = rvfcVid.requestVideoFrameCallback(onVideoFrame);
+    } else if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      const onRaf = () => {
+        if (cancelled) return;
+        drawGroundingAtRef.current(vid.currentTime);
+        if (playingRef.current && !vid.ended) {
+          rafHandle = window.requestAnimationFrame(onRaf);
+        } else {
+          rafHandle = null;
+        }
+      };
+      rafHandle = window.requestAnimationFrame(onRaf);
+    }
+
+    return () => {
+      cancelled = true;
+      if (rvfcHandle !== null && typeof rvfcVid.cancelVideoFrameCallback === "function") {
+        rvfcVid.cancelVideoFrameCallback(rvfcHandle);
+      }
+      if (
+        rafHandle !== null &&
+        typeof window !== "undefined" &&
+        typeof window.cancelAnimationFrame === "function"
+      ) {
+        window.cancelAnimationFrame(rafHandle);
+      }
+    };
+  }, [playing, hdFrameMode, videoFailed, selectedCamera, episodeId, viewMode]);
+
+  // Redraw whenever intrinsic <video> dimensions change
+  useEffect(() => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    const onIntrinsicResize = () => {
+      drawGroundingAtRef.current(getEffectiveDrawTime());
+    };
+    vid.addEventListener("resize", onIntrinsicResize);
+    return () => vid.removeEventListener("resize", onIntrinsicResize);
+  }, [hdFrameMode, videoFailed, selectedCamera, episodeId, viewMode, getEffectiveDrawTime]);
+
+  // Observe container & active media layout resizes (window resize, split drag, Single/PiP/Grid transitions)
+  useEffect(() => {
+    const pane = primaryPaneRef.current;
+    if (!pane || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      drawGroundingAtRef.current(getEffectiveDrawTime());
+    });
+    ro.observe(pane);
+    if (videoRef.current) ro.observe(videoRef.current);
+    if (hdImgRef.current) ro.observe(hdImgRef.current);
     return () => ro.disconnect();
-  }, [drawGrounding, viewMode]);
+  }, [viewMode, hdFrameMode, videoFailed, selectedCamera, episodeId, getEffectiveDrawTime]);
 
   const handleVideoTimeUpdate = () => {
     const vid = videoRef.current;
     if (!vid) return;
     const rawT = vid.currentTime;
+    // Ignore spurious 0s timeupdate emitted while a newly switched camera reloads metadata
+    if (restoringTimeRef.current !== null && restoringTimeRef.current > 0.1 && rawT < 0.05) {
+      return;
+    }
     const prevT = lastTrackedTimeRef.current;
     const maxStep = Math.max(0.6, 0.75 * playbackRate);
     if (onWatchInterval && rawT > prevT && rawT - prevT <= maxStep) {
@@ -599,6 +834,21 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
             muted
             playsInline
             preload="metadata"
+            onLoadedMetadata={(e) => {
+              const secVid = e.currentTarget;
+              secVid.playbackRate = playbackRate;
+              const target = Math.max(0, Math.min(durationS, currentTimeRef.current));
+              if (Math.abs(secVid.currentTime - target) > 0.08) {
+                try {
+                  secVid.currentTime = target;
+                } catch {
+                  // Ignore seek errors before metadata is fully ready
+                }
+              }
+              if (playingRef.current && secVid.paused) {
+                void Promise.resolve(secVid.play?.()).catch(() => {});
+              }
+            }}
             onError={() =>
               setFailedSecondary((prev) => ({
                 ...prev,
@@ -624,6 +874,14 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
   };
 
   const trackCount = Object.keys(grounding?.object_tracks_2d ?? {}).length;
+  const groundedCamera = useMemo(
+    () => resolveGroundedCameraName(grounding, primaryCamera),
+    [grounding, primaryCamera],
+  );
+  const isGroundedCamera = selectedCamera === groundedCamera;
+  const hasDenseTracking = Boolean(
+    grounding?.dense_times_s && grounding.dense_times_s.length > 0,
+  );
   const hasMultiCam = cameras.length >= 2;
   const isGridMode = viewMode === "grid" && hasMultiCam;
   const isPipMode = viewMode === "pip" && hasMultiCam && Boolean(pipCamera);
@@ -695,13 +953,34 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
 
           <button
             type="button"
-            className={`pill-btn ${showGrounding ? "active" : ""}`}
+            className={`pill-btn ${showGrounding && isGroundedCamera ? "active" : ""}`}
             onClick={() => setShowGrounding((v) => !v)}
-            title="2D Grounding boxes are read-only visual aids"
+            title={
+              !isGroundedCamera && trackCount > 0
+                ? `No 2D boxes on camera ${selectedCamera} (available on ${groundedCamera} only)`
+                : trackCount === 0
+                  ? "No 2D grounding annotations on this episode"
+                  : hasDenseTracking
+                    ? "v2 frame-level 2D grounding tracking overlay (read-only; ◆ marks VLM anchor)"
+                    : 'v1 sparse 2D grounding fallback overlay (read-only; use "Rerun S1 Only" to upgrade to v2 frame-level)'
+            }
             data-testid="toggle-grounding"
           >
             {showGrounding ? <Eye size={13} /> : <EyeOff size={13} />}
             <span>2D Boxes ({trackCount})</span>
+            {trackCount > 0 && (
+              <span
+                className={`grounding-version-chip ${hasDenseTracking ? "dense" : "sparse"}`}
+                data-testid="grounding-version-badge"
+              >
+                {hasDenseTracking ? "v2 Dense" : "v1 Sparse"}
+              </span>
+            )}
+            {!isGroundedCamera && trackCount > 0 && (
+              <span className="grounding-cam-mismatch-hint" data-testid="grounding-cam-mismatch">
+                {groundedCamera} only
+              </span>
+            )}
           </button>
 
           <button
@@ -737,6 +1016,36 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
               src={videoSrc}
               playsInline
               preload="metadata"
+              onLoadedMetadata={(e) => {
+                const vid = e.currentTarget;
+                vid.playbackRate = playbackRate;
+                const target = Math.max(
+                  0,
+                  Math.min(durationS, restoringTimeRef.current ?? currentTimeRef.current),
+                );
+                restoringTimeRef.current = null;
+                if (target > 0.01 && Math.abs(vid.currentTime - target) > 0.05) {
+                  try {
+                    vid.currentTime = target;
+                  } catch {
+                    // Ignore seek errors
+                  }
+                }
+                lastTrackedTimeRef.current = target;
+                drawGroundingAtRef.current(target);
+                if (shouldResumeAfterLoadRef.current) {
+                  shouldResumeAfterLoadRef.current = false;
+                  void Promise.resolve(vid.play?.()).catch(() => {
+                    setPlaying(false);
+                  });
+                }
+              }}
+              onLoadedData={(e) => {
+                drawGroundingAtRef.current(e.currentTarget.currentTime);
+              }}
+              onSeeked={(e) => {
+                drawGroundingAtRef.current(e.currentTarget.currentTime);
+              }}
               onTimeUpdate={handleVideoTimeUpdate}
               onPlay={() => {
                 setPlaying(true);
@@ -744,20 +1053,25 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
               }}
               onPause={() => {
                 setPlaying(false);
-                syncSecondaryVideos(videoRef.current?.currentTime ?? currentTimeRef.current, false, playbackRate);
+                const tNow = videoRef.current?.currentTime ?? currentTimeRef.current;
+                syncSecondaryVideos(tNow, false, playbackRate);
+                drawGroundingAtRef.current(tNow);
               }}
               onEnded={() => {
                 setPlaying(false);
                 syncSecondaryVideos(durationS, false, playbackRate);
+                drawGroundingAtRef.current(durationS);
               }}
               onError={() => setVideoFailed(true)}
             />
           ) : (
             <img
+              ref={hdImgRef}
               className="player-media"
               data-testid="primary-hd-frame"
               src={hdFrameSrc}
               alt={`${episodeId} ${selectedCamera} @ ${currentTime.toFixed(2)}s`}
+              onLoad={() => drawGroundingAtRef.current(currentTimeRef.current)}
             />
           )}
 
@@ -765,6 +1079,8 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
             ref={canvasRef}
             className="grounding-canvas-readonly"
             data-testid="grounding-canvas"
+            data-grounded-camera={groundedCamera}
+            data-camera-matched={String(isGroundedCamera)}
             aria-label="2D Grounding read-only overlay"
           />
 

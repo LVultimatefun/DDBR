@@ -19,7 +19,13 @@ from ..models.annotation import (
     VisualEvidence,
 )
 from ..models.taxonomy import FewShotItem, LabelRegistry, TaskSpec, VisualLabelDef
-from .client import BudgetExceeded, BudgetTracker, VlmClient
+from .client import (
+    BudgetExceeded,
+    BudgetTracker,
+    VlmCancelledError,
+    VlmClient,
+    check_client_cancelled,
+)
 from .prompt_builder import PromptBuilder
 
 _FORBIDDEN_LEGACY = {"long_pause", "back_and_forth"}
@@ -183,13 +189,17 @@ def run_stage3_discover(
     min_span = 0.4 if ev.duration_s >= 1.5 else 0.1
 
     def _run_window(w_idx: int, w0: float, w1: float) -> tuple[int, list[dict[str, Any]], Exception | None]:
+        check_client_cancelled(cl)
         t_list = _plan_window_times(w0, w1, step_s)
-        tiles = [
-            compose_2x2_tile(
-                ev.media, roles, t, cell_w=cell_w, cell_h=cell_h, include_header=True
+        tiles: list[np.ndarray] = []
+        for t in t_list:
+            check_client_cancelled(cl)
+            tiles.append(
+                compose_2x2_tile(
+                    ev.media, roles, t, cell_w=cell_w, cell_h=cell_h, include_header=True
+                )
             )
-            for t in t_list
-        ]
+        check_client_cancelled(cl)
         if pb is not None:
             sys_p, usr_p = pb.build_s3(
                 task=t_spec,
@@ -221,9 +231,10 @@ def run_stage3_discover(
             )
             segs = resp.get("segments")
             return w_idx, segs if isinstance(segs, list) else [], None
-        except BudgetExceeded:
+        except (BudgetExceeded, VlmCancelledError):
             raise
         except Exception as exc:
+            check_client_cancelled(cl)
             return w_idx, [], exc
 
     win_results: list[tuple[int, list[dict[str, Any]]]] = []

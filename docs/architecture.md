@@ -109,17 +109,20 @@ flowchart LR
     classDef iter fill:#1e1b4b,stroke:#818cf8,stroke-width:1.5px,color:#e0e7ff
     classDef guard fill:#78350f,stroke:#fbbf24,stroke-width:1.5px,color:#fef3c7
 
-    S0["S0: Open EpisodeView & Adaptive Layout"]:::cached --> S1["S1: 2D Grounding (0..1000 + Static Container Median)"]:::cached
-    S1 --> S2["S2: Macro Backbone (macro_stages + L/R arm_timelines)"]:::cached
-    S1 --> S5["S5: Dense-Tail Success + 30% Anti-FP Control Check"]:::cached
+    S0["S0: Open EpisodeView & Adaptive Layout"]:::cached --> S1["S1: Temporal-Batched 2D Grounding + BAFT Dense Tracking"]:::cached
+    S0 --> S2["S2: Macro Backbone (macro_stages + L/R arm_timelines)"]:::cached
+    S0 --> S5["S5: Dense-Tail Success + 30% Anti-FP Control Check"]:::cached
     S2 --> S3["S3: Sliding-Window QC Discovery (S2 Protected + Precision-First + Few-Shot)"]:::iter
     S3 --> S4A["S4A: Global Deduplication & Merge"]:::iter
     S4A --> S4B["S4B: 0.5s Start-vs-End CoV Diff Refinement"]:::iter
     S4B --> GRD["Guardrails: hallucination + splice_gate | visual_gate"]:::guard
-    S2 & S5 & GRD --> OUT["Persist VlmRunArtifact + SQLite Index"]:::cached
+    S1 & S2 & S5 & GRD --> OUT["Persist VlmRunArtifact + SQLite Index"]:::cached
 ```
 
 </details>
+
+- **Stage 1 Temporal Batching & BAFT Local Tracking (`vlm/stage1_grounding.py`, `vlm/tracker.py`)**: Stage 1 groups sparse keyframes into balanced temporal batches (`batch_size=8` default) for cross-frame target identity lock and consistent semantic boundaries, then runs the offline-safe **BAFT** (Bidirectional Anchor-Fused Optical-Flow + Multi-Scale NCC) tracker with **0 extra VLM calls by default** (`adaptive_reanchor_max_calls: 0`). BAFT performs chunked grayscale streaming decode, DIS optical flow + NCC fusion, anchor scale-outlier clamping, instance-switch outlier rejection, global camera ego-motion detection (tracking static containers instead of freezing them on panning cameras), and bidirectional occlusion hysteresis (`flag=0`).
+- **Stage 1 Cache & Rerun Decoupling**: `S1` cache keys (`s1_key`) are fully decoupled from `S2`, `S3`, `S4`, and `S5` (`s2_key` and `s5_key` omit `s1_key` as `upstream_hash`; `s3_key` and `s4_key` depend only on `S2`/`S3` outputs). Running `fresh_stages={"s1_grounding"}` executes only `S1` while reusing `S2`–`S5` `StageCache` at 100%.
 
 ### 2.3 Episode Status State Machine (`EpisodeStatus`)
 
@@ -143,7 +146,12 @@ flowchart TB
 
     ING -- "batch_vlm / run-vlm" --> QUE
     ING -- "run-vlm direct" --> RUN
+    RDY -- "batch_vlm rerun" --> QUE
     QUE --> RUN --> RDY
+    QUE -- "cancel rollback (no active_run_id)" --> ING
+    QUE -- "cancel rollback (has active_run_id)" --> RDY
+    RUN -- "cancel / fail rollback (prev ingested)" --> ING
+    RUN -- "cancel / fail rollback (prev vlm_ready)" --> RDY
     RDY -- "POST /claim" --> CLM
     CLM -- "POST /release or TTL expired" --> RDY
     CLM -- "submit_review" --> REV
@@ -155,6 +163,8 @@ flowchart TB
     REV -- "Lead freeze_gt" --> GTF
 ```
 
+**Cooperative Cancel & Atomic Rollback**: When a `batch_vlm` job is cancelled mid-flight (`POST /api/jobs/{job_id}/cancel`) or fails, `VlmClient.cancel()` sets `cancel_event` and shuts down active TCP sockets (~1 ms wakeup), raising `VlmCancelledError` across stages, BAFT tracking, and pre-commit checks (`before_commit_check`). `Repository.restore_vlm_episodes_on_cancel` atomically reverts only episodes still in transient `vlm_queued`/`vlm_running` states back to their pre-job restorable status (`vlm_ready` if previously ready or `active_run_id` exists, otherwise `ingested`) and emits `episode_updated` SSE notifications — never overwriting completed `vlm_ready` or protected review states (`claimed`, `reviewed`, `flagged`, `approved`, `gt_frozen`).
+
 ---
 
 ## 3. Authoritative Pydantic v2 Schemas & SQLite WAL Store
@@ -165,7 +175,9 @@ All models enforce `ConfigDict(extra="forbid")` and use clean language-neutral f
 
 1. **`VlmRunArtifact` (`models/annotation.py`)**:
    - Metadata & provenance: `run_id`, `episode_id`, `created_at`, `is_eval_sandbox`, `config_fingerprint` (`ConfigFingerprintSnapshot`), `stage_refs` (`StageRefs`), `usage` (`UsageSummary`).
-   - Read-only visual & kinematic aids: `grounding` (`GroundingResult` with `[0, 1000]` normalized bboxes and `GroundingTrack.name`), `arm_timelines` (`ArmTimelines`: `left` / `right` `ArmSpan` with `state ∈ {idle, work, hold, anom, mask, good}`).
+   - Read-only visual & kinematic aids:
+     - `grounding` (`GroundingResult`, backward-compatible `schema_version=1` sparse or `schema_version=2` BAFT dense): `camera_name` (enforced by `StudioPlayer` and `viz_mp4` so boxes only overlay on the grounded camera), `ref_size`, `keyframes_s`, `track_fps`, `dense_times_s` (monotonically non-decreasing dense sample timestamps validated by `_validate_dense_alignment`), `camera_motion_detected`, and `object_tracks_2d: dict[str, GroundingTrack]`. Each `GroundingTrack` carries `object_id`, `name` (accepting `name_zh` alias), `tag_pos`, `is_static_container`, sparse `keyframes` (`[0, 1000]` normalized bboxes), `tracking_mode` (`"sparse_vlm" | "static_locked" | "bidir_flow_ncc"`), `dense_boxes_norm_1000`, `dense_flags` (`0=invisible` requiring `[0, 0, 0, 0]`, `1=tracked`, `2=vlm_anchor`, `3=static_locked`), and `dense_conf_pct` (`0..100`, validated by `_validate_dense`).
+     - `arm_timelines` (`ArmTimelines`: `left` / `right` `ArmSpan` with `state ∈ {idle, work, hold, anom, mask, good}`).
    - Editable target baselines: `macro_stages` (`list[MacroStage]` with `label` and optional `label_en`), `qc_segments` (`list[QcSegment]` with `name`), `success` (`SuccessVerdict`).
    - **`QcSegment` Triplet Consistency** (enforced by `_validate_triplet_and_span`):
      - `keep_positive`: requires `mask_side is None` and `training_role ∈ {"necessary", "recovery"}`.
@@ -248,7 +260,7 @@ Crucial isolation guarantees in [`ConfigManager`](../robo_vlm_qc/config.py):
 - `s5_cache_basis(task_id)`: depends ONLY on `s5_success` model/prompt/settings and task `goal`/`criteria`/`task_prompt`.
 - `s3_cache_basis(task_id, few_shot_hash)` and `s4_cache_basis(task_id, few_shot_hash)`: include `label_taxonomy_sha256`, full `TaskSpec`, and `few_shot_hash`.
 
-Therefore, updating QC labels (`labels.yaml`), S3/S4 prompts, or Few-Shot examples in `VLM Lab` yields **100% cache hits (0 tokens, 0 upstream HTTP calls)** on `S1`, `S2`, and `S5`, re-executing only `S3` and `S4`.
+Therefore, updating QC labels (`labels.yaml`), S3/S4 prompts, or Few-Shot examples in `VLM Lab` yields **100% cache hits (0 tokens, 0 upstream HTTP calls)** on `S1`, `S2`, and `S5`, re-executing only `S3` and `S4`. Likewise, because `s2_key`–`s5_key` do not include `s1_key` in `upstream_hash`, re-running `S1` alone (e.g., after tuning `s1_grounding` or `tracking.*`) preserves **100% cache hits** on `S2`–`S5`.
 
 ### 5.2 Multi-Provider `VlmClient` (`vlm/client.py`)
 
@@ -256,7 +268,7 @@ Therefore, updating QC labels (`labels.yaml`), S3/S4 prompts, or Few-Shot exampl
 - Defaults to `base_url="https://api.openai.com/v1"`, `api_key_env="OPENAI_API_KEY"`, `key_file=".env"`, `default_model="gpt-4o"`, `thinking: false`, and `thinking_mode="auto"`. Ready-to-use provider overrides are packaged under [`configs/presets/`](../configs/presets/).
 - Stage-level heterogeneous model routing via `vlm.stage_models` (`s1_grounding`..`s5_success`).
 - Provider-safe thinking handling (`thinking_mode: auto | dashscope | disabled`): DashScope-specific `enable_thinking`/`thinking_budget` fields are emitted only when `thinking: true` and `thinking_mode == "dashscope"` (or `thinking_mode == "auto"` with a DashScope `base_url`); standard OpenAI-compatible endpoints always receive clean payloads with `response_format={"type": "json_object"}`.
-- Exponential backoff retries (`retries=3`, `1.0s..16.0s`) and hierarchical `BudgetTracker` (`ceil(duration_s * 5000)`, minimum `200000` tokens unless `unlimited: true`).
+- Exponential backoff retries (`retries=3`, `1.0s..16.0s`, interruptible via `cancel_event.wait`), cooperative mid-flight cancellation (`VlmClient.cancel()` shuts down active TCP sockets and raises `VlmCancelledError`), and hierarchical `BudgetTracker` (`ceil(duration_s * 5000)`, minimum `200000` tokens unless `unlimited: true`).
 
 ---
 

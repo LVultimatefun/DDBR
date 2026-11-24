@@ -398,6 +398,48 @@
   border: 1px solid var(--badge-info-border);
 }
 
+.grounding-cam-mismatch-hint {
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--badge-neutral-bg);
+  color: var(--badge-neutral-text);
+  line-height: 1.5;
+}
+
+.grounding-version-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 6px;
+  border-radius: 999px;
+  line-height: 1.5;
+  border: 1px solid transparent;
+}
+
+.grounding-version-chip.dense {
+  background: var(--badge-info-bg);
+  color: var(--badge-info-text);
+  border-color: var(--badge-info-border);
+}
+
+.grounding-version-chip.sparse {
+  background: var(--badge-warn-bg);
+  color: var(--badge-warn-text);
+  border-color: var(--badge-warn-border);
+}
+
+.pill-btn.active .grounding-version-chip.dense {
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--on-solid);
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.pill-btn.active .grounding-version-chip.sparse {
+  background: rgba(254, 243, 199, 0.92);
+  color: #92400e;
+  border-color: rgba(252, 211, 77, 0.85);
+}
+
 /* ==========================================================================
    4. FourTrackTimeline NLE Handles, Brush Create, Heatmap Bar
    ========================================================================== */

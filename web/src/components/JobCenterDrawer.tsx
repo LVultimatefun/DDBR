@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import { Activity, Download, RefreshCw, X, XCircle } from "lucide-react";
 import { exportDownloadUrl } from "../api/client";
 import type { JobStatus } from "../api/types";
@@ -26,6 +26,21 @@ export const JobCenterDrawer: React.FC = () => {
   const { isLead, token } = useAuth();
   const { jobs, drawerOpen, setDrawerOpen, refreshJobs, cancelJob, artifactDownloadUrl } =
     useJobs();
+  const [cancellingIds, setCancellingIds] = useState<Record<string, boolean>>({});
+
+  const handleCancelClick = async (jobId: string) => {
+    if (cancellingIds[jobId]) return;
+    setCancellingIds((prev) => ({ ...prev, [jobId]: true }));
+    try {
+      await cancelJob(jobId);
+    } finally {
+      setCancellingIds((prev) => {
+        const next = { ...prev };
+        delete next[jobId];
+        return next;
+      });
+    }
+  };
 
   useEffect(() => {
     if (!drawerOpen) return;
@@ -126,10 +141,11 @@ export const JobCenterDrawer: React.FC = () => {
                         <button
                           type="button"
                           className="danger-btn compact"
+                          disabled={Boolean(cancellingIds[job.job_id])}
                           data-testid={`drawer-cancel-job-${job.job_id}`}
-                          onClick={() => void cancelJob(job.job_id)}
+                          onClick={() => void handleCancelClick(job.job_id)}
                         >
-                          <XCircle size={12} /> Cancel
+                          <XCircle size={12} /> {cancellingIds[job.job_id] ? "Cancelling..." : "Cancel"}
                         </button>
                       )}
                       {job.status === "completed" &&

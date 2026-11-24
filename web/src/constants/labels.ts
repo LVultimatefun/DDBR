@@ -441,12 +441,19 @@ export function createDefaultSegment(
   durationS: number,
   labelDef: VisualLabelDef = DEFAULT_VISUAL_LABELS[2],
 ): QcSegment {
-  const safeStart = Math.max(0, Number(tStart.toFixed(2)));
-  const safeEnd = Math.min(durationS, Math.max(safeStart + 0.5, Number((safeStart + 1.0).toFixed(2))));
+  const maxDur = Math.max(0.1, Number.isFinite(durationS) ? durationS : 1.0);
+  const fallbackSpan = Math.min(1.0, Math.max(0.1, Number((maxDur * 0.2).toFixed(2))));
+  const rawStart = Math.max(0, Number.isFinite(tStart) ? Number(tStart.toFixed(2)) : 0);
+  const safeStart = Number(
+    (rawStart + 0.1 > maxDur ? Math.max(0, maxDur - fallbackSpan) : rawStart).toFixed(2),
+  );
+  const safeEnd = Number(
+    Math.min(maxDur, Math.max(safeStart + 0.1, Number((safeStart + 1.0).toFixed(2)))).toFixed(2),
+  );
   const base: QcSegment = {
     seg_id: `human_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
     t_start: safeStart,
-    t_end: safeEnd > safeStart ? safeEnd : Number((safeStart + 0.2).toFixed(2)),
+    t_end: safeEnd > safeStart ? safeEnd : Number(maxDur.toFixed(2)),
     label_id: labelDef.id,
     name: labelDef.name,
     training_role: labelDef.default_training_role,

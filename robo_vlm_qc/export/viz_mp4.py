@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import functools
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ from ..io.media import DEFAULT_MAIN_ZOOM, select_tile_mode
 from ..models.annotation import (
     ArmSpan,
     GroundingKeyframe,
+    GroundingResult,
     GroundingTrack,
     MacroStage,
     QcSegment,
@@ -175,24 +177,70 @@ def _wrap_text(
     return lines
 
 
+def _compute_center_crop_rect(
+    src_w: int, src_h: int, target_w: int, target_h: int
+) -> tuple[int, int, int, int]:
+    """Return exact center-crop rectangle (x0, y0, crop_w, crop_h) used by `_fit_crop_resize`."""
+    if src_w <= 0 or src_h <= 0 or target_w <= 0 or target_h <= 0:
+        return 0, 0, max(1, src_w), max(1, src_h)
+    target_ar = target_w / float(target_h)
+    src_ar = src_w / float(src_h)
+    if abs(src_ar - target_ar) > 0.05:
+        if src_ar > target_ar:
+            new_w = max(2, int(round(src_h * target_ar)))
+            x0 = max(0, (src_w - new_w) // 2)
+            return x0, 0, min(new_w, src_w - x0), src_h
+        new_h = max(2, int(round(src_w / target_ar)))
+        y0 = max(0, (src_h - new_h) // 2)
+        return 0, y0, src_w, min(new_h, src_h - y0)
+    return 0, 0, src_w, src_h
+
+
 def _fit_crop_resize(rgb: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
     """Resize RGB image to target_w x target_h preserving aspect ratio via center crop."""
     h, w = rgb.shape[:2]
     if h <= 0 or w <= 0:
         return np.zeros((target_h, target_w, 3), dtype=np.uint8)
-    target_ar = target_w / float(target_h)
-    src_ar = w / float(h)
-    if abs(src_ar - target_ar) > 0.05:
-        if src_ar > target_ar:
-            new_w = max(2, int(round(h * target_ar)))
-            x0 = max(0, (w - new_w) // 2)
-            rgb = rgb[:, x0 : x0 + new_w]
-        else:
-            new_h = max(2, int(round(w / target_ar)))
-            y0 = max(0, (h - new_h) // 2)
-            rgb = rgb[y0 : y0 + new_h, :]
+    x0, y0, cw, ch = _compute_center_crop_rect(w, h, target_w, target_h)
+    if x0 != 0 or y0 != 0 or cw != w or ch != h:
+        rgb = rgb[y0 : y0 + ch, x0 : x0 + cw]
     interp = cv2.INTER_AREA if rgb.shape[1] >= target_w else cv2.INTER_LINEAR
     return cv2.resize(rgb, (target_w, target_h), interpolation=interp)
+
+
+def _project_norm_box_for_crop(
+    bbox_norm_1000: Sequence[float],
+    src_w: int,
+    src_h: int,
+    target_w: int = 1280,
+    target_h: int = 720,
+) -> list[int] | None:
+    """Project [0,1000] bbox from original uncropped frame into center-cropped target view."""
+    if src_w <= 0 or src_h <= 0 or target_w <= 0 or target_h <= 0:
+        return None
+    x0, y0, cw, ch = _compute_center_crop_rect(src_w, src_h, target_w, target_h)
+    sx1 = float(bbox_norm_1000[0]) * src_w / 1000.0
+    sy1 = float(bbox_norm_1000[1]) * src_h / 1000.0
+    sx2 = float(bbox_norm_1000[2]) * src_w / 1000.0
+    sy2 = float(bbox_norm_1000[3]) * src_h / 1000.0
+
+    scale_x = target_w / float(max(1, cw))
+    scale_y = target_h / float(max(1, ch))
+    tx1 = (sx1 - x0) * scale_x
+    ty1 = (sy1 - y0) * scale_y
+    tx2 = (sx2 - x0) * scale_x
+    ty2 = (sy2 - y0) * scale_y
+
+    if tx2 <= 0.0 or tx1 >= target_w or ty2 <= 0.0 or ty1 >= target_h:
+        return None
+
+    ix1 = int(round(max(0.0, min(float(target_w - 1), tx1))))
+    iy1 = int(round(max(0.0, min(float(target_h - 1), ty1))))
+    ix2 = int(round(max(0.0, min(float(target_w - 1), tx2))))
+    iy2 = int(round(max(0.0, min(float(target_h - 1), ty2))))
+    if ix2 <= ix1 + 1 or iy2 <= iy1 + 1:
+        return None
+    return [ix1, iy1, ix2, iy2]
 
 
 def _pick_tick_step(duration_s: float) -> float:
@@ -212,74 +260,123 @@ def _smoothstep(u: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
-def _interp_track_box(
-    track: GroundingTrack, t_s: float, view_w: int, view_h: int
-) -> tuple[list[int], str, str] | None:
-    vis_kfs: list[GroundingKeyframe] = [k for k in track.keyframes if k.visible]
+def _nearest_visible_anchor_meta(track: GroundingTrack, t_s: float) -> tuple[str, str]:
+    vis_kfs = [k for k in track.keyframes if k.visible]
     if not vis_kfs:
-        return None
-    if len(vis_kfs) == 1 or t_s <= vis_kfs[0].time_s:
+        return "", "neutral"
+    times = [k.time_s for k in vis_kfs]
+    pos = bisect.bisect_left(times, t_s)
+    if pos <= 0:
         k = vis_kfs[0]
-        if abs(t_s - k.time_s) > 3.0 and not track.is_static_container:
-            return None
-        b = k.bbox_norm_1000
-        return (
-            [
-                int(round(b[0] * view_w / 1000.0)),
-                int(round(b[1] * view_h / 1000.0)),
-                int(round(b[2] * view_w / 1000.0)),
-                int(round(b[3] * view_h / 1000.0)),
-            ],
-            k.state,
-            k.status_kind,
-        )
-    if t_s >= vis_kfs[-1].time_s:
+    elif pos >= len(vis_kfs):
         k = vis_kfs[-1]
-        if abs(t_s - k.time_s) > 3.0 and not track.is_static_container:
-            return None
-        b = k.bbox_norm_1000
-        return (
-            [
-                int(round(b[0] * view_w / 1000.0)),
-                int(round(b[1] * view_h / 1000.0)),
-                int(round(b[2] * view_w / 1000.0)),
-                int(round(b[3] * view_h / 1000.0)),
-            ],
-            k.state,
-            k.status_kind,
-        )
+    else:
+        k = vis_kfs[pos - 1] if (t_s - times[pos - 1]) <= (times[pos] - t_s) else vis_kfs[pos]
+    return k.state, k.status_kind
 
-    for i in range(len(vis_kfs) - 1):
-        k0, k1 = vis_kfs[i], vis_kfs[i + 1]
-        if k0.time_s <= t_s <= k1.time_s:
-            span = max(1e-6, k1.time_s - k0.time_s)
-            if span > 4.0 and not track.is_static_container:
-                nearest = k0 if (t_s - k0.time_s) <= (k1.time_s - t_s) else k1
-                if abs(t_s - nearest.time_s) > 1.5:
-                    return None
-                b = nearest.bbox_norm_1000
-                return (
-                    [
-                        int(round(b[0] * view_w / 1000.0)),
-                        int(round(b[1] * view_h / 1000.0)),
-                        int(round(b[2] * view_w / 1000.0)),
-                        int(round(b[3] * view_h / 1000.0)),
-                    ],
-                    nearest.state,
-                    nearest.status_kind,
-                )
-            w = _smoothstep((t_s - k0.time_s) / span)
-            b0 = k0.bbox_norm_1000
-            b1 = k1.bbox_norm_1000
-            interp_b = [
-                int(round(((1.0 - w) * b0[0] + w * b1[0]) * view_w / 1000.0)),
-                int(round(((1.0 - w) * b0[1] + w * b1[1]) * view_h / 1000.0)),
-                int(round(((1.0 - w) * b0[2] + w * b1[2]) * view_w / 1000.0)),
-                int(round(((1.0 - w) * b0[3] + w * b1[3]) * view_h / 1000.0)),
-            ]
-            ref_k = k0 if w < 0.5 else k1
-            return interp_b, ref_k.state, ref_k.status_kind
-    return None
+
+def _interp_track_box(
+    track: GroundingTrack,
+    t_s: float,
+    view_w: int,
+    view_h: int,
+    *,
+    grounding: GroundingResult | None = None,
+    src_w: int | None = None,
+    src_h: int | None = None,
+) -> tuple[list[int], str, str] | None:
+    eff_src_w = int(src_w) if src_w and src_w > 0 else view_w
+    eff_src_h = int(src_h) if src_h and src_h > 0 else view_h
+
+    # Fast dense path (schema_version >= 2)
+    if (
+        grounding is not None
+        and grounding.dense_times_s
+        and len(track.dense_boxes_norm_1000) == len(grounding.dense_times_s)
+    ):
+        times = grounding.dense_times_s
+        boxes = track.dense_boxes_norm_1000
+        flags = track.dense_flags
+        n = len(times)
+
+        def _flag_at(idx: int) -> int:
+            if flags:
+                return flags[idx]
+            return 0 if boxes[idx] == [0, 0, 0, 0] else 1
+
+        pos = bisect.bisect_left(times, t_s)
+        norm_box: list[float] | None = None
+        if pos <= 0:
+            if _flag_at(0) > 0:
+                norm_box = [float(v) for v in boxes[0]]
+        elif pos >= n:
+            if _flag_at(n - 1) > 0:
+                norm_box = [float(v) for v in boxes[n - 1]]
+        else:
+            i0, i1 = pos - 1, pos
+            f0, f1 = _flag_at(i0), _flag_at(i1)
+            dt = times[i1] - times[i0]
+            if f0 > 0 and f1 > 0 and dt <= 0.5:
+                u = (t_s - times[i0]) / max(1e-6, dt)
+                b0, b1 = boxes[i0], boxes[i1]
+                norm_box = [(1.0 - u) * b0[j] + u * b1[j] for j in range(4)]
+            else:
+                pick = i0 if (t_s - times[i0]) <= (times[i1] - t_s) else i1
+                if _flag_at(pick) > 0:
+                    norm_box = [float(v) for v in boxes[pick]]
+
+        if norm_box is None:
+            return None
+        proj = _project_norm_box_for_crop(norm_box, eff_src_w, eff_src_h, view_w, view_h)
+        if proj is None:
+            return None
+        state, skind = _nearest_visible_anchor_meta(track, t_s)
+        return proj, state, skind
+
+    # Legacy sparse fallback (schema_version == 1)
+    kfs: list[GroundingKeyframe] = list(track.keyframes)
+    if not kfs:
+        return None
+    kf_times = [k.time_s for k in kfs]
+    pos = bisect.bisect_left(kf_times, t_s)
+
+    if pos <= 0:
+        k = kfs[0]
+        if not k.visible:
+            return None
+        if abs(t_s - k.time_s) > 4.5 and not track.is_static_container:
+            return None
+        proj = _project_norm_box_for_crop(k.bbox_norm_1000, eff_src_w, eff_src_h, view_w, view_h)
+        return (proj, k.state, k.status_kind) if proj is not None else None
+
+    if pos >= len(kfs):
+        k = kfs[-1]
+        if not k.visible:
+            return None
+        if abs(t_s - k.time_s) > 4.5 and not track.is_static_container:
+            return None
+        proj = _project_norm_box_for_crop(k.bbox_norm_1000, eff_src_w, eff_src_h, view_w, view_h)
+        return (proj, k.state, k.status_kind) if proj is not None else None
+
+    k0, k1 = kfs[pos - 1], kfs[pos]
+    span = max(1e-6, k1.time_s - k0.time_s)
+    if k0.visible and k1.visible and (span <= 4.5 or track.is_static_container):
+        w = _smoothstep((t_s - k0.time_s) / span)
+        b0, b1 = k0.bbox_norm_1000, k1.bbox_norm_1000
+        norm_b = [(1.0 - w) * b0[j] + w * b1[j] for j in range(4)]
+        proj = _project_norm_box_for_crop(norm_b, eff_src_w, eff_src_h, view_w, view_h)
+        if proj is None:
+            return None
+        ref_k = k0 if w < 0.5 else k1
+        return proj, ref_k.state, ref_k.status_kind
+
+    nearest = k0 if (t_s - k0.time_s) <= (k1.time_s - t_s) else k1
+    if not nearest.visible:
+        return None
+    if abs(t_s - nearest.time_s) > 2.0 and not track.is_static_container:
+        return None
+    proj = _project_norm_box_for_crop(nearest.bbox_norm_1000, eff_src_w, eff_src_h, view_w, view_h)
+    return (proj, nearest.state, nearest.status_kind) if proj is not None else None
 
 
 def _find_active_idx(spans: Sequence[Any], t_s: float) -> int:
@@ -636,39 +733,73 @@ class _HudCompositor:
         canvas = self._base_bg.copy()
 
         # Main view (1280x720 -> [60:780, 16:1296])
+        src_h, src_w = main_rgb.shape[:2]
         main_resized = _fit_crop_resize(main_rgb, 1280, 720)
         main_bgr = np.ascontiguousarray(main_resized[:, :, ::-1])
 
-        # Draw 2D grounding boxes on main_bgr
-        for oid, track in self.resolved.grounding.object_tracks_2d.items():
-            res = _interp_track_box(track, t_s, 1280, 720)
-            if res is None:
-                continue
-            box, state, skind = res
-            x1, y1, x2, y2 = [max(0, min(1279, box[0])), max(0, min(719, box[1])), max(0, min(1279, box[2])), max(0, min(719, box[3]))]
-            if x2 <= x1 + 4 or y2 <= y1 + 4:
-                continue
-            bgr_col = (68, 68, 239) if skind == "error" else ((11, 158, 245) if skind == "warn" else ((129, 185, 16) if skind == "good" else (246, 130, 59)))
-            # Corner brackets
-            blen = min(18, (x2 - x1) // 3, (y2 - y1) // 3)
-            cv2.rectangle(main_bgr, (x1, y1), (x2, y2), bgr_col, 1)
-            for cx, cy, dx, dy in (
-                (x1, y1, 1, 1),
-                (x2, y1, -1, 1),
-                (x1, y2, 1, -1),
-                (x2, y2, -1, -1),
-            ):
-                cv2.line(main_bgr, (cx, cy), (cx + dx * blen, cy), bgr_col, 3)
-                cv2.line(main_bgr, (cx, cy), (cx, cy + dy * blen), bgr_col, 3)
+        # Draw 2D grounding boxes on main_bgr (only when grounded camera matches main cam)
+        main_cam = self.roles.get("main") or (
+            self.view.media.cameras[0].name if self.view.media.cameras else ""
+        )
+        grounded_cam = self.resolved.grounding.camera_name
+        if not grounded_cam or grounded_cam == main_cam:
+            for oid, track in self.resolved.grounding.object_tracks_2d.items():
+                res = _interp_track_box(
+                    track,
+                    t_s,
+                    1280,
+                    720,
+                    grounding=self.resolved.grounding,
+                    src_w=src_w,
+                    src_h=src_h,
+                )
+                if res is None:
+                    continue
+                box, state, skind = res
+                x1, y1, x2, y2 = [
+                    max(0, min(1279, box[0])),
+                    max(0, min(719, box[1])),
+                    max(0, min(1279, box[2])),
+                    max(0, min(719, box[3])),
+                ]
+                if x2 <= x1 + 4 or y2 <= y1 + 4:
+                    continue
+                bgr_col = (
+                    (68, 68, 239)
+                    if skind == "error"
+                    else (
+                        (11, 158, 245)
+                        if skind == "warn"
+                        else (
+                            (129, 185, 16) if skind == "good" else (246, 130, 59)
+                        )
+                    )
+                )
+                # Corner brackets
+                blen = min(18, (x2 - x1) // 3, (y2 - y1) // 3)
+                cv2.rectangle(main_bgr, (x1, y1), (x2, y2), bgr_col, 1)
+                for cx, cy, dx, dy in (
+                    (x1, y1, 1, 1),
+                    (x2, y1, -1, 1),
+                    (x1, y2, 1, -1),
+                    (x2, y2, -1, -1),
+                ):
+                    cv2.line(main_bgr, (cx, cy), (cx + dx * blen, cy), bgr_col, 3)
+                    cv2.line(main_bgr, (cx, cy), (cx, cy + dy * blen), bgr_col, 3)
 
-            tag_txt = f"{track.name or oid}" + (f" | {state}" if state else "")
-            pil_tag = Image.fromarray(main_bgr[:, :, ::-1])
-            d_tag = ImageDraw.Draw(pil_tag)
-            tw = min(320, _text_width(d_tag, tag_txt, self.f_reg_12) + 12)
-            ty = max(0, y1 - 22) if track.tag_pos == "top" else min(698, y2 + 2)
-            d_tag.rectangle((x1, ty, min(1279, x1 + tw), ty + 20), fill=bgr_col[::-1])
-            d_tag.text((x1 + 6, ty + 3), _fit_single_line(d_tag, tag_txt, self.f_reg_12, tw - 8), font=self.f_reg_12, fill=(255, 255, 255))
-            main_bgr = np.ascontiguousarray(np.asarray(pil_tag, dtype=np.uint8)[:, :, ::-1])
+                tag_txt = f"{track.name or oid}" + (f" | {state}" if state else "")
+                pil_tag = Image.fromarray(main_bgr[:, :, ::-1])
+                d_tag = ImageDraw.Draw(pil_tag)
+                tw = min(320, _text_width(d_tag, tag_txt, self.f_reg_12) + 12)
+                ty = max(0, y1 - 22) if track.tag_pos == "top" else min(698, y2 + 2)
+                d_tag.rectangle((x1, ty, min(1279, x1 + tw), ty + 20), fill=bgr_col[::-1])
+                d_tag.text(
+                    (x1 + 6, ty + 3),
+                    _fit_single_line(d_tag, tag_txt, self.f_reg_12, tw - 8),
+                    font=self.f_reg_12,
+                    fill=(255, 255, 255),
+                )
+                main_bgr = np.ascontiguousarray(np.asarray(pil_tag, dtype=np.uint8)[:, :, ::-1])
 
         stage_idx = _find_active_idx(self.resolved.macro_stages, t_s)
         l_idx = _find_active_idx(self.resolved.arm_timelines.left, t_s)

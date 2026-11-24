@@ -18,14 +18,17 @@ import {
   Undo2,
   Unlock,
   Video,
+  XCircle,
 } from "lucide-react";
 import {
   ApiError,
   buildReviewWritePayload,
+  cancelJob as apiCancelJob,
   claimEpisode,
   createJob,
   encodeEpPath,
   getEpisode,
+  getJob,
   getLabLabels,
   getSettings,
   getSharedLabels,
@@ -38,6 +41,7 @@ import {
 } from "../api/client";
 import type {
   HumanReviewArtifact,
+  JobStatus,
   MacroStage,
   ResolvedEpisode,
   ReviewAction,
@@ -123,8 +127,16 @@ export const ReviewStudioPage: React.FC = () => {
     return params["*"] ?? "";
   }, [params]);
 
-  const { isLead, username, token, canApprove, canFreezeGt, canViewDiff, setAuthPromptOpen } =
-    useAuth();
+  const {
+    isLead,
+    username,
+    token,
+    authProbing,
+    canApprove,
+    canFreezeGt,
+    canViewDiff,
+    setAuthPromptOpen,
+  } = useAuth();
   const jobStore = useJobs();
   const toast = useToast();
 
@@ -149,8 +161,10 @@ export const ReviewStudioPage: React.FC = () => {
   const [shortcutsOpen, setShortcutsOpen] = useState<boolean>(false);
   const [rerunMenuOpen, setRerunMenuOpen] = useState<boolean>(false);
   const [rerunning, setRerunning] = useState<boolean>(false);
+  const [cancellingRerun, setCancellingRerun] = useState<boolean>(false);
   const [localRerunJobId, setLocalRerunJobId] = useState<string | null>(null);
   const [rerunCompletedReady, setRerunCompletedReady] = useState<boolean>(false);
+  const [rerunCompletedRunId, setRerunCompletedRunId] = useState<string | null>(null);
 
   const [leftPanePct, setLeftPanePct] = useState<number>(loadSplitPct);
   const [draggingSplit, setDraggingSplit] = useState<boolean>(false);
@@ -185,19 +199,21 @@ export const ReviewStudioPage: React.FC = () => {
   const searchKey = searchParams.toString();
   const deepLinkRunId = searchParams.get("run_id") ?? "";
 
+  const { showToast } = toast;
   const notify = useCallback(
     (message: string, variant: "success" | "info" | "warning" | "error" = "info") => {
-      toast.showToast({
+      showToast({
         message,
         variant,
         testId: "studio-info-banner",
       });
     },
-    [toast],
+    [showToast],
   );
 
   // Fetch workspace settings (min_watch_coverage)
   useEffect(() => {
+    if (authProbing) return;
     let cancelled = false;
     void getSettings()
       .then((res) => {
@@ -218,10 +234,10 @@ export const ReviewStudioPage: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [token]);
+  }, [token, authProbing]);
 
   const loadRunsCatalog = useCallback(async () => {
-    if (!episodeId || !isLead) {
+    if (!episodeId || !isLead || authProbing) {
       setAvailableRuns([]);
       return;
     }
@@ -233,16 +249,23 @@ export const ReviewStudioPage: React.FC = () => {
     } catch {
       setAvailableRuns([]);
     }
-  }, [episodeId, isLead]);
+  }, [episodeId, isLead, authProbing]);
 
   useEffect(() => {
     void loadRunsCatalog();
   }, [loadRunsCatalog, token]);
 
+  const loadSeqRef = useRef(0);
+  const selectedRunIdRef = useRef(selectedRunId);
+  selectedRunIdRef.current = selectedRunId;
+  const minWatchCoverageRef = useRef(minWatchCoverage);
+  minWatchCoverageRef.current = minWatchCoverage;
+
   const loadEpisodeData = useCallback(
     async (runIdOverride?: string) => {
       if (!episodeId) return;
-      const targetRunId = runIdOverride !== undefined ? runIdOverride : selectedRunId;
+      const seq = ++loadSeqRef.current;
+      const targetRunId = runIdOverride !== undefined ? runIdOverride : selectedRunIdRef.current;
       setLoading(true);
       setError(null);
       try {
@@ -250,6 +273,7 @@ export const ReviewStudioPage: React.FC = () => {
           getEpisode(episodeId, targetRunId || undefined),
           listReviews(episodeId).catch(() => [] as HumanReviewArtifact[]),
         ]);
+        if (seq !== loadSeqRef.current) return;
         setEpisode(ep);
         setReviews(revs);
         const loadedNotes = ep.notes ?? "";
@@ -325,20 +349,24 @@ export const ReviewStudioPage: React.FC = () => {
         setSelectedStageId(nextSelectedStageId);
         setSelectedSegmentId(nextSelectedSegId);
 
+        const covThreshold = minWatchCoverageRef.current;
         const preservedIntervals =
           trackedEpisodeIdRef.current === ep.episode_id
-            ? trackerRef.current.snapshot(minWatchCoverage).watched_intervals
+            ? trackerRef.current.snapshot(covThreshold).watched_intervals
             : [];
         trackedEpisodeIdRef.current = ep.episode_id;
         trackerRef.current = new WatchCoverageTracker(ep.meta.duration_s, preservedIntervals);
-        setWatchCoverage(trackerRef.current.snapshot(minWatchCoverage));
+        setWatchCoverage(trackerRef.current.snapshot(covThreshold));
       } catch (err) {
+        if (seq !== loadSeqRef.current) return;
         if (err instanceof ApiError && err.status === 401) {
           setAuthPromptOpen(true);
         }
         setError(err instanceof Error ? err.message : "Failed to load episode details");
       } finally {
-        setLoading(false);
+        if (seq === loadSeqRef.current) {
+          setLoading(false);
+        }
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
     },
@@ -349,13 +377,27 @@ export const ReviewStudioPage: React.FC = () => {
   useEffect(() => {
     setSelectedRunId(isLead && deepLinkRunId ? deepLinkRunId : "");
     setLocalRerunJobId(null);
+    setRerunning(false);
+    setCancellingRerun(false);
     setRerunCompletedReady(false);
+    setRerunCompletedRunId(null);
   }, [episodeId, isLead, deepLinkRunId]);
 
   useEffect(() => {
+    if (authProbing) return;
     void loadEpisodeData(isLead && deepLinkRunId ? deepLinkRunId : "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [episodeId, token, searchKey]);
+  }, [episodeId, token, searchKey, authProbing]);
+
+  // If ?run_id=... is present and user elevates to Lead without changing token (e.g. --no-auth switch), load that run
+  useEffect(() => {
+    if (authProbing || !isLead || !deepLinkRunId) return;
+    if (episode && episode.selected_run_id !== deepLinkRunId) {
+      setSelectedRunId(deepLinkRunId);
+      void loadEpisodeData(deepLinkRunId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLead, deepLinkRunId, authProbing]);
 
   // Recompute watchCoverage snapshot when dynamic min_watch_coverage setting loads
   useEffect(() => {
@@ -370,19 +412,114 @@ export const ReviewStudioPage: React.FC = () => {
     }
   }, [canViewDiff, searchParams, episode]);
 
-  // Watch jobStore for completion of our triggered single-episode local VLM rerun
+  const handledRerunJobIdsRef = useRef<Set<string>>(new Set());
+  const prevJobStatusRef = useRef<Map<string, JobStatus["status"]>>(new Map());
+
+  const handleRerunTerminalJob = useCallback(
+    (tracked: JobStatus) => {
+      if (handledRerunJobIdsRef.current.has(tracked.job_id)) return;
+      if (tracked.status === "completed") {
+        handledRerunJobIdsRef.current.add(tracked.job_id);
+        const firstRes = tracked.summary?.results?.[0];
+        const newRunId =
+          firstRes && typeof firstRes.run_id === "string" ? (firstRes.run_id as string) : null;
+        setRerunCompletedRunId(newRunId);
+        setRerunCompletedReady(true);
+        setRerunning(false);
+        setLocalRerunJobId(null);
+        void loadRunsCatalog();
+      } else if (tracked.status === "failed" || tracked.status === "cancelled") {
+        handledRerunJobIdsRef.current.add(tracked.job_id);
+        setRerunning(false);
+        setLocalRerunJobId(null);
+        const errDetail = tracked.summary?.errors?.[0]?.error;
+        notify(
+          tracked.status === "cancelled"
+            ? `Single-episode VLM rerun job ${tracked.job_id} cancelled; episode status reverted`
+            : errDetail
+              ? `Single-episode VLM rerun job ${tracked.job_id} failed: ${errDetail}`
+              : `Single-episode VLM rerun job ${tracked.job_id} failed`,
+          tracked.status === "cancelled" ? "warning" : "error",
+        );
+        void loadEpisodeData();
+      }
+    },
+    [loadRunsCatalog, loadEpisodeData, notify],
+  );
+
+  // Watch jobStore for completion/cancellation/failure of our triggered single-episode local VLM rerun
   useEffect(() => {
-    if (!localRerunJobId) return;
+    if (!localRerunJobId || handledRerunJobIdsRef.current.has(localRerunJobId)) return;
     const tracked = jobStore.jobs.find((j) => j.job_id === localRerunJobId);
     if (!tracked) return;
-    if (tracked.status === "completed") {
-      setRerunCompletedReady(true);
-      setRerunning(false);
-      void loadRunsCatalog();
-    } else if (tracked.status === "failed" || tracked.status === "cancelled") {
-      setRerunning(false);
+    handleRerunTerminalJob(tracked);
+  }, [jobStore.jobs, localRerunJobId, handleRerunTerminalJob]);
+
+  // Fallback polling for localRerunJobId when mounted standalone without JobProvider
+  useEffect(() => {
+    if (!localRerunJobId || !rerunning || jobStore.isProvided) return;
+    let stopped = false;
+    const timer = window.setInterval(() => {
+      if (stopped) return;
+      void getJob(localRerunJobId)
+        .then((latest) => {
+          if (stopped) return;
+          if (
+            latest.status === "completed" ||
+            latest.status === "failed" ||
+            latest.status === "cancelled"
+          ) {
+            handleRerunTerminalJob(latest);
+          }
+        })
+        .catch(() => {
+          // Ignore transient polling errors
+        });
+    }, 1500);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [localRerunJobId, rerunning, jobStore.isProvided, handleRerunTerminalJob]);
+
+  // Also refresh episode status if an externally started batch_vlm job targeting this episode is cancelled/failed
+  useEffect(() => {
+    if (!jobStore.isProvided || !episodeId) return;
+    let shouldReload = false;
+    const prevMap = prevJobStatusRef.current;
+    for (const job of jobStore.jobs) {
+      const prev = prevMap.get(job.job_id);
+      prevMap.set(job.job_id, job.status);
+      if (job.job_id === localRerunJobId || handledRerunJobIdsRef.current.has(job.job_id)) {
+        continue;
+      }
+      const wasActive = prev === "queued" || prev === "running";
+      const isCancelledOrFailed = job.status === "cancelled" || job.status === "failed";
+      const epIds = Array.isArray(job.params?.episode_ids)
+        ? (job.params.episode_ids as unknown[])
+        : [];
+      if (
+        wasActive &&
+        isCancelledOrFailed &&
+        job.job_type === "batch_vlm" &&
+        (epIds.includes(episodeId) ||
+          episode?.status === "vlm_queued" ||
+          episode?.status === "vlm_running")
+      ) {
+        shouldReload = true;
+      }
     }
-  }, [jobStore.jobs, localRerunJobId, loadRunsCatalog]);
+    if (shouldReload) {
+      void loadEpisodeData();
+    }
+  }, [
+    jobStore.isProvided,
+    jobStore.jobs,
+    episodeId,
+    localRerunJobId,
+    episode?.status,
+    loadEpisodeData,
+  ]);
 
   // Close rerun split menu when clicking outside
   useEffect(() => {
@@ -398,6 +535,7 @@ export const ReviewStudioPage: React.FC = () => {
 
   // Load label catalog separately so role probe updates do not discard unsaved edits / undo history
   useEffect(() => {
+    if (authProbing) return;
     let cancelled = false;
     const req = isLead ? getLabLabels() : getSharedLabels();
     void req
@@ -414,7 +552,7 @@ export const ReviewStudioPage: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [isLead, token]);
+  }, [isLead, token, authProbing]);
 
   // Lease heartbeat renewal every 60s when claimed by current user
   const isClaimedByMe = claimedBy === username;
@@ -665,12 +803,16 @@ export const ReviewStudioPage: React.FC = () => {
       setSaving(true);
       setError(null);
       try {
+        const sanitizedStages = history.state.macro_stages.map((st, idx) => ({
+          ...st,
+          label: st.label.trim() || `Stage ${idx + 1}`,
+        }));
         const payload = buildReviewWritePayload({
           baseRunId: episode.active_run_id,
           action,
           qcSegments: history.state.qc_segments,
           success: history.state.success,
-          macroStages: history.state.macro_stages,
+          macroStages: sanitizedStages,
           watchCoverage,
           notes,
           flaggedReason: action === "flag" ? flaggedReason.trim() : null,
@@ -740,10 +882,12 @@ export const ReviewStudioPage: React.FC = () => {
     }
   };
 
-  const handleLocalRerunVlm = async (mode: "s3_s4" | "s1_s5") => {
+  const handleLocalRerunVlm = async (mode: "s3_s4" | "s1_grounding" | "s1_s5") => {
+    if (isGtFrozen) return;
     setRerunMenuOpen(false);
     setRerunning(true);
     setRerunCompletedReady(false);
+    setRerunCompletedRunId(null);
     setError(null);
     try {
       const job = await createJob({
@@ -754,16 +898,46 @@ export const ReviewStudioPage: React.FC = () => {
       });
       setLocalRerunJobId(job.job_id);
       jobStore.trackJob(job);
-      const label = mode === "s3_s4" ? "S3/S4 rerun (cached)" : "Full S1-S5 rerun";
+      const label =
+        mode === "s3_s4"
+          ? "S3/S4 rerun (cached)"
+          : mode === "s1_grounding"
+            ? "S1 only rerun (refresh 2D boxes, reuse S2-S5 cache)"
+            : "Full S1-S5 rerun";
       notify(`Submitted single-episode ${label} job: ${job.job_id}`, "info");
-      if (job.status === "completed") {
-        setRerunning(false);
-        setRerunCompletedReady(true);
-        await loadRunsCatalog();
+      if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+        handleRerunTerminalJob(job);
       }
     } catch (err) {
       setRerunning(false);
       setError(err instanceof Error ? err.message : "Failed to trigger local VLM rerun");
+    }
+  };
+
+  const handleCancelLocalRerun = async () => {
+    if (!localRerunJobId || cancellingRerun) return;
+    const jobId = localRerunJobId;
+    setCancellingRerun(true);
+    try {
+      const updated = jobStore.isProvided
+        ? await jobStore.cancelJob(jobId)
+        : await apiCancelJob(jobId).catch(() => null);
+      if (updated) {
+        handledRerunJobIdsRef.current.add(jobId);
+        prevJobStatusRef.current.set(updated.job_id, updated.status);
+        setRerunning(false);
+        setLocalRerunJobId(null);
+        // Avoid duplicate cancel toast when JobProvider already emits notifyJobCancelled
+        if (!jobStore.isProvided) {
+          notify(
+            `Single-episode VLM rerun job ${jobId} cancelled; episode status reverted`,
+            "warning",
+          );
+        }
+        await loadEpisodeData();
+      }
+    } finally {
+      setCancellingRerun(false);
     }
   };
 
@@ -834,12 +1008,25 @@ export const ReviewStudioPage: React.FC = () => {
     }
   };
 
-  // Unified Review Studio keyboard shortcut suite (ignored in inputs/textareas/selects)
+  // Unified Review Studio keyboard shortcut suite (ignored in inputs/textareas/selects and behind overlays)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && shortcutsOpen) {
-        e.preventDefault();
-        setShortcutsOpen(false);
+      if (e.key === "Escape") {
+        if (shortcutsOpen) {
+          e.preventDefault();
+          setShortcutsOpen(false);
+          return;
+        }
+        if (flagDialogOpen) {
+          e.preventDefault();
+          setFlagDialogOpen(false);
+          return;
+        }
+        if (rerunMenuOpen) {
+          e.preventDefault();
+          setRerunMenuOpen(false);
+          return;
+        }
         return;
       }
 
@@ -857,6 +1044,25 @@ export const ReviewStudioPage: React.FC = () => {
       const key = e.key;
       const lower = key.toLowerCase();
       const mod = e.ctrlKey || e.metaKey;
+
+      // Block global Studio shortcuts while any modal, drawer, or flag dialog is open
+      const hasOpenOverlay =
+        shortcutsOpen ||
+        flagDialogOpen ||
+        Boolean(document.querySelector(".modal-backdrop, .drawer-backdrop"));
+      if (hasOpenOverlay) {
+        if (
+          shortcutsOpen &&
+          !flagDialogOpen &&
+          (key === "?" || (key === "/" && e.shiftKey)) &&
+          !mod &&
+          !e.altKey
+        ) {
+          e.preventDefault();
+          setShortcutsOpen(false);
+        }
+        return;
+      }
 
       // ? toggles ShortcutsModal
       if ((key === "?" || (key === "/" && e.shiftKey)) && !mod && !e.altKey) {
@@ -1060,6 +1266,8 @@ export const ReviewStudioPage: React.FC = () => {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     shortcutsOpen,
+    flagDialogOpen,
+    rerunMenuOpen,
     episode,
     isReadOnly,
     saving,
@@ -1156,17 +1364,21 @@ export const ReviewStudioPage: React.FC = () => {
                 <button
                   type="button"
                   className="mini-btn accent rerun-main-btn"
-                  disabled={rerunning}
+                  disabled={rerunning || isGtFrozen}
                   onClick={() => void handleLocalRerunVlm("s3_s4")}
                   data-testid="rerun-vlm-s3s4-btn"
-                  title="Reuse S1/S2/S5 cache and quickly rerun S3/S4"
+                  title={
+                    isGtFrozen
+                      ? "GT is frozen; VLM rerun is disabled"
+                      : "Reuse S1/S2/S5 cache and quickly rerun S3/S4"
+                  }
                 >
                   <Sparkles size={13} /> {rerunning ? "Rerunning..." : "Rerun S3/S4"}
                 </button>
                 <button
                   type="button"
                   className="mini-btn accent rerun-caret-btn"
-                  disabled={rerunning}
+                  disabled={rerunning || isGtFrozen}
                   aria-label="Expand VLM rerun options"
                   data-testid="rerun-vlm-menu-toggle"
                   onClick={() => setRerunMenuOpen((v) => !v)}
@@ -1189,6 +1401,17 @@ export const ReviewStudioPage: React.FC = () => {
                     <button
                       type="button"
                       className="rerun-menu-item"
+                      data-testid="rerun-vlm-s1-btn"
+                      onClick={() => void handleLocalRerunVlm("s1_grounding")}
+                    >
+                      <strong>Rerun S1 Only (Refresh 2D Boxes, Reuse S2-S5 Cache)</strong>
+                      <span className="rerun-menu-desc">
+                        Refresh 2D boxes and frame-level tracking while preserving S2–S5 caches
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="rerun-menu-item"
                       data-testid="rerun-vlm-all-btn"
                       onClick={() => void handleLocalRerunVlm("s1_s5")}
                     >
@@ -1201,16 +1424,36 @@ export const ReviewStudioPage: React.FC = () => {
                 )}
               </div>
 
+              {rerunning && localRerunJobId && (
+                <button
+                  type="button"
+                  className="danger-btn compact"
+                  disabled={cancellingRerun}
+                  data-testid="cancel-rerun-vlm-btn"
+                  onClick={() => void handleCancelLocalRerun()}
+                  title="Cancel this single-episode VLM rerun and revert episode status immediately"
+                >
+                  <XCircle size={12} /> {cancellingRerun ? "Cancelling..." : "Cancel Rerun"}
+                </button>
+              )}
+
               {rerunCompletedReady && (
                 <button
                   type="button"
                   className="mini-btn primary"
                   data-testid="refresh-after-rerun-btn"
                   onClick={() => {
+                    const isProtected =
+                      episode.status === "claimed" ||
+                      episode.status === "reviewed" ||
+                      episode.status === "flagged" ||
+                      episode.status === "approved" ||
+                      episode.status === "gt_frozen";
+                    const nextRun = isProtected && rerunCompletedRunId ? rerunCompletedRunId : "";
                     setRerunCompletedReady(false);
-                    setSelectedRunId("");
+                    setSelectedRunId(nextRun);
                     void loadRunsCatalog();
-                    void loadEpisodeData("");
+                    void loadEpisodeData(nextRun);
                   }}
                 >
                   <RefreshCw size={12} /> Load New Run
@@ -1371,15 +1614,19 @@ export const ReviewStudioPage: React.FC = () => {
             onCreateSegmentSpan={(tStart, tEnd) => handleAddSegmentAt(tStart, tEnd)}
             onSplitMacroStage={handleSplitMacroStage}
             onAddMacroStage={() => {
-              const t0 = Math.max(0, Number(currentTime.toFixed(2)));
-              const t1 = Math.min(
-                episode.meta.duration_s,
-                Math.max(t0 + 0.5, Number((t0 + 2.0).toFixed(2))),
+              const maxDur = Math.max(0.1, episode.meta.duration_s);
+              const fallbackSpan = Math.min(2.0, Math.max(0.2, Number((maxDur * 0.2).toFixed(2))));
+              const rawT0 = Math.max(0, Number(currentTime.toFixed(2)));
+              const t0 = Number(
+                (rawT0 + 0.1 > maxDur ? Math.max(0, maxDur - fallbackSpan) : rawT0).toFixed(2),
+              );
+              const t1 = Number(
+                Math.min(maxDur, Math.max(t0 + 0.1, Number((t0 + 2.0).toFixed(2)))).toFixed(2),
               );
               const st: MacroStage = {
                 stage_id: `M${history.state.macro_stages.length + 1}_${Date.now().toString(36).slice(-3)}`,
                 t_start: t0,
-                t_end: t1 > t0 ? t1 : t0 + 0.2,
+                t_end: t1 > t0 ? t1 : Number(maxDur.toFixed(2)),
                 label: "New Macro Stage",
                 label_en: "new_stage",
                 summary: "",

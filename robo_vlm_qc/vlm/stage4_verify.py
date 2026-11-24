@@ -16,7 +16,13 @@ from ..models.annotation import (
     VisualEvidence,
 )
 from ..models.taxonomy import FewShotItem, LabelRegistry, TaskSpec
-from .client import BudgetExceeded, BudgetTracker, VlmClient
+from .client import (
+    BudgetExceeded,
+    BudgetTracker,
+    VlmCancelledError,
+    VlmClient,
+    check_client_cancelled,
+)
 from .prompt_builder import PromptBuilder
 from .stage3_discover import _parse_visual_evidence, normalize_triplet_fields
 
@@ -237,6 +243,7 @@ def run_stage4a_merge(
             f"Stage 3 raw candidates: {json.dumps([s.model_dump() for s in raw], ensure_ascii=False)}"
         )
 
+    check_client_cancelled(cl)
     try:
         resp = cl.chat_json(
             stage="s4a_merge",
@@ -264,9 +271,10 @@ def run_stage4a_merge(
                 out.append(seg)
         out.sort(key=lambda s: (s.t_start, s.t_end))
         return out
-    except BudgetExceeded:
+    except (BudgetExceeded, VlmCancelledError):
         raise
     except Exception:
+        check_client_cancelled(cl)
         min_len = 0.35 if dur >= 1.5 else 0.1
         return _deterministic_merge_raw_segments(raw, min_len_s=min_len, duration_s=dur)
 
@@ -371,17 +379,21 @@ def run_stage4b_verify(
     pb = prompt_builder or (PromptBuilder(cm) if cm is not None else None)
 
     def _verify_one(idx: int, cand: QcSegment) -> QcSegment | None:
+        check_client_cancelled(cl)
         w0 = round(max(0.0, cand.t_start - margin_s), 3)
         w1 = round(min(dur, cand.t_end + margin_s), 3)
         span = max(0.05, w1 - w0)
         n_frames = min(max(2, max_frames), max(2, int(np.floor(span / max(0.1, step_s))) + 1))
         t_list = sorted({round(float(t), 3) for t in np.linspace(w0, w1, n_frames)})
-        tiles = [
-            compose_2x2_tile(
-                ev.media, roles, t, cell_w=cell_w, cell_h=cell_h, include_header=True
+        tiles: list[np.ndarray] = []
+        for t in t_list:
+            check_client_cancelled(cl)
+            tiles.append(
+                compose_2x2_tile(
+                    ev.media, roles, t, cell_w=cell_w, cell_h=cell_h, include_header=True
+                )
             )
-            for t in t_list
-        ]
+        check_client_cancelled(cl)
         if pb is not None:
             sys_p, usr_p = pb.build_s4b(
                 task=t_spec,
@@ -413,9 +425,10 @@ def run_stage4b_verify(
                 jpeg_quality=quality,
                 budget=budget,
             )
-        except BudgetExceeded:
+        except (BudgetExceeded, VlmCancelledError):
             raise
         except Exception:
+            check_client_cancelled(cl)
             return cand
 
         keep_val = resp.get("keep_segment", resp.get("confirmed", True))
@@ -490,6 +503,7 @@ def run_stage4_verify(
         labels=labels,
         budget=budget,
     )
+    check_client_cancelled(client or vlm_client)
     return run_stage4b_verify(
         view=view,
         episode_view=episode_view,

@@ -19,7 +19,11 @@ if (typeof HTMLCanvasElement !== "undefined") {
       fillText: () => {},
       measureText: (t: string) => ({ width: t.length * 7 }),
       setLineDash: () => {},
+      setTransform: () => {},
       beginPath: () => {},
+      moveTo: () => {},
+      lineTo: () => {},
+      closePath: () => {},
       rect: () => {},
       stroke: () => {},
       fill: () => {},
@@ -28,6 +32,7 @@ if (typeof HTMLCanvasElement !== "undefined") {
       strokeStyle: "",
       fillStyle: "",
       lineWidth: 1,
+      globalAlpha: 1,
       font: "",
     };
   }) as unknown as typeof HTMLCanvasElement.prototype.getContext;

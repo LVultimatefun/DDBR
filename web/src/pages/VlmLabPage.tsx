@@ -517,7 +517,7 @@ export const VlmLabPage: React.FC = () => {
         if (res.baseline?.eval_id && !base) setBaselineId(res.baseline.eval_id);
         if (res.candidate?.eval_id && !cand) setCandidateId(res.candidate.eval_id);
         if (!res.candidate && res.evals.length > 0 && !cand) {
-          setCandidateId(res.evals[res.evals.length - 1].eval_id);
+          setCandidateId(res.evals[0].eval_id);
         }
       } catch (err) {
         setErrorMsg(err instanceof Error ? err.message : "Failed to load evaluation comparison");
@@ -593,7 +593,10 @@ export const VlmLabPage: React.FC = () => {
         });
         setCompareData(cmp);
         if (cmp.baseline?.eval_id && !baselineId) setBaselineId(cmp.baseline.eval_id);
-        const candFromCmp = cmp.candidate ?? (evalRunId ? cmp.evals.find((e) => e.eval_id === evalRunId) : cmp.evals[cmp.evals.length - 1]) ?? null;
+        const candFromCmp =
+          cmp.candidate ??
+          (evalRunId ? cmp.evals.find((e) => e.eval_id === evalRunId) : cmp.evals[0]) ??
+          null;
         if (candFromCmp) {
           resolvedReport = candFromCmp;
         }
@@ -647,20 +650,24 @@ export const VlmLabPage: React.FC = () => {
     },
   });
 
+  const activeEvalJobId = activeEvalJob?.job_id ?? null;
+  const activeEvalJobStatus = activeEvalJob?.status ?? null;
+  const jobStoreProvided = jobStore.isProvided;
+  const trackJobInStore = jobStore.trackJob;
+
   useEffect(() => {
-    if (!activeEvalJob) return;
-    if (activeEvalJob.status !== "queued" && activeEvalJob.status !== "running") return;
+    if (!activeEvalJobId) return;
+    if (activeEvalJobStatus !== "queued" && activeEvalJobStatus !== "running") return;
 
     let stopped = false;
-    const jobId = activeEvalJob.job_id;
     const timer = setInterval(() => {
       if (stopped) return;
-      void getJob(jobId)
+      void getJob(activeEvalJobId)
         .then((latest) => {
           if (stopped) return;
           setLocalEvalJob(latest);
-          if (jobStore.isProvided) {
-            jobStore.trackJob(latest);
+          if (jobStoreProvided) {
+            trackJobInStore(latest);
           }
           if (
             latest.status === "completed" ||
@@ -679,7 +686,7 @@ export const VlmLabPage: React.FC = () => {
       stopped = true;
       clearInterval(timer);
     };
-  }, [activeEvalJob, finalizeEvalJob, jobStore]);
+  }, [activeEvalJobId, activeEvalJobStatus, finalizeEvalJob, jobStoreProvided, trackJobInStore]);
 
   if (authProbing) {
     return <div className="page-container">Verifying permissions...</div>;
@@ -941,7 +948,20 @@ export const VlmLabPage: React.FC = () => {
     setErrorMsg(null);
     clearLabInfo();
     try {
-      const saved = await putLabLabels(registry);
+      const sanitized: LabelRegistry = {
+        ...registry,
+        labels: registry.labels.map((l) => ({
+          ...l,
+          vlm_semantics: {
+            ...l.vlm_semantics,
+            counter_examples: l.vlm_semantics.counter_examples
+              .map((s) => s.trim())
+              .filter(Boolean),
+            visual_cues: l.vlm_semantics.visual_cues.map((s) => s.trim()).filter(Boolean),
+          },
+        })),
+      };
+      const saved = await putLabLabels(sanitized);
       setRegistry(saved);
       showLabInfo(`Label registry saved (v${saved.version}); previous version archived to .history/`, "success");
     } catch (err) {
@@ -1034,10 +1054,15 @@ export const VlmLabPage: React.FC = () => {
     setErrorMsg(null);
     clearLabInfo();
     try {
-      const res = await putLabTasks(activeTaskSpec);
+      const sanitizedTask: TaskSpec = {
+        ...activeTaskSpec,
+        criteria: activeTaskSpec.criteria.map((s) => s.trim()).filter(Boolean),
+        steps: activeTaskSpec.steps.map((s) => s.trim()).filter(Boolean),
+      };
+      const res = await putLabTasks(sanitizedTask);
       setTasksMap(res.tasks);
       showLabInfo(
-        `TaskSpec "${activeTaskSpec.task_id}" (v${activeTaskSpec.version}) saved and backed up to .history/`,
+        `TaskSpec "${sanitizedTask.task_id}" (v${sanitizedTask.version}) saved and backed up to .history/`,
         "success",
       );
     } catch (err) {
@@ -2184,15 +2209,13 @@ export const VlmLabPage: React.FC = () => {
                       <span>Counter-Examples (one per line, counter_examples)</span>
                       <textarea
                         rows={2}
+                        aria-label="Counter-examples"
                         value={selectedLabel.vlm_semantics.counter_examples.join("\n")}
                         onChange={(e) =>
                           updateSelectedLabel({
                             vlm_semantics: {
                               ...selectedLabel.vlm_semantics,
-                              counter_examples: e.target.value
-                                .split("\n")
-                                .map((s) => s.trim())
-                                .filter(Boolean),
+                              counter_examples: e.target.value.split("\n"),
                             },
                           })
                         }
@@ -2423,13 +2446,11 @@ export const VlmLabPage: React.FC = () => {
                       <span>Completion Criteria (one per line, criteria)</span>
                       <textarea
                         rows={4}
+                        aria-label="Completion criteria"
                         value={activeTaskSpec.criteria.join("\n")}
                         onChange={(e) =>
                           updateActiveTaskSpec({
-                            criteria: e.target.value
-                              .split("\n")
-                              .map((s) => s.trim())
-                              .filter(Boolean),
+                            criteria: e.target.value.split("\n"),
                           })
                         }
                       />
@@ -2438,13 +2459,11 @@ export const VlmLabPage: React.FC = () => {
                       <span>Expected Steps (one per line, steps)</span>
                       <textarea
                         rows={4}
+                        aria-label="Expected steps"
                         value={activeTaskSpec.steps.join("\n")}
                         onChange={(e) =>
                           updateActiveTaskSpec({
-                            steps: e.target.value
-                              .split("\n")
-                              .map((s) => s.trim())
-                              .filter(Boolean),
+                            steps: e.target.value.split("\n"),
                           })
                         }
                       />

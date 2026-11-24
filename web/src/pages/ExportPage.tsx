@@ -51,10 +51,10 @@ export const ExportPage: React.FC = () => {
   const [datasetFilter, setDatasetFilter] = useState("");
   const [taskFilter, setTaskFilter] = useState("");
   const [smoothTail, setSmoothTail] = useState<SmoothTailMode>("on_jump");
-  const [minPieceS, setMinPieceS] = useState<number>(0.1);
+  const [minPieceSText, setMinPieceSText] = useState<string>("0.1");
   const [tailFrames, setTailFrames] = useState<string>("");
   const [chunkSize, setChunkSize] = useState<string>("");
-  const [contextWindowS, setContextWindowS] = useState<number>(2.0);
+  const [contextWindowSText, setContextWindowSText] = useState<string>("2");
 
   const [dryRunResult, setDryRunResult] = useState<ExportManifest | null>(null);
   const [history, setHistory] = useState<ExportManifest[]>([]);
@@ -185,20 +185,24 @@ export const ExportPage: React.FC = () => {
   });
 
   // Polling fallback when EventSource is unavailable or SSE lags
+  const activeExportJobId = activeExportJob?.job_id ?? null;
+  const activeExportJobStatus = activeExportJob?.status ?? null;
+  const jobStoreProvided = jobStore.isProvided;
+  const trackJobInStore = jobStore.trackJob;
+
   useEffect(() => {
-    if (!activeExportJob) return;
-    if (activeExportJob.status !== "queued" && activeExportJob.status !== "running") return;
+    if (!activeExportJobId) return;
+    if (activeExportJobStatus !== "queued" && activeExportJobStatus !== "running") return;
 
     let stopped = false;
-    const jobId = activeExportJob.job_id;
     const timer = setInterval(() => {
       if (stopped) return;
-      void getJob(jobId)
+      void getJob(activeExportJobId)
         .then((latest) => {
           if (stopped) return;
           setLocalExportJob(latest);
-          if (jobStore.isProvided) {
-            jobStore.trackJob(latest);
+          if (jobStoreProvided) {
+            trackJobInStore(latest);
           }
           if (
             latest.status === "completed" ||
@@ -217,7 +221,13 @@ export const ExportPage: React.FC = () => {
       stopped = true;
       clearInterval(timer);
     };
-  }, [activeExportJob, finalizeExportJob, jobStore]);
+  }, [
+    activeExportJobId,
+    activeExportJobStatus,
+    finalizeExportJob,
+    jobStoreProvided,
+    trackJobInStore,
+  ]);
 
   if (authProbing) {
     return <div className="page-container">Verifying permissions...</div>;
@@ -235,25 +245,53 @@ export const ExportPage: React.FC = () => {
     );
   }
 
-  const buildRequest = (): ExportRequest => ({
-    format,
-    recipe,
-    include_statuses: includeStatuses,
-    dataset_filter: datasetFilter.trim() || null,
-    task_filter: taskFilter.trim() || null,
-    smooth_tail: smoothTail,
-    min_piece_s: minPieceS,
-    tail_frames: tailFrames.trim() ? Number(tailFrames) : null,
-    chunk_size: chunkSize.trim() ? Number(chunkSize) : null,
-    context_window_s: contextWindowS,
-  });
+  const validateAndBuildRequest = (): { req?: ExportRequest; validationError?: string } => {
+    if (includeStatuses.length === 0) {
+      return { validationError: "Select at least one status (include_statuses)" };
+    }
+    const parsedMinPiece = minPieceSText.trim() === "" ? NaN : Number(minPieceSText);
+    if (!Number.isFinite(parsedMinPiece) || parsedMinPiece < 0.01) {
+      return { validationError: "Min piece duration (min_piece_s) must be a valid number >= 0.01" };
+    }
+    const parsedCtx = contextWindowSText.trim() === "" ? NaN : Number(contextWindowSText);
+    if (recipe === "badcase_pairs" && (!Number.isFinite(parsedCtx) || parsedCtx < 0)) {
+      return { validationError: "Context window (context_window_s) must be a valid number >= 0" };
+    }
+    const parsedTail = tailFrames.trim() ? Number(tailFrames) : null;
+    if (parsedTail !== null && (!Number.isInteger(parsedTail) || parsedTail < 0)) {
+      return { validationError: "Tail blend frames (tail_frames) must be an integer >= 0" };
+    }
+    const parsedChunk = chunkSize.trim() ? Number(chunkSize) : null;
+    if (parsedChunk !== null && (!Number.isInteger(parsedChunk) || parsedChunk < 2)) {
+      return { validationError: "Chunk size (chunk_size) must be an integer >= 2" };
+    }
+    return {
+      req: {
+        format,
+        recipe,
+        include_statuses: includeStatuses,
+        dataset_filter: datasetFilter.trim() || null,
+        task_filter: taskFilter.trim() || null,
+        smooth_tail: smoothTail,
+        min_piece_s: parsedMinPiece,
+        tail_frames: parsedTail,
+        chunk_size: parsedChunk,
+        context_window_s: Number.isFinite(parsedCtx) && parsedCtx >= 0 ? parsedCtx : 2.0,
+      },
+    };
+  };
 
   const handleDryRun = async () => {
+    const { req, validationError } = validateAndBuildRequest();
+    if (validationError || !req) {
+      setError(validationError ?? "Invalid export parameters");
+      return;
+    }
     setBusy(true);
     setError(null);
     toast.dismissByTestId("export-info-banner");
     try {
-      const res = await dryRunExport(buildRequest());
+      const res = await dryRunExport(req);
       setDryRunResult(res);
       toast.showToast({
         message: "Dry run preview completed (nothing written to exports/)",
@@ -271,6 +309,11 @@ export const ExportPage: React.FC = () => {
   };
 
   const handleTriggerExport = async () => {
+    const { req, validationError } = validateAndBuildRequest();
+    if (validationError || !req) {
+      setError(validationError ?? "Invalid export parameters");
+      return;
+    }
     setBusy(true);
     setError(null);
     setCompletedResult(null);
@@ -278,7 +321,7 @@ export const ExportPage: React.FC = () => {
     try {
       const job = await createJob({
         job_type: "export",
-        export_params: buildRequest(),
+        export_params: req,
       });
       setLocalExportJob(job);
       jobStore.trackJob(job);
@@ -423,8 +466,8 @@ export const ExportPage: React.FC = () => {
               type="number"
               step={0.05}
               min={0.01}
-              value={minPieceS}
-              onChange={(e) => setMinPieceS(Number(e.target.value))}
+              value={minPieceSText}
+              onChange={(e) => setMinPieceSText(e.target.value)}
             />
           </label>
 
@@ -457,8 +500,8 @@ export const ExportPage: React.FC = () => {
                 type="number"
                 step={0.5}
                 min={0}
-                value={contextWindowS}
-                onChange={(e) => setContextWindowS(Number(e.target.value))}
+                value={contextWindowSText}
+                onChange={(e) => setContextWindowSText(e.target.value)}
               />
             </label>
           )}

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +54,13 @@ class AuthConfig:
 
 
 @dataclass
+class _JobControl:
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    callbacks: list[Callable[[], None]] = field(default_factory=list)
+    prev_statuses: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class AppState:
     workspace: Path
     config_dir: Path
@@ -78,6 +87,119 @@ class AppState:
     _cached_cfg_sig: tuple[tuple[str, int, int], ...] | None = field(
         default=None, init=False, repr=False
     )
+    _jobs_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _active_jobs: dict[str, _JobControl] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _active_vlm_episodes: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    def try_reserve_vlm_episodes(
+        self, episode_ids: Sequence[str], owner_id: str
+    ) -> list[str]:
+        unique_ids = list(dict.fromkeys(str(e) for e in episode_ids if e))
+        with self._jobs_lock:
+            busy = [
+                eid
+                for eid in unique_ids
+                if eid in self._active_vlm_episodes
+                and self._active_vlm_episodes[eid] != owner_id
+            ]
+            if busy:
+                return busy
+            for eid in unique_ids:
+                self._active_vlm_episodes[eid] = owner_id
+            return []
+
+    def rebind_vlm_episodes(self, old_owner: str, new_owner: str) -> None:
+        with self._jobs_lock:
+            for eid, cur_owner in list(self._active_vlm_episodes.items()):
+                if cur_owner == old_owner:
+                    self._active_vlm_episodes[eid] = new_owner
+
+    def release_vlm_episodes(self, owner_id: str) -> None:
+        with self._jobs_lock:
+            for eid, cur_owner in list(self._active_vlm_episodes.items()):
+                if cur_owner == owner_id:
+                    del self._active_vlm_episodes[eid]
+
+    def can_job_restore_episode(self, job_id: str, episode_id: str) -> bool:
+        with self._jobs_lock:
+            owner = self._active_vlm_episodes.get(episode_id)
+            return owner is None or owner == job_id
+
+    def register_job_control(
+        self,
+        job_id: str,
+        *,
+        prev_statuses: dict[str, str] | None = None,
+    ) -> threading.Event:
+        with self._jobs_lock:
+            ctrl = self._active_jobs.get(job_id)
+            if ctrl is None:
+                ctrl = _JobControl()
+                self._active_jobs[job_id] = ctrl
+            if prev_statuses:
+                ctrl.prev_statuses.update(prev_statuses)
+            return ctrl.cancel_event
+
+    def get_job_cancel_event(self, job_id: str) -> threading.Event:
+        return self.register_job_control(job_id)
+
+    def get_job_prev_statuses(self, job_id: str) -> dict[str, str]:
+        with self._jobs_lock:
+            ctrl = self._active_jobs.get(job_id)
+            return dict(ctrl.prev_statuses) if ctrl is not None else {}
+
+    def has_job_control(self, job_id: str) -> bool:
+        with self._jobs_lock:
+            return job_id in self._active_jobs
+
+    def add_job_cancel_callback(
+        self, job_id: str, callback: Callable[[], None]
+    ) -> None:
+        with self._jobs_lock:
+            ctrl = self._active_jobs.get(job_id)
+            if ctrl is None:
+                ctrl = _JobControl()
+                self._active_jobs[job_id] = ctrl
+            already_cancelled = ctrl.cancel_event.is_set()
+            if not already_cancelled:
+                ctrl.callbacks.append(callback)
+        if already_cancelled:
+            with contextlib.suppress(Exception):
+                callback()
+
+    def trigger_job_cancel(self, job_id: str) -> dict[str, str]:
+        with self._jobs_lock:
+            ctrl = self._active_jobs.get(job_id)
+            if ctrl is None:
+                return {}
+            ctrl.cancel_event.set()
+            callbacks = list(ctrl.callbacks)
+            ctrl.callbacks.clear()
+            prev = dict(ctrl.prev_statuses)
+        for cb in callbacks:
+            with contextlib.suppress(Exception):
+                cb()
+        return prev
+
+    def clear_job_control(self, job_id: str) -> dict[str, str]:
+        with self._jobs_lock:
+            ctrl = self._active_jobs.pop(job_id, None)
+            for eid, cur_owner in list(self._active_vlm_episodes.items()):
+                if cur_owner == job_id:
+                    del self._active_vlm_episodes[eid]
+            return dict(ctrl.prev_statuses) if ctrl is not None else {}
+
+    def cancel_all_jobs(self) -> None:
+        with self._jobs_lock:
+            job_ids = list(self._active_jobs.keys())
+        for jid in job_ids:
+            self.trigger_job_cancel(jid)
 
     def _config_files_signature(self) -> tuple[tuple[str, int, int], ...]:
         sig_items: list[tuple[str, int, int]] = []

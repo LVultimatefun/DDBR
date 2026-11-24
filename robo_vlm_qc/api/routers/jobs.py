@@ -8,6 +8,7 @@ import json
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +27,7 @@ from ...lab.eval_runner import run_gt_eval
 from ...models.review import EpisodeStatus
 from ...store import NotFoundError
 from ...vlm import VlmDag
-from ...vlm.client import normalize_stage_name
+from ...vlm.client import VlmCancelledError, VlmClient, normalize_stage_name
 from ..auth import AuthContext, get_app_state, require_auth, require_lead
 from ..state import AppState
 from .exports import ExportTriggerPayload, _run_export_sync
@@ -158,6 +159,18 @@ def _resolve_batch_concurrency(payload: JobCreatePayload, cfg: Any, n_items: int
     return max(1, min(32, req, max(1, n_items)))
 
 
+def _publish_episode_status(
+    state: AppState, episode_id: str, new_status: EpisodeStatus
+) -> None:
+    state.sse.publish(
+        {
+            "type": "episode_updated",
+            "episode_id": episode_id,
+            "status": new_status.value,
+        }
+    )
+
+
 def _run_job_worker(
     state: AppState,
     job_id: str,
@@ -165,11 +178,22 @@ def _run_job_worker(
     eff_fresh: bool,
     fresh_stages: set[str] | None,
 ) -> None:
+    cancel_event = state.get_job_cancel_event(job_id)
+    sandbox_flag = (
+        bool(payload.is_eval_sandbox)
+        if payload.is_eval_sandbox is not None
+        else False
+    )
+    restore_needed_on_fail = False
     try:
         cur = state.repo.get_job(job_id)
-        if cur["status"] == "cancelled":
+        if cancel_event.is_set() or cur["status"] == "cancelled":
+            cancel_event.set()
             return
         cur = state.repo.update_job(job_id, status="running", progress_done=0)
+        if cancel_event.is_set() or cur["status"] == "cancelled":
+            cancel_event.set()
+            return
         state.sse.publish({"type": "job_update", "job": cur})
 
         cfg = state.get_config()
@@ -182,12 +206,26 @@ def _run_job_worker(
         if payload.job_type == "batch_vlm":
             ep_ids = list(payload.episode_ids)
             eff_workers = _resolve_batch_concurrency(payload, cfg, len(ep_ids))
-            sandbox_flag = bool(payload.is_eval_sandbox) if payload.is_eval_sandbox is not None else False
-            dag = VlmDag(workspace=state.workspace, config=cfg, repo=state.repo)
+            prev_statuses = state.get_job_prev_statuses(job_id)
+            vlm_client = VlmClient.from_config(
+                cfg,
+                workspace_dir=state.workspace,
+                cancel_event=cancel_event,
+            )
+            state.add_job_cancel_callback(job_id, vlm_client.cancel)
+            dag = VlmDag(
+                workspace=state.workspace,
+                config=cfg,
+                client=vlm_client,
+                repo=state.repo,
+                cancel_event=cancel_event,
+            )
             progress_lock = threading.Lock()
-            cancel_event = threading.Event()
             results_map: dict[int, dict[str, Any]] = {}
             errors_map: dict[int, dict[str, str]] = {}
+
+            def _on_ep_status(ep_id_cb: str, st_cb: EpisodeStatus) -> None:
+                _publish_episode_status(state, ep_id_cb, st_cb)
 
             def _batch_one(idx: int, ep_id: str) -> None:
                 nonlocal done
@@ -197,20 +235,40 @@ def _run_job_worker(
                         return
                     try:
                         meta = state.repo.get_episode_meta(ep_id)
+                        if cancel_event.is_set():
+                            return
                         with state.open_view(meta, cfg) as view:
                             art = dag.run_episode(
                                 view,
                                 fresh=eff_fresh,
                                 fresh_stages=fresh_stages,
                                 is_eval_sandbox=sandbox_flag,
+                                cancel_event=cancel_event,
+                                on_status_change=_on_ep_status,
+                                can_rollback=lambda eid: state.can_job_restore_episode(
+                                    job_id, eid
+                                ),
                             )
-                        item_res = {
+                        item_res: dict[str, Any] | None = {
                             "episode_id": ep_id,
                             "run_id": art.run_id,
                             "verdict": art.success.verdict,
                         }
-                        item_err = None
+                        item_err: dict[str, str] | None = None
+                    except VlmCancelledError:
+                        cancel_event.set()
+                        return
                     except Exception as exc:
+                        if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
+                            cancel_event.set()
+                            return
+                        if not sandbox_flag and state.can_job_restore_episode(job_id, ep_id):
+                            with contextlib.suppress(Exception):
+                                restored_one = state.repo.restore_vlm_episodes_on_cancel(
+                                    [ep_id], prev_statuses=prev_statuses or None
+                                )
+                                for r_ep, r_st in restored_one:
+                                    _on_ep_status(r_ep, r_st)
                         item_res = None
                         item_err = {"episode_id": ep_id, "error": str(exc)}
 
@@ -220,11 +278,12 @@ def _run_job_worker(
                         if item_err is not None:
                             errors_map[idx] = item_err
                         done += 1
-                        if state.repo.get_job(job_id)["status"] == "cancelled":
+                        if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
                             cancel_event.set()
                             return
                         upd = state.repo.update_job(job_id, progress_done=done)
-                        state.sse.publish({"type": "job_update", "job": upd})
+                        if upd["status"] != "cancelled":
+                            state.sse.publish({"type": "job_update", "job": upd})
                 finally:
                     state.repo.db.close_thread_connection()
 
@@ -244,13 +303,15 @@ def _run_job_worker(
                     dag.client.close()
 
             if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
+                cancel_event.set()
                 return
             results = [results_map[i] for i in sorted(results_map)]
             errors = [errors_map[i] for i in sorted(errors_map)]
 
         elif payload.job_type == "render_mp4":
             for ep_id in payload.episode_ids:
-                if state.repo.get_job(job_id)["status"] == "cancelled":
+                if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
+                    cancel_event.set()
                     return
                 try:
                     resolved = state.repo.resolve_episode(ep_id)
@@ -277,14 +338,21 @@ def _run_job_worker(
                     errors.append({"episode_id": ep_id, "error": str(exc)})
                 done += 1
                 upd = state.repo.update_job(job_id, progress_done=done)
-                state.sse.publish({"type": "job_update", "job": upd})
+                if upd["status"] != "cancelled":
+                    state.sse.publish({"type": "job_update", "job": upd})
 
         elif payload.job_type == "export":
+            if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
+                cancel_event.set()
+                return
             exp_dict = dict(payload.export_params or {})
             if exp_dict.get("episode_ids") is None and payload.episode_ids:
                 exp_dict["episode_ids"] = list(payload.episode_ids)
             exp_payload = ExportTriggerPayload.model_validate(exp_dict)
             manifest = _run_export_sync(state, exp_payload)
+            if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
+                cancel_event.set()
+                return
             done = int(cur.get("progress_total") or 1)
             out_resolved = Path(manifest.output_dir).resolve()
             artifacts.append(
@@ -327,7 +395,8 @@ def _run_job_worker(
                 done_n: int, total_n: int, _ep_id: str, info: dict[str, Any]
             ) -> None:
                 nonlocal done
-                if state.repo.get_job(job_id)["status"] == "cancelled":
+                if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
+                    cancel_event.set()
                     raise _JobCancelled()
                 cache_hits_acc.update(info.get("cache_hit_stages", []))
                 per_ep_results.append(info)
@@ -341,7 +410,8 @@ def _run_job_worker(
                         "results": per_ep_results,
                     },
                 )
-                state.sse.publish({"type": "job_update", "job": upd})
+                if upd["status"] != "cancelled":
+                    state.sse.publish({"type": "job_update", "job": upd})
 
             try:
                 report = run_gt_eval(
@@ -358,8 +428,11 @@ def _run_job_worker(
                     candidate_prompts=eval_payload.candidate_prompts,
                     candidate_labels=eval_payload.candidate_labels,
                     on_progress=_on_eval_progress,
+                    cancel_event=cancel_event,
+                    on_cancel_register=lambda cb: state.add_job_cancel_callback(job_id, cb),
                 )
-            except _JobCancelled:
+            except (_JobCancelled, VlmCancelledError):
+                cancel_event.set()
                 return
 
             done = report.metrics.episodes_evaluated
@@ -399,13 +472,15 @@ def _run_job_worker(
             upd_total = state.repo.update_job(
                 job_id, progress_total=len(all_handles), progress_done=0
             )
-            state.sse.publish({"type": "job_update", "job": upd_total})
+            if upd_total["status"] != "cancelled":
+                state.sse.publish({"type": "job_update", "job": upd_total})
 
             inserted = 0
             updated = 0
             skipped = 0
             for handle in all_handles:
-                if state.repo.get_job(job_id)["status"] == "cancelled":
+                if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
+                    cancel_event.set()
                     return
                 try:
                     src_resolved = Path(handle.source_uri).resolve()
@@ -451,7 +526,8 @@ def _run_job_worker(
                     errors.append({"episode_id": handle.episode_id, "error": str(exc)})
                 done += 1
                 upd = state.repo.update_job(job_id, progress_done=done)
-                state.sse.publish({"type": "job_update", "job": upd})
+                if upd["status"] != "cancelled":
+                    state.sse.publish({"type": "job_update", "job": upd})
 
             summary_extra = {
                 "discovered": len(all_handles),
@@ -460,7 +536,7 @@ def _run_job_worker(
                 "skipped": skipped,
             }
 
-        if state.repo.get_job(job_id)["status"] == "cancelled":
+        if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
             return
         final_status = "failed" if errors else "completed"
         summary_payload: dict[str, Any] = {
@@ -475,11 +551,13 @@ def _run_job_worker(
             progress_done=done,
             summary=summary_payload,
         )
-        state.sse.publish({"type": "job_update", "job": final_job})
+        if final_job["status"] != "cancelled":
+            state.sse.publish({"type": "job_update", "job": final_job})
     except Exception as exc:
+        restore_needed_on_fail = True
         with contextlib.suppress(Exception):
             cur_after = state.repo.get_job(job_id)
-            if cur_after["status"] != "cancelled":
+            if not cancel_event.is_set() and cur_after["status"] != "cancelled":
                 fail_job = state.repo.update_job(
                     job_id,
                     status="failed",
@@ -489,8 +567,29 @@ def _run_job_worker(
                         "artifacts": [],
                     },
                 )
-                state.sse.publish({"type": "job_update", "job": fail_job})
+                if fail_job["status"] != "cancelled":
+                    state.sse.publish({"type": "job_update", "job": fail_job})
     finally:
+        prev_map = state.get_job_prev_statuses(job_id)
+        if payload.job_type == "batch_vlm" and not sandbox_flag:
+            is_cancelled = cancel_event.is_set()
+            if not is_cancelled:
+                with contextlib.suppress(Exception):
+                    is_cancelled = state.repo.get_job(job_id)["status"] == "cancelled"
+            if is_cancelled or restore_needed_on_fail:
+                restorable_ids = [
+                    eid
+                    for eid in payload.episode_ids
+                    if state.can_job_restore_episode(job_id, eid)
+                ]
+                if restorable_ids:
+                    with contextlib.suppress(Exception):
+                        restored = state.repo.restore_vlm_episodes_on_cancel(
+                            restorable_ids, prev_statuses=prev_map or None
+                        )
+                        for r_ep, r_st in restored:
+                            _publish_episode_status(state, r_ep, r_st)
+        state.clear_job_control(job_id)
         state.repo.db.close_thread_connection()
 
 
@@ -510,7 +609,11 @@ def list_jobs(
         limit=limit,
         offset=offset,
     )
-    return {"items": items, "total": len(items)}
+    total = state.repo.count_jobs(
+        status=status_filter,
+        job_type=job_type,
+    )
+    return {"items": items, "total": total}
 
 
 @router.post("/api/jobs", status_code=status.HTTP_201_CREATED)
@@ -521,7 +624,13 @@ def create_job(
 ) -> dict[str, Any]:
     _ = auth
     eff_fresh, fresh_stages = _resolve_stage_options(payload.stage, payload.fresh)
-    ep_ids = list(payload.episode_ids)
+    raw_ep_ids = list(payload.episode_ids)
+    if payload.job_type == "batch_vlm" and raw_ep_ids:
+        ep_ids = list(dict.fromkeys(raw_ep_ids))
+        if ep_ids != raw_ep_ids:
+            payload = payload.model_copy(update={"episode_ids": ep_ids})
+    else:
+        ep_ids = raw_ep_ids
 
     if payload.job_type in ("batch_vlm", "render_mp4") and not ep_ids:
         job = state.repo.create_job(
@@ -591,16 +700,78 @@ def create_job(
                 raise HTTPException(status_code=404, detail=f"Data path not found: {rp}")
         progress_total = len(raw_paths)
 
-    job = state.repo.create_job(
-        payload.job_type,
-        payload.model_dump(mode="json"),
-        progress_total=progress_total,
-        status="queued",
+    sandbox_flag = (
+        bool(payload.is_eval_sandbox)
+        if payload.is_eval_sandbox is not None
+        else False
     )
+    reserve_token: str | None = None
+    if payload.job_type == "batch_vlm" and not sandbox_flag and ep_ids:
+        reserve_token = f"pending_{uuid.uuid4().hex}"
+        busy_mem = state.try_reserve_vlm_episodes(ep_ids, reserve_token)
+        if busy_mem:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Episodes already queued or running VLM: {', '.join(busy_mem)}",
+            )
+        busy_db: list[str] = []
+        for eid in ep_ids:
+            try:
+                row = state.repo.get_episode_row(eid)
+                if row["status"] in (
+                    EpisodeStatus.VLM_QUEUED.value,
+                    EpisodeStatus.VLM_RUNNING.value,
+                ):
+                    busy_db.append(eid)
+            except NotFoundError:
+                continue
+        if busy_db:
+            state.release_vlm_episodes(reserve_token)
+            raise HTTPException(
+                status_code=409,
+                detail=f"Episodes already queued or running VLM: {', '.join(busy_db)}",
+            )
+
+    try:
+        job = state.repo.create_job(
+            payload.job_type,
+            payload.model_dump(mode="json"),
+            progress_total=progress_total,
+            status="queued",
+        )
+    except Exception:
+        if reserve_token is not None:
+            state.release_vlm_episodes(reserve_token)
+        raise
+
+    if reserve_token is not None:
+        state.rebind_vlm_episodes(reserve_token, job["job_id"])
+
+    prev_statuses: dict[str, str] = {}
+    if payload.job_type == "batch_vlm" and not sandbox_flag and ep_ids:
+        queued_eps = state.repo.queue_vlm_episodes(ep_ids)
+        prev_statuses = {eid: prev_st.value for eid, prev_st in queued_eps}
+        state.register_job_control(job["job_id"], prev_statuses=prev_statuses)
+        for eid, _ in queued_eps:
+            _publish_episode_status(state, eid, EpisodeStatus.VLM_QUEUED)
+    else:
+        state.register_job_control(job["job_id"])
+
     state.sse.publish({"type": "job_update", "job": job})
-    state.executor.submit(
-        _run_job_worker, state, job["job_id"], payload, eff_fresh, fresh_stages
-    )
+    try:
+        state.executor.submit(
+            _run_job_worker, state, job["job_id"], payload, eff_fresh, fresh_stages
+        )
+    except Exception:
+        if payload.job_type == "batch_vlm" and not sandbox_flag and ep_ids:
+            with contextlib.suppress(Exception):
+                restored = state.repo.restore_vlm_episodes_on_cancel(
+                    ep_ids, prev_statuses=prev_statuses or None
+                )
+                for r_ep, r_st in restored:
+                    _publish_episode_status(state, r_ep, r_st)
+        state.clear_job_control(job["job_id"])
+        raise
     return job
 
 
@@ -727,9 +898,29 @@ def cancel_job(
 ) -> dict[str, Any]:
     _ = auth
     try:
+        before = state.repo.get_job(job_id)
+        was_active = (
+            before["status"] in ("queued", "running")
+            or state.has_job_control(job_id)
+        )
         job = state.repo.cancel_job(job_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if job["status"] == "cancelled":
+        prev_statuses = state.trigger_job_cancel(job_id)
+        if was_active and job["job_type"] == "batch_vlm":
+            params = job.get("params") or {}
+            if not bool(params.get("is_eval_sandbox")):
+                ep_ids = [str(e) for e in (params.get("episode_ids") or []) if e]
+                if ep_ids:
+                    restored = state.repo.restore_vlm_episodes_on_cancel(
+                        ep_ids, prev_statuses=prev_statuses or None
+                    )
+                    for r_ep, r_st in restored:
+                        _publish_episode_status(state, r_ep, r_st)
+                state.release_vlm_episodes(job_id)
+
     state.sse.publish({"type": "job_update", "job": job})
     return job
 
@@ -743,7 +934,7 @@ async def stream_job_events(
 ) -> StreamingResponse:
     _ = auth
     try:
-        initial = state.repo.get_job(job_id)
+        initial = await run_in_threadpool(state.repo.get_job, job_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -755,7 +946,7 @@ async def stream_job_events(
         while not await request.is_disconnected():
             await asyncio.sleep(0.08)
             try:
-                cur = state.repo.get_job(job_id)
+                cur = await run_in_threadpool(state.repo.get_job, job_id)
             except NotFoundError:
                 break
             sig = (cur["status"], cur["progress_done"], cur["updated_at"])

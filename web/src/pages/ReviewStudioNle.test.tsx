@@ -843,4 +843,271 @@ describe("Review Studio NLE, Multi-Cam, Live Splice, Shortcuts & Lead Workflows"
     expect(screen.getByTestId("studio-info-banner")).toHaveTextContent("job_full_1");
     expect(screen.getByTestId("refresh-after-rerun-btn")).toBeInTheDocument();
   });
+
+  it("8. ReviewStudioPage: inline cancel and external SSE cancel/fail of single-episode VLM rerun reset rerunning, show toast, and refresh status badge", async () => {
+    const sseInstances: Array<{ onmessage: ((evt: MessageEvent) => void) | null; close: () => void }> = [];
+    class MockEventSource {
+      url: string;
+      onopen: (() => void) | null = null;
+      onmessage: ((evt: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      close = vi.fn();
+      constructor(url: string) {
+        this.url = url;
+        sseInstances.push(this);
+      }
+    }
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    let epStatus: "vlm_running" | "vlm_ready" = "vlm_ready";
+    let jobSeq = 0;
+    let cancelCalls = 0;
+    let episodeFetches = 0;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (url.endsWith("/api/jobs") && method === "POST") {
+          jobSeq += 1;
+          epStatus = "vlm_running";
+          return new Response(
+            JSON.stringify(
+              makeJobStatus({
+                job_id: `job_studio_${jobSeq}`,
+                job_type: "batch_vlm",
+                status: "running",
+                progress_done: 0,
+                progress_total: 1,
+                params: { episode_ids: ["demo_ds/ep_001"] },
+              }),
+            ),
+            { status: 201 },
+          );
+        }
+        if (url.includes("/cancel") && method === "POST") {
+          cancelCalls += 1;
+          epStatus = "vlm_ready";
+          return new Response(
+            JSON.stringify(
+              makeJobStatus({
+                job_id: `job_studio_${jobSeq}`,
+                job_type: "batch_vlm",
+                status: "cancelled",
+                progress_done: 0,
+                progress_total: 1,
+                params: { episode_ids: ["demo_ds/ep_001"] },
+              }),
+            ),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/jobs")) {
+          return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+        }
+        if (url.endsWith("/runs")) {
+          return new Response(
+            JSON.stringify({ episode_id: "demo_ds/ep_001", active_run_id: "run_001", runs: [] }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith("/reviews")) {
+          return new Response(JSON.stringify({ items: [] }), { status: 200 });
+        }
+        if (url.includes("/api/episodes/demo_ds/ep_001")) {
+          episodeFetches += 1;
+          return new Response(
+            JSON.stringify(makeResolvedEpisode({ episode_id: "demo_ds/ep_001", status: epStatus })),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ schema_version: "1.0", version: 1, categories: [], labels: [] }), {
+          status: 200,
+        });
+      }),
+    );
+
+    render(
+      <AuthProvider initialAuth={{ token: "lead-tok", username: "lead_1", role: "lead" }}>
+        <ToastProvider>
+          <JobProvider>
+            <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+              <Routes>
+                <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+              </Routes>
+            </MemoryRouter>
+          </JobProvider>
+        </ToastProvider>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("review-studio-page")).toBeInTheDocument());
+
+    // 1. Trigger rerun and cancel directly via inline cancel button
+    fireEvent.click(screen.getByTestId("rerun-vlm-s3s4-btn"));
+    const inlineCancelBtn = await screen.findByTestId("cancel-rerun-vlm-btn");
+    expect(screen.getByTestId("rerun-vlm-s3s4-btn")).toBeDisabled();
+
+    const fetchesBeforeInlineCancel = episodeFetches;
+    fireEvent.click(inlineCancelBtn);
+
+    await waitFor(() => expect(cancelCalls).toBe(1));
+    await waitFor(() => expect(episodeFetches).toBeGreaterThan(fetchesBeforeInlineCancel));
+    await waitFor(() => expect(screen.getByTestId("rerun-vlm-s3s4-btn")).toBeEnabled());
+    expect(screen.queryByTestId("cancel-rerun-vlm-btn")).toBeNull();
+
+    // 2. Trigger a second rerun and cancel externally via SSE job_update -> resets rerunning + reloads episode
+    fireEvent.click(screen.getByTestId("rerun-vlm-s3s4-btn"));
+    await screen.findByTestId("cancel-rerun-vlm-btn");
+    epStatus = "vlm_ready";
+    const fetchesBeforeExternalCancel = episodeFetches;
+
+    act(() => {
+      for (const es of sseInstances) {
+        es.onmessage?.({
+          data: JSON.stringify({
+            type: "job_update",
+            job: makeJobStatus({
+              job_id: "job_studio_2",
+              job_type: "batch_vlm",
+              status: "cancelled",
+              progress_done: 0,
+              progress_total: 1,
+              params: { episode_ids: ["demo_ds/ep_001"] },
+            }),
+          }),
+        } as MessageEvent);
+      }
+    });
+
+    await waitFor(() => expect(episodeFetches).toBeGreaterThan(fetchesBeforeExternalCancel));
+    await waitFor(() => expect(screen.getByTestId("rerun-vlm-s3s4-btn")).toBeEnabled());
+    expect(screen.getByTestId("review-studio-page")).toHaveTextContent("Ready for Review");
+  });
+
+  it("9. ReviewStudioPage: Lead split menu triggers S1-only rerun (s1_grounding, fresh=false) and updates grounding badge from v1 Sparse to v2 Dense on refresh", async () => {
+    const epV1 = makeResolvedEpisode({
+      episode_id: "demo_ds/ep_001",
+      active_run_id: "run_v1",
+    });
+    const epV2 = makeResolvedEpisode({
+      episode_id: "demo_ds/ep_001",
+      active_run_id: "run_v2",
+      grounding: {
+        schema_version: 2,
+        camera_name: "head_rgbd",
+        ref_size: [1280, 720],
+        keyframes_s: [0, 2.5, 5.0],
+        dense_times_s: [0.0, 0.1, 0.2],
+        object_tracks_2d: {
+          block: {
+            object_id: "block",
+            name: "Target Block",
+            tag_pos: "top",
+            is_static_container: false,
+            tracking_mode: "bidir_flow_ncc",
+            keyframes: epV1.grounding!.object_tracks_2d.block.keyframes,
+            dense_boxes_norm_1000: [
+              [200, 300, 350, 500],
+              [210, 300, 360, 500],
+              [220, 300, 370, 500],
+            ],
+            dense_flags: [2, 1, 1],
+            dense_conf_pct: [100, 96, 95],
+          },
+        },
+      },
+    });
+
+    let currentEp = epV1;
+    const jobBodies: Array<Record<string, unknown>> = [];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/api/jobs") && init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+          jobBodies.push(body);
+          currentEp = epV2;
+          return new Response(
+            JSON.stringify(
+              makeJobStatus({
+                job_id: "job_s1_only_1",
+                job_type: "batch_vlm",
+                status: "completed",
+                progress_done: 1,
+                progress_total: 1,
+                params: body,
+              }),
+            ),
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/runs")) {
+          return new Response(
+            JSON.stringify({
+              episode_id: "demo_ds/ep_001",
+              active_run_id: currentEp.active_run_id,
+              runs: [],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith("/reviews")) {
+          return new Response(JSON.stringify({ items: [] }), { status: 200 });
+        }
+        if (url.includes("/api/episodes/demo_ds/ep_001")) {
+          return new Response(JSON.stringify(currentEp), { status: 200 });
+        }
+        if (url.includes("/api/settings")) {
+          return new Response(JSON.stringify({ min_watch_coverage: 0.95, batch_vlm_concurrency: 4 }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({ schema_version: "1.0", version: 1, categories: [], labels: [] }), {
+          status: 200,
+        });
+      }),
+    );
+
+    render(
+      <AuthProvider initialAuth={{ token: "lead-tok", username: "lead_1", role: "lead" }}>
+        <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+          <Routes>
+            <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("review-studio-page")).toBeInTheDocument());
+    expect(screen.getByTestId("grounding-version-badge")).toHaveTextContent("v1 Sparse");
+
+    fireEvent.click(screen.getByTestId("rerun-vlm-menu-toggle"));
+    const s1Btn = screen.getByTestId("rerun-vlm-s1-btn");
+    expect(s1Btn).toHaveTextContent("Rerun S1 Only (Refresh 2D Boxes, Reuse S2-S5 Cache)");
+
+    await act(async () => {
+      fireEvent.click(s1Btn);
+    });
+
+    await waitFor(() => expect(jobBodies).toHaveLength(1));
+    expect(jobBodies[0]).toEqual({
+      job_type: "batch_vlm",
+      episode_ids: ["demo_ds/ep_001"],
+      stage: "s1_grounding",
+      fresh: false,
+    });
+
+    const refreshBtn = await screen.findByTestId("refresh-after-rerun-btn");
+    await act(async () => {
+      fireEvent.click(refreshBtn);
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("grounding-version-badge")).toHaveTextContent("v2 Dense"),
+    );
+  });
 });

@@ -65,7 +65,7 @@ function formatUpdatedAt(ts: number): string {
 }
 
 export const QueuePage: React.FC = () => {
-  const { isLead, username, token, authProbing, setAuthPromptOpen } = useAuth();
+  const { isLead, username, token, noAuth, authProbing, setAuthPromptOpen } = useAuth();
   const jobStore = useJobs();
   const toast = useToast();
   const navigate = useNavigate();
@@ -89,10 +89,42 @@ export const QueuePage: React.FC = () => {
   const [taskFilter, setTaskFilter] = useState("");
   const [adapterFilter, setAdapterFilter] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [sortBy, setSortBy] = useState<EpisodeSortField>("episode_id");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [passedFilter, setPassedFilter] = useState<"all" | "true" | "false">("all");
   const [downgradedOnly, setDowngradedOnly] = useState(false);
+  const queueSeqRef = useRef(0);
+
+  // Debounce search query to prevent spamming backend on fast typing
+  useEffect(() => {
+    const trimmed = searchQuery.trim();
+    if (!trimmed) {
+      setDebouncedSearch("");
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(trimmed);
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
+  // Clear batch selection whenever visible filter/page/role scope changes
+  useEffect(() => {
+    setSelectedIds([]);
+  }, [
+    isLead,
+    page,
+    statusFilter,
+    datasetFilter,
+    taskFilter,
+    adapterFilter,
+    passedFilter,
+    downgradedOnly,
+    debouncedSearch,
+    sortBy,
+    sortDir,
+  ]);
 
   // Lead batch job, ingest & workspace settings state
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -196,6 +228,7 @@ export const QueuePage: React.FC = () => {
 
   const fetchQueue = useCallback(async () => {
     if (authProbing) return;
+    const seq = ++queueSeqRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -207,7 +240,7 @@ export const QueuePage: React.FC = () => {
             adapter_type: adapterFilter || undefined,
             passed: passedFilter === "all" ? null : passedFilter === "true",
             guardrail_downgraded: downgradedOnly || undefined,
-            search: searchQuery.trim() || undefined,
+            search: debouncedSearch || undefined,
             sort_by: sortBy,
             sort_dir: sortDir,
             limit: PAGE_SIZE,
@@ -229,6 +262,7 @@ export const QueuePage: React.FC = () => {
               };
 
       const res = await listEpisodes(filters);
+      if (seq !== queueSeqRef.current) return;
       if (isLead) {
         setServerStatusCounts(res.status_counts ?? null);
         setFacets(res.facets ?? null);
@@ -250,18 +284,22 @@ export const QueuePage: React.FC = () => {
           res.items.filter((e) => e.status === "claimed" && e.claimed_by === username).length,
       );
     } catch (err) {
+      if (seq !== queueSeqRef.current) return;
       const status = (err as { status?: number })?.status;
       if (status === 401) {
         setAuthPromptOpen(true);
       }
       setError(err instanceof Error ? err.message : "Failed to load queue");
     } finally {
-      setLoading(false);
+      if (seq === queueSeqRef.current) {
+        setLoading(false);
+      }
     }
   }, [
     authProbing,
     isLead,
     token,
+    noAuth,
     username,
     page,
     statusFilter,
@@ -270,7 +308,7 @@ export const QueuePage: React.FC = () => {
     adapterFilter,
     passedFilter,
     downgradedOnly,
-    searchQuery,
+    debouncedSearch,
     sortBy,
     sortDir,
     reviewerTab,
@@ -281,10 +319,11 @@ export const QueuePage: React.FC = () => {
     void fetchQueue();
   }, [fetchQueue]);
 
-  // Global SSE notifications
+  // Global SSE notifications (supports both token-auth and --no-auth modes)
+  const canStreamEvents = !authProbing && (Boolean(token) || noAuth);
   useEventStream({
-    url: token ? "/api/events" : null,
-    enabled: Boolean(token),
+    url: canStreamEvents ? "/api/events" : null,
+    enabled: canStreamEvents,
     onMessage: (evt: Record<string, unknown>) => {
       const eventName =
         typeof evt.type === "string"
@@ -297,6 +336,27 @@ export const QueuePage: React.FC = () => {
       }
     },
   });
+
+  // Watch jobStore.jobs terminal transitions so cancelling/finishing from JobCenterDrawer refreshes queue immediately
+  const prevJobStatusesRef = useRef<Map<string, JobStatus["status"]>>(new Map());
+  useEffect(() => {
+    if (!jobStore.isProvided) return;
+    let shouldRefresh = false;
+    const prevMap = prevJobStatusesRef.current;
+    for (const job of jobStore.jobs) {
+      const prev = prevMap.get(job.job_id);
+      prevMap.set(job.job_id, job.status);
+      const wasActive = prev === "queued" || prev === "running";
+      const isTerminal =
+        job.status === "completed" || job.status === "failed" || job.status === "cancelled";
+      if (wasActive && isTerminal) {
+        shouldRefresh = true;
+      }
+    }
+    if (shouldRefresh) {
+      void fetchQueue();
+    }
+  }, [jobStore.isProvided, jobStore.jobs, fetchQueue]);
 
   // Fallback per-job SSE stream when QueuePage is mounted standalone without JobProvider
   useEventStream<JobStatus>({
@@ -359,16 +419,36 @@ export const QueuePage: React.FC = () => {
   }, [facets]);
 
   const handleClaimNext = async () => {
-    const candidate = episodes.find((ep) => ep.status === "vlm_ready");
-    if (!candidate) {
-      setError("No episodes currently ready for review (vlm_ready)");
-      return;
-    }
     setClaimingNext(true);
     setError(null);
     try {
-      await claimEpisode(candidate.episode_id, username);
-      navigate(`/review/${encodeEpPath(candidate.episode_id)}`);
+      const res = await listEpisodes({ status: "vlm_ready", limit: 10 });
+      const candidates = (res.items ?? []).filter((ep) => ep.status === "vlm_ready");
+      if (candidates.length === 0) {
+        setError("No episodes currently ready for review (vlm_ready)");
+        return;
+      }
+      let lastErr: unknown = null;
+      for (const candidate of candidates) {
+        try {
+          await claimEpisode(candidate.episode_id, username);
+          navigate(`/review/${encodeEpPath(candidate.episode_id)}`);
+          return;
+        } catch (err) {
+          const status = (err as { status?: number })?.status;
+          if (status === 409) {
+            lastErr = err;
+            continue;
+          }
+          throw err;
+        }
+      }
+      setError(
+        lastErr instanceof Error
+          ? `Claim conflict: all candidates were already claimed (${lastErr.message})`
+          : "No claimable episodes currently available",
+      );
+      void fetchQueue();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to claim episode");
     } finally {
@@ -408,6 +488,9 @@ export const QueuePage: React.FC = () => {
         stage: jobType === "batch_vlm" && vlmStage ? vlmStage : undefined,
       });
       handleTrackSubmittedJob(job);
+      if (jobType === "batch_vlm") {
+        void fetchQueue();
+      }
     } catch (err) {
       toast.showToast({
         message: err instanceof Error ? err.message : "Failed to create batch job",
@@ -422,7 +505,19 @@ export const QueuePage: React.FC = () => {
       ? await jobStore.cancelJob(jobId)
       : await apiCancelJob(jobId).catch(() => null);
     if (updated) {
+      prevJobStatusesRef.current.set(updated.job_id, updated.status);
       setLocalActiveJob(updated);
+      if (!jobStore.isProvided && updated.status === "cancelled") {
+        toast.showToast({
+          message:
+            updated.job_type === "batch_vlm"
+              ? `Job ${updated.job_id} cancelled; unfinished episode statuses reverted`
+              : `Job ${updated.job_id} (${updated.job_type}) cancelled`,
+          variant: "warning",
+          testId: "queue-job-toast",
+        });
+      }
+      void fetchQueue();
     }
   };
 
@@ -728,10 +823,12 @@ export const QueuePage: React.FC = () => {
             <span>Selected: {selectedIds.length}</span>
             <select
               aria-label="Rerun stage"
+              data-testid="batch-vlm-stage-select"
               value={vlmStage}
               onChange={(e) => setVlmStage(e.target.value)}
             >
               <option value="">Full DAG (S1–S5)</option>
+              <option value="s1_grounding">Rerun S1 only (refresh 2D boxes, reuse S2-S5 cache)</option>
               <option value="s3_s4">Rerun S3/S4 only (Discover + Verify)</option>
               <option value="s3_discover">Rerun S3 only (Discover)</option>
               <option value="s4_verify">Rerun S4 only (Verify)</option>
@@ -762,6 +859,15 @@ export const QueuePage: React.FC = () => {
                   Job {activeJob.job_id} ({activeJob.job_type})
                 </strong>{" "}
                 — Status: {activeJob.status} ({activeJob.progress_done}/{activeJob.progress_total})
+                {activeJob.summary?.errors && activeJob.summary.errors.length > 0 && (
+                  <div className="small delta-neg" data-testid="active-job-error-summary">
+                    Error: {activeJob.summary.errors[0].episode_id ? `${activeJob.summary.errors[0].episode_id}: ` : ""}
+                    {activeJob.summary.errors[0].error || "Job execution failed"}
+                    {activeJob.summary.errors.length > 1
+                      ? ` (+${activeJob.summary.errors.length - 1} more)`
+                      : ""}
+                  </div>
+                )}
               </div>
               <div className="header-actions">
                 {(activeJob.status === "queued" || activeJob.status === "running") && (
@@ -784,6 +890,19 @@ export const QueuePage: React.FC = () => {
                       <Download size={13} /> Download {art.name || `Artifact #${idx + 1}`}
                     </a>
                   ))}
+                {(activeJob.status === "completed" ||
+                  activeJob.status === "failed" ||
+                  activeJob.status === "cancelled") && (
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    data-testid="dismiss-active-job-btn"
+                    onClick={() => setLocalActiveJob(null)}
+                    aria-label="Dismiss job banner"
+                  >
+                    <X size={13} /> Dismiss
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -801,7 +920,10 @@ export const QueuePage: React.FC = () => {
                   <input
                     type="checkbox"
                     aria-label="Select all"
-                    checked={displayRows.length > 0 && selectedIds.length === displayRows.length}
+                    checked={
+                      displayRows.length > 0 &&
+                      displayRows.every((r) => selectedIds.includes(r.episode_id))
+                    }
                     onChange={(e) =>
                       setSelectedIds(e.target.checked ? displayRows.map((r) => r.episode_id) : [])
                     }

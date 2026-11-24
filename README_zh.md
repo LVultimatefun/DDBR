@@ -118,7 +118,7 @@
 ## 核心特性
 
 - **3-In 可插拔只读 I/O 内核（[`robo_vlm_qc/io/`](robo_vlm_qc/io/)）**：严格只读接入 `h5_raw_v3`（5 流 30 Hz 同步、Slerp、触觉断帧修复、SBS 立体裁切）、`lerobot`（v2/v3 Parquet + MP4）及 `video_dir`（纯视频 `kinematics=None`），支持按相机角色自适应拼图（`wrist_2x2`、`torso_head_2x2`、`single_1x2`）。
-- **因果 VLM DAG 与轻量护栏（[`robo_vlm_qc/vlm/`](robo_vlm_qc/vlm/)、[`robo_vlm_qc/guardrail/`](robo_vlm_qc/guardrail/)）**：基于 `httpx` 的多提供商 `VlmClient`（OpenAI 兼容接口、DashScope、Gemini、本地 vLLM），支持按阶段路由模型、动态时长 Token 预算、内容寻址 `StageCache`，以及三级并发 DAG `S0 → S1 → (S2 ∥ S5) → S3 → S4A → S4B`。轻量护栏（`hallucination`、`splice_gate`、`visual_gate`）不主动产生标签，仅在切段跳变超限时将不安全的 `cut_clean` 自动降级为 `mask_loss`。
+- **因果 VLM DAG、BAFT 帧级 2D 追踪与中途取消同步（[`robo_vlm_qc/vlm/`](robo_vlm_qc/vlm/)、[`robo_vlm_qc/guardrail/`](robo_vlm_qc/guardrail/)）**：基于 `httpx` 的多提供商 `VlmClient`（OpenAI 兼容接口、DashScope、Gemini、本地 vLLM），支持按阶段路由模型、动态时长 Token 预算、内容寻址 `StageCache`（`S1` 与下游缓存解耦，仅重跑 `S1` 时 100% 保留 `S2`–`S5` 缓存）、三级并发 DAG `S0 → S1 → (S2 ∥ S5) → S3 → S4A → S4B`、完全离线的 **BAFT**（双向锚点融合光流 + 多尺度 NCC）稠密帧级 2D 目标定位与追踪（时序分批锚点、默认零额外 VLM 调用、自动相机运动检测、遮挡隐藏，以及前端 30fps `requestVideoFrameCallback` + `object-fit: contain` 精准渲染），以及协作式中途 VLM 取消（~1 ms 主动中断在途连接 + 原子化状态回滚与 SSE 实时同步）。轻量护栏（`hallucination`、`splice_gate`、`visual_gate`）不主动产生标签，仅在切段跳变超限时将不安全的 `cut_clean` 自动降级为 `mask_loss`。
 - **11 个纯视觉核心标签（[`configs/labels.yaml`](configs/labels.yaml)）**：纯视觉语义分类与切段策略解耦，配合精准优先（Precision-First）阶段提示词（[`configs/prompts/`](configs/prompts/)）与通用任务模板（[`configs/tasks/`](configs/tasks/)）。
 - **单一真相存储（[`robo_vlm_qc/store/`](robo_vlm_qc/store/)）**：由 Pydantic v2 强类型契约（`VlmRunArtifact`、`HumanReviewArtifact`、`ResolvedEpisode`）驱动，底层采用 SQLite WAL（`robo_vlm_qc.db`）、不可变 JSON 制品（`artifacts/`）以及 `.history/` 配置变更快照。
 - **`VLM Lab` 纯上下文迭代闭环（[`robo_vlm_qc/lab/`](robo_vlm_qc/lab/)）**：自动化 6 桶错因诊断（`VLM 原始输出 vs 人工 GT`）、一键 2×2 视觉/文本错题本 Few-Shot 注入 S3/S4、未知异常归类（`merge` / `promote`）、`.history/` 差异对比与一键回滚、辅助 Prompt 改写建议（`prompt_assist`），以及 100% 复用 S1/S2/S5 缓存的 GT 回归评测沙盒（**严格纯 In-Context，零 VLM SFT/DPO/LoRA 微调导出**）。
@@ -243,7 +243,7 @@ docker compose up --build
 | **3 种训练配方** | `bc_clean`（仅成功轨迹，移除安全 `cut_clean`，`mask_loss` 置 `0.0` 掩码）、`recovery_plus`（额外放开 `recovery` 恢复段训练）、`badcase_pairs`（导出正负对比/失败上下文窗口）。 |
 | **11 个纯视觉标签** | `boundary_idle`、`mid_idle_freeze`、`missed_grasp_retry`、`object_slip_recovery`、`placement_redo`、`hesitation_oscillation`、`collision_or_knock`、`precision_fine_adjust`、`bimanual_assist_hold`、`terminal_failure`、`unknown_anomaly`。 |
 | **内置示例任务** | [`_default.yaml`](configs/tasks/_default.yaml)、[`pick_and_place.yaml`](configs/tasks/pick_and_place.yaml)、[`bimanual_handover.yaml`](configs/tasks/bimanual_handover.yaml)。 |
-| **因果 DAG 与缓存** | `S1`（2D 目标定位）→ `S2 ∥ S5`（宏观阶段与左右臂状态 ∥ 尾段稠密成败判定与 30% 反误报对照）→ `S3`（滑窗异常发现 + S2 保护 + Few-Shot）→ `S4A/S4B`（去重合并 + 0.5s 边界精修）。修改 S3/标签/Few-Shot 时 S1/S2/S5 `StageCache` 100% 命中。 |
+| **因果 DAG 与缓存** | `S1`（时序分批 2D 定位 + BAFT 帧级稠密追踪：光流 + 多尺度 NCC，默认零额外 VLM 调用，支持相机运动检测、遮挡隐藏与 30fps `requestVideoFrameCallback` + `object-fit: contain` 渲染）→ `S2 ∥ S5`（宏观阶段与左右臂状态 ∥ 尾段稠密成败判定与 30% 反误报对照）→ `S3`（滑窗异常发现 + S2 保护 + Few-Shot）→ `S4A/S4B`（去重合并 + 0.5s 边界精修）。仅重跑 `S1` 完整保留 `S2`–`S5` 缓存，修改 S3/标签/Few-Shot 时 S1/S2/S5 `StageCache` 100% 命中，并支持中途 VLM 协作取消与原子 SSE 状态回滚。 |
 | **双角色三层编辑** | `Reviewer` 与 `Lead` 共用同一 `ReviewStudioPage`。人工仅编辑 `qc_segments`、`success`、`macro_stages`；`grounding`、`arm_timelines` 与 `raw_vlm_segments` 严格只读。 |
 | **`VLM Lab` 上下文闭环** | `GT 冻结` → `6 桶错因诊断` → `2×2 视觉 Few-Shot` / `未知异常归类` / `版本化配置` → `GT 沙盒回归` → `一键发布`（含 `.history/` 快照回滚）。**绝不包含 VLM SFT/DPO/LoRA 微调导出。** |
 

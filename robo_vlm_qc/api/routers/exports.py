@@ -256,9 +256,14 @@ async def download_export(
 ) -> StreamingResponse:
     _ = auth
     manifest = _load_manifest(state, export_id)
-    out_dir = Path(manifest.output_dir)
-    if not out_dir.is_absolute():
-        out_dir = (state.workspace / out_dir).resolve()
+    ws_root = state.workspace.resolve()
+    raw_out = Path(manifest.output_dir)
+    out_dir = raw_out.resolve() if raw_out.is_absolute() else (ws_root / raw_out).resolve()
+    if not out_dir.is_relative_to(ws_root):
+        raise HTTPException(
+            status_code=403,
+            detail="Export output directory escapes workspace boundary",
+        )
     if not out_dir.is_dir():
         raise HTTPException(
             status_code=404, detail=f"Export output directory missing for {export_id!r}"
@@ -268,8 +273,14 @@ async def download_export(
         tmp = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
         with zipfile.ZipFile(tmp, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
             for fpath in sorted(out_dir.rglob("*")):
-                if fpath.is_file():
-                    zf.write(fpath, arcname=fpath.relative_to(out_dir).as_posix())
+                try:
+                    f_res = fpath.resolve()
+                except OSError:
+                    continue
+                if not f_res.is_relative_to(out_dir):
+                    continue
+                if f_res.is_file():
+                    zf.write(f_res, arcname=fpath.relative_to(out_dir).as_posix())
         tmp.seek(0)
         return tmp
 

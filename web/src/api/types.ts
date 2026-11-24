@@ -55,6 +55,7 @@ export interface EpisodeMeta {
 }
 
 export type GroundingStatusKind = "neutral" | "warn" | "error" | "good";
+export type GroundingTrackingMode = "sparse_vlm" | "static_locked" | "bidir_flow_ncc";
 
 export interface GroundingKeyframe {
   row: number;
@@ -72,12 +73,20 @@ export interface GroundingTrack {
   tag_pos: "top" | "bottom";
   is_static_container: boolean;
   keyframes: GroundingKeyframe[];
+  tracking_mode?: GroundingTrackingMode;
+  dense_boxes_norm_1000?: Array<[number, number, number, number]>;
+  dense_flags?: number[];
+  dense_conf_pct?: number[];
 }
 
 export interface GroundingResult {
   schema_version: number;
+  camera_name?: string | null;
   ref_size: [number, number];
   keyframes_s: number[];
+  track_fps?: number | null;
+  dense_times_s?: number[];
+  camera_motion_detected?: boolean;
   object_tracks_2d: Record<string, GroundingTrack>;
 }
 

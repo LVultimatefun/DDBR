@@ -423,10 +423,16 @@ export async function getExport(exportId: string): Promise<ExportManifest> {
   return apiFetch<ExportManifest>(`/api/exports/${encodeURIComponent(exportId)}`);
 }
 
+export interface AuthMeResponse {
+  role: ReviewRole;
+  user: string;
+  no_auth?: boolean;
+}
+
 export async function getAuthMe(
   overrideCreds?: Partial<AuthCredentials>,
-): Promise<{ role: ReviewRole; user: string }> {
-  return apiFetch<{ role: ReviewRole; user: string }>("/api/auth/me", {}, overrideCreds);
+): Promise<AuthMeResponse> {
+  return apiFetch<AuthMeResponse>("/api/auth/me", {}, overrideCreds);
 }
 
 export async function getLabLabels(overrideCreds?: Partial<AuthCredentials>): Promise<LabelRegistry> {

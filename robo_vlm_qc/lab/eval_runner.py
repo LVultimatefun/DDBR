@@ -28,7 +28,7 @@ from ..models.review import EpisodeStatus
 from ..models.taxonomy import LabelRegistry, PromptTemplate, TaskSpec
 from ..store.artifacts import ArtifactStore, archive_before, atomic_write
 from ..store.repository import NotFoundError, Repository
-from ..vlm.client import normalize_stage_name
+from ..vlm.client import VlmCancelledError, VlmClient, normalize_stage_name
 from ..vlm.dag import VlmDag
 from .few_shot import open_episode_view, retrieve_few_shots
 
@@ -226,6 +226,8 @@ def run_gt_eval(
     label_ver: str | None = None,
     persist_report: bool = True,
     on_progress: Callable[[int, int, str, dict[str, Any]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+    on_cancel_register: Callable[[Callable[[], None]], None] | None = None,
 ) -> EvalRunReport:
     """Run VlmDag in is_eval_sandbox=True mode over gt_frozen episodes and compute metrics."""
     owns_repo = False
@@ -304,7 +306,20 @@ def run_gt_eval(
                 )
             return report
 
-        dag = VlmDag(workspace=ws, config=eff_cfg, repo=eff_repo)
+        vlm_client = VlmClient.from_config(
+            eff_cfg,
+            workspace_dir=ws,
+            cancel_event=cancel_event,
+        )
+        if on_cancel_register is not None:
+            on_cancel_register(vlm_client.cancel)
+        dag = VlmDag(
+            workspace=ws,
+            config=eff_cfg,
+            client=vlm_client,
+            repo=eff_repo,
+            cancel_event=cancel_event,
+        )
         s3_cfg = eff_cfg.settings.get("vlm", {}).get("s3_discover", {})
         eff_top_k = int(top_k if top_k is not None else s3_cfg.get("few_shot_top_k", 4))
         eff_max_tok = int(
@@ -312,6 +327,8 @@ def run_gt_eval(
         )
 
         def _eval_one(row: dict[str, Any]) -> tuple[EpisodeEvalResult, VlmRunArtifact]:
+            if cancel_event is not None and cancel_event.is_set():
+                raise VlmCancelledError("GT eval cancelled")
             ep_id = str(row["episode_id"])
             resolved_gt = eff_repo.resolve_episode(ep_id)
             with open_episode_view(resolved_gt.meta, eff_cfg) as view:
@@ -331,6 +348,7 @@ def run_gt_eval(
                     few_shots=fs_items,
                     is_eval_sandbox=True,
                     persist=True,
+                    cancel_event=cancel_event,
                 )
 
             pred_segs = sandbox_run.qc_segments
@@ -409,6 +427,8 @@ def run_gt_eval(
             if max_w == 1:
                 outcomes = []
                 for idx, r in enumerate(frozen_rows, start=1):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise VlmCancelledError("GT eval cancelled")
                     ep_res, run_art = _eval_one(r)
                     outcomes.append((ep_res, run_art))
                     if on_progress is not None:
@@ -442,6 +462,7 @@ def run_gt_eval(
                                     _progress_info(ep_res),
                                 )
                     except BaseException:
+                        dag.client.cancel()
                         for f in fut_to_idx:
                             f.cancel()
                         raise

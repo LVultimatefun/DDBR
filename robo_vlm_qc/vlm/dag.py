@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from ..config import ConfigManager, canonical_sha256
 from ..guardrail import (
@@ -29,7 +31,13 @@ from ..models.review import EpisodeStatus
 from ..models.taxonomy import FewShotItem, TaskSpec
 from ..store.repository import GtFrozenError, NotFoundError, Repository
 from .cache import StageCache
-from .client import BudgetTracker, VlmClient, normalize_stage_name
+from .client import (
+    BudgetTracker,
+    VlmCancelledError,
+    VlmClient,
+    check_client_cancelled,
+    normalize_stage_name,
+)
 from .prompt_builder import PromptBuilder
 from .stage1_grounding import run_stage1_grounding
 from .stage2_macro import run_stage2_macro
@@ -55,6 +63,7 @@ class VlmDag:
         stage_cache: StageCache | None = None,
         repo: Repository | None = None,
         repository: Repository | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         ws = workspace or workspace_dir
         cm = config_manager or config or cfg
@@ -65,7 +74,16 @@ class VlmDag:
                 ws = Path("./workspace")
         self.workspace = Path(ws).resolve()
         self.cfg = cm or ConfigManager(workspace_dir=self.workspace)
-        self.client = client or vlm_client or VlmClient.from_config(self.cfg, workspace_dir=self.workspace)
+        self._cancel_event = cancel_event
+        self.client = (
+            client
+            or vlm_client
+            or VlmClient.from_config(
+                self.cfg,
+                workspace_dir=self.workspace,
+                cancel_event=cancel_event,
+            )
+        )
         self.cache = cache or stage_cache or StageCache(workspace=self.workspace)
         self.repo = repo or repository or Repository(self.workspace)
         self.prompt_builder = PromptBuilder(self.cfg)
@@ -91,20 +109,38 @@ class VlmDag:
         fresh_stages: Sequence[str] | set[str] | None = None,
         is_eval_sandbox: bool = False,
         persist: bool = True,
+        cancel_event: threading.Event | None = None,
+        on_status_change: Callable[[str, EpisodeStatus], None] | None = None,
+        can_rollback: Callable[[str], bool] | None = None,
     ) -> VlmRunArtifact:
         ev = view or episode_view
         assert ev is not None, "EpisodeView is required"
+
+        def _check_cancelled() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise VlmCancelledError(
+                    f"VLM run cancelled for episode {ev.meta.episode_id!r}"
+                )
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                raise VlmCancelledError(
+                    f"VLM run cancelled for episode {ev.meta.episode_id!r}"
+                )
+            check_client_cancelled(self.client)
+
+        def _emit_status(st: EpisodeStatus) -> None:
+            if on_status_change is not None:
+                with contextlib.suppress(Exception):
+                    on_status_change(ev.meta.episode_id, st)
+
         t_spec = self._resolve_task(ev, task_spec or task)
         fs_stages = (
             {normalize_stage_name(str(s)) for s in fresh_stages}
             if fresh_stages
             else set()
         )
-        if "s1_grounding" in fs_stages:
-            fs_stages |= {"s2_macro", "s3_discover", "s4_verify"}
-        elif "s2_macro" in fs_stages:
+        if "s2_macro" in fs_stages:
             fs_stages |= {"s3_discover", "s4_verify"}
-        elif "s3_discover" in fs_stages:
+        if "s3_discover" in fs_stages:
             fs_stages |= {"s4_verify"}
 
         fs_raw = few_shots if few_shots is not None else few_shot_items
@@ -128,28 +164,33 @@ class VlmDag:
         # Manage episode status transition safely if tracked in SQLite
         transitioned_to_running = False
         prev_status: EpisodeStatus | None = None
-        if persist and not is_eval_sandbox:
-            try:
-                row = self.repo.get_episode_row(ev.meta.episode_id)
-                cur_st = EpisodeStatus(row["status"])
-                if cur_st == EpisodeStatus.GT_FROZEN:
-                    raise GtFrozenError(
-                        f"Episode {ev.meta.episode_id!r} is gt_frozen; cannot overwrite active VLM run"
-                    )
-                if cur_st in {
-                    EpisodeStatus.INGESTED,
-                    EpisodeStatus.VLM_QUEUED,
-                    EpisodeStatus.VLM_READY,
-                }:
-                    prev_status = cur_st
-                    self.repo.transition_status(
-                        ev.meta.episode_id, EpisodeStatus.VLM_RUNNING
-                    )
-                    transitioned_to_running = True
-            except NotFoundError:
-                pass
 
         try:
+            _check_cancelled()
+            if persist and not is_eval_sandbox:
+                try:
+                    row = self.repo.get_episode_row(ev.meta.episode_id)
+                    cur_st = EpisodeStatus(row["status"])
+                    if cur_st == EpisodeStatus.GT_FROZEN:
+                        raise GtFrozenError(
+                            f"Episode {ev.meta.episode_id!r} is gt_frozen; cannot overwrite active VLM run"
+                        )
+                    if cur_st in {
+                        EpisodeStatus.INGESTED,
+                        EpisodeStatus.VLM_QUEUED,
+                        EpisodeStatus.VLM_READY,
+                    }:
+                        prev_status = cur_st
+                        _check_cancelled()
+                        self.repo.transition_status(
+                            ev.meta.episode_id, EpisodeStatus.VLM_RUNNING
+                        )
+                        transitioned_to_running = True
+                        _emit_status(EpisodeStatus.VLM_RUNNING)
+                except NotFoundError:
+                    pass
+
+            _check_cancelled()
             ep_fp = ev.meta.episode_fingerprint
             s1_key = StageCache.compute_key(
                 episode_fingerprint=ep_fp,
@@ -157,16 +198,15 @@ class VlmDag:
             )
             s2_key = StageCache.compute_key(
                 episode_fingerprint=ep_fp,
-                upstream_hash=s1_key,
                 stage_basis=self.cfg.s2_cache_basis(t_spec.task_id),
             )
             s5_key = StageCache.compute_key(
                 episode_fingerprint=ep_fp,
-                upstream_hash=s1_key,
                 stage_basis=self.cfg.s5_cache_basis(t_spec.task_id),
             )
 
             # Level 1: Stage 1 (2D Grounding)
+            _check_cancelled()
             s1_cached = None if (fresh or "s1_grounding" in fs_stages) else self.cache.get(s1_key)
             if s1_cached is not None:
                 grounding = GroundingResult.model_validate(s1_cached)
@@ -183,11 +223,16 @@ class VlmDag:
                     cfg=self.cfg,
                     prompt_builder=self.prompt_builder,
                     budget=ep_budget,
+                    cancel_event=cancel_event or self._cancel_event,
                 )
+                _check_cancelled()
                 self.cache.put(s1_key, grounding.model_dump(mode="json"))
 
             # Level 2: Stage 2 (Macro Backbone) || Stage 5 (Dense-Tail Success + 30% Control)
+            _check_cancelled()
+
             def _exec_s2() -> tuple[list[MacroStage], ArmTimelines]:
+                _check_cancelled()
                 s2_cached = None if (fresh or "s2_macro" in fs_stages) else self.cache.get(s2_key)
                 if s2_cached is not None:
                     stages = [
@@ -211,6 +256,7 @@ class VlmDag:
                     prompt_builder=self.prompt_builder,
                     budget=ep_budget,
                 )
+                _check_cancelled()
                 self.cache.put(
                     s2_key,
                     {
@@ -221,6 +267,7 @@ class VlmDag:
                 return stages, arms
 
             def _exec_s5() -> SuccessVerdict:
+                _check_cancelled()
                 s5_cached = None if (fresh or "s5_success" in fs_stages) else self.cache.get(s5_key)
                 if s5_cached is not None:
                     verdict = SuccessVerdict.model_validate(s5_cached)
@@ -238,6 +285,7 @@ class VlmDag:
                     prompt_builder=self.prompt_builder,
                     budget=ep_budget,
                 )
+                _check_cancelled()
                 self.cache.put(s5_key, verdict.model_dump(mode="json"))
                 return verdict
 
@@ -247,6 +295,7 @@ class VlmDag:
                 macro_stages, arm_timelines = fut_s2.result()
                 success_verdict = fut_s5.result()
 
+            _check_cancelled()
             s2_out_hash = canonical_sha256(
                 {
                     "macro_stages": [s.model_dump(mode="json") for s in macro_stages],
@@ -255,11 +304,12 @@ class VlmDag:
             )
             s3_key = StageCache.compute_key(
                 episode_fingerprint=ep_fp,
-                upstream_hash=f"{s1_key}:{s2_key}:{s2_out_hash}",
+                upstream_hash=f"{s2_key}:{s2_out_hash}",
                 stage_basis=self.cfg.s3_cache_basis(t_spec.task_id, few_shot_hash),
             )
 
             # Level 3A: Stage 3 (Sliding QC Discovery w/ S2 Protection & Few-Shot)
+            _check_cancelled()
             s3_cached = None if (fresh or "s3_discover" in fs_stages) else self.cache.get(s3_key)
             if s3_cached is not None:
                 s3_cands = [
@@ -282,21 +332,24 @@ class VlmDag:
                     labels=self.cfg.labels,
                     budget=ep_budget,
                 )
+                _check_cancelled()
                 self.cache.put(
                     s3_key,
                     {"segments": [s.model_dump(mode="json") for s in s3_cands]},
                 )
 
+            _check_cancelled()
             s3_out_hash = canonical_sha256(
                 [s.model_dump(mode="json") for s in s3_cands]
             )
             s4_key = StageCache.compute_key(
                 episode_fingerprint=ep_fp,
-                upstream_hash=f"{s1_key}:{s2_key}:{s2_out_hash}:{s3_key}:{s3_out_hash}",
+                upstream_hash=f"{s2_key}:{s2_out_hash}:{s3_key}:{s3_out_hash}",
                 stage_basis=self.cfg.s4_cache_basis(t_spec.task_id, few_shot_hash),
             )
 
             # Level 3B: Stage 4 (4A Global Merge + 4B 0.5s CoV Refinement)
+            _check_cancelled()
             s4_cached = None if (fresh or "s4_verify" in fs_stages) else self.cache.get(s4_key)
             if s4_cached is not None:
                 s4_segs = [
@@ -320,12 +373,14 @@ class VlmDag:
                     labels=self.cfg.labels,
                     budget=ep_budget,
                 )
+                _check_cancelled()
                 self.cache.put(
                     s4_key,
                     {"segments": [s.model_dump(mode="json") for s in s4_segs]},
                 )
 
             # Level 4: Detector-Free Light Guardrails
+            _check_cancelled()
             if ev.kinematics is not None:
                 qc_segments = apply_hallucination_check(
                     segments=s4_segs,
@@ -347,6 +402,7 @@ class VlmDag:
                     duration_s=ev.duration_s,
                 )
 
+            _check_cancelled()
             run_id = f"run_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
             fpshot = ConfigFingerprintSnapshot(
                 model_routing={
@@ -382,21 +438,37 @@ class VlmDag:
                 success=success_verdict,
                 usage=ep_budget.to_usage_summary(),
             )
+            _check_cancelled()
             if persist:
-                self.repo.save_vlm_run_artifact(artifact)
+                self.repo.save_vlm_run_artifact(
+                    artifact, before_commit_check=_check_cancelled
+                )
+                if not is_eval_sandbox:
+                    try:
+                        cur_after = EpisodeStatus(
+                            self.repo.get_episode_row(ev.meta.episode_id)["status"]
+                        )
+                        _emit_status(cur_after)
+                    except NotFoundError:
+                        pass
             return artifact
 
-        except BaseException:
-            if transitioned_to_running:
-                try:
-                    restore_st = (
-                        prev_status
-                        if prev_status is not None
-                        else EpisodeStatus.INGESTED
-                    )
-                    self.repo.transition_status(ev.meta.episode_id, restore_st)
-                except Exception:
-                    pass
+        except BaseException as exc:
+            if persist and not is_eval_sandbox and (
+                transitioned_to_running or isinstance(exc, VlmCancelledError)
+            ):
+                if can_rollback is None or can_rollback(ev.meta.episode_id):
+                    with contextlib.suppress(Exception):
+                        prev_map = (
+                            {ev.meta.episode_id: prev_status}
+                            if prev_status in {EpisodeStatus.INGESTED, EpisodeStatus.VLM_READY}
+                            else None
+                        )
+                        restored = self.repo.restore_vlm_episodes_on_cancel(
+                            [ev.meta.episode_id], prev_statuses=prev_map
+                        )
+                        for _, restored_st in restored:
+                            _emit_status(restored_st)
             raise
 
     run = run_episode

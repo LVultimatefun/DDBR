@@ -430,7 +430,7 @@ def get_lab_unknowns(
 
 
 @router.post("/unknowns/triage")
-async def post_lab_unknowns_triage(
+def post_lab_unknowns_triage(
     payload: UnknownTriagePayload,
     auth: AuthContext = Depends(require_lead),
     state: AppState = Depends(get_app_state),
@@ -476,8 +476,7 @@ async def post_lab_unknowns_triage(
             or seg.unknown_note.strip()
             or f"Merged unknown anomaly into {target_lbl.id}"
         )
-        fs_item = await run_in_threadpool(
-            create_few_shot_example,
+        fs_item = create_few_shot_example(
             state.repo,
             config=cfg,
             episode_id=payload.episode_id,

@@ -59,6 +59,9 @@ class GroundingKeyframe(BaseModel):
         return self
 
 
+TrackingMode = Literal["sparse_vlm", "static_locked", "bidir_flow_ncc"]
+
+
 class GroundingTrack(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -67,20 +70,91 @@ class GroundingTrack(BaseModel):
     tag_pos: Literal["top", "bottom"] = "top"
     is_static_container: bool = False
     keyframes: list[GroundingKeyframe] = Field(default_factory=list)
+    tracking_mode: TrackingMode = "sparse_vlm"
+    dense_boxes_norm_1000: list[list[int]] = Field(default_factory=list)
+    dense_flags: list[int] = Field(default_factory=list)
+    dense_conf_pct: list[int] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
     def _alias_legacy_fields(cls, data: Any) -> Any:
         return _alias_legacy_key(data, "name_zh", "name")
 
+    @model_validator(mode="after")
+    def _validate_dense(self) -> "GroundingTrack":
+        n = len(self.dense_boxes_norm_1000)
+        if n == 0:
+            if self.dense_flags or self.dense_conf_pct:
+                raise ValueError(
+                    "dense_flags and dense_conf_pct must be empty when dense_boxes_norm_1000 is empty"
+                )
+            return self
+        if self.dense_flags and len(self.dense_flags) != n:
+            raise ValueError(
+                f"dense_flags length ({len(self.dense_flags)}) != dense_boxes_norm_1000 length ({n})"
+            )
+        if self.dense_conf_pct and len(self.dense_conf_pct) != n:
+            raise ValueError(
+                f"dense_conf_pct length ({len(self.dense_conf_pct)}) != dense_boxes_norm_1000 length ({n})"
+            )
+        has_flags = bool(self.dense_flags)
+        for i, box in enumerate(self.dense_boxes_norm_1000):
+            if len(box) != 4:
+                raise ValueError(f"dense_boxes_norm_1000[{i}] must have 4 elements, got {box}")
+            x1, y1, x2, y2 = box
+            if not (0 <= x1 <= x2 <= 1000 and 0 <= y1 <= y2 <= 1000):
+                raise ValueError(f"Invalid dense_boxes_norm_1000[{i}]: {box}")
+            if has_flags:
+                flag = self.dense_flags[i]
+                if flag not in (0, 1, 2, 3):
+                    raise ValueError(f"Invalid dense_flags[{i}]: {flag} (expected 0..3)")
+                if flag == 0 and box != [0, 0, 0, 0]:
+                    raise ValueError(
+                        f"Invisible dense frame {i} (flag=0) must have [0, 0, 0, 0] bbox, got {box}"
+                    )
+        for i, conf in enumerate(self.dense_conf_pct):
+            if not (0 <= conf <= 100):
+                raise ValueError(f"dense_conf_pct[{i}] must be in [0, 100], got {conf}")
+        return self
+
 
 class GroundingResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = 1
+    camera_name: str | None = None
     ref_size: list[int] = Field(default_factory=lambda: [1280, 720], min_length=2, max_length=2)
     keyframes_s: list[float] = Field(default_factory=list)
+    track_fps: float | None = Field(default=None, gt=0.0)
+    dense_times_s: list[float] = Field(default_factory=list)
+    camera_motion_detected: bool = False
     object_tracks_2d: dict[str, GroundingTrack] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_dense_alignment(self) -> "GroundingResult":
+        import math
+
+        n = len(self.dense_times_s)
+        prev_t = -1.0
+        for i, t in enumerate(self.dense_times_s):
+            if not math.isfinite(t) or t < 0.0:
+                raise ValueError(f"dense_times_s[{i}] must be finite >= 0.0, got {t}")
+            if i > 0 and t < prev_t - 1e-6:
+                raise ValueError(
+                    f"dense_times_s must be monotonically non-decreasing at index {i}: {t} < {prev_t}"
+                )
+            prev_t = t
+        for oid, tr in self.object_tracks_2d.items():
+            m = len(tr.dense_boxes_norm_1000)
+            if n == 0 and m > 0:
+                raise ValueError(
+                    f"Track {oid!r} has dense_boxes_norm_1000 ({m}) but GroundingResult.dense_times_s is empty"
+                )
+            if n > 0 and m > 0 and m != n:
+                raise ValueError(
+                    f"Track {oid!r} dense_boxes_norm_1000 length ({m}) != dense_times_s length ({n})"
+                )
+        return self
 
 
 class MacroStage(BaseModel):

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { History, RefreshCw, RotateCcw, X } from "lucide-react";
 import { getLabHistoryDiff, listLabHistory, rollbackLabHistory } from "../api/client";
 import type {
@@ -45,32 +45,41 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
   const [loadingDiff, setLoadingDiff] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (open) {
-      setActiveTarget(target);
-    }
-  }, [open, target]);
+  const listSeqRef = useRef(0);
+  const diffSeqRef = useRef(0);
+  const prevOpenRef = useRef(false);
 
   const loadList = useCallback(async (tgt: LabHistoryTarget) => {
+    const seq = ++listSeqRef.current;
+    diffSeqRef.current += 1;
     setLoadingList(true);
     setError(null);
     setSelectedId(null);
     setDiff(null);
     try {
       const res = await listLabHistory({ target: tgt });
+      if (seq !== listSeqRef.current) return;
       setItems(res.items);
     } catch (err) {
+      if (seq !== listSeqRef.current) return;
       setError(err instanceof Error ? err.message : "Failed to load .history/ snapshots");
     } finally {
-      setLoadingList(false);
+      if (seq === listSeqRef.current) {
+        setLoadingList(false);
+      }
     }
   }, []);
 
   useEffect(() => {
+    const justOpened = open && !prevOpenRef.current;
+    prevOpenRef.current = open;
     if (!open) return;
+    if (justOpened && activeTarget !== target) {
+      setActiveTarget(target);
+      return;
+    }
     void loadList(activeTarget);
-  }, [open, activeTarget, loadList]);
+  }, [open, target, activeTarget, loadList]);
 
   useEffect(() => {
     if (!open) return;
@@ -82,21 +91,27 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
   }, [open, onClose]);
 
   const handleSelectSnapshot = async (snapshotId: string) => {
+    const seq = ++diffSeqRef.current;
     setSelectedId(snapshotId);
+    setDiff(null);
     setLoadingDiff(true);
     setError(null);
     try {
       const res = await getLabHistoryDiff(snapshotId);
+      if (seq !== diffSeqRef.current) return;
       setDiff(res);
     } catch (err) {
+      if (seq !== diffSeqRef.current) return;
       setError(err instanceof Error ? err.message : "Failed to load snapshot diff");
     } finally {
-      setLoadingDiff(false);
+      if (seq === diffSeqRef.current) {
+        setLoadingDiff(false);
+      }
     }
   };
 
   const handleRollback = async () => {
-    if (!selectedId) return;
+    if (!selectedId || loadingDiff || !diff || diff.snapshot_id !== selectedId) return;
     setRollingBack(true);
     setError(null);
     try {
@@ -212,7 +227,7 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
                 <button
                   type="button"
                   className="warning-btn compact"
-                  disabled={rollingBack || loadingDiff}
+                  disabled={rollingBack || loadingDiff || !diff || diff.snapshot_id !== selectedId}
                   onClick={() => void handleRollback()}
                   data-testid="history-rollback-btn"
                 >

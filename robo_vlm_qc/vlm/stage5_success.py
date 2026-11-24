@@ -12,7 +12,7 @@ from ..io.base import EpisodeView
 from ..io.media import compose_2x2_tile
 from ..models.annotation import ControlCheckResult, CriterionResult, SuccessVerdict
 from ..models.taxonomy import TaskSpec
-from .client import BudgetTracker, VlmClient
+from .client import BudgetTracker, VlmClient, check_client_cancelled
 from .prompt_builder import PromptBuilder
 
 
@@ -145,20 +145,20 @@ def run_stage5_success(
         ev.duration_s, control_ratio, control_frames
     )
 
+    check_client_cancelled(cl)
     # Compose tiles once for union of timestamps
     all_times = sorted(set(full_times) | set(ctrl_times))
-    with ThreadPoolExecutor(max_workers=min(6, max(1, len(all_times)))) as pool:
-        tile_map = dict(
-            zip(
-                all_times,
-                pool.map(
-                    lambda t: compose_2x2_tile(
-                        ev.media, roles, t, cell_w=cell_w, cell_h=cell_h, include_header=True
-                    ),
-                    all_times,
-                ),
-            )
+
+    def _build_tile(t: float) -> np.ndarray:
+        check_client_cancelled(cl)
+        return compose_2x2_tile(
+            ev.media, roles, t, cell_w=cell_w, cell_h=cell_h, include_header=True
         )
+
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(all_times)))) as pool:
+        tile_map = dict(zip(all_times, pool.map(_build_tile, all_times)))
+
+    check_client_cancelled(cl)
 
     full_tiles = [tile_map[t] for t in full_times]
     ctrl_tiles = [tile_map[t] for t in ctrl_times]
@@ -180,6 +180,7 @@ def run_stage5_success(
         usr_ctrl = f"Task: {t_spec.task_id} (early control clip truncated at {cut_s:.2f}s)\nCompletion criteria:\n{crit_str}"
 
     def _run_full() -> dict[str, Any]:
+        check_client_cancelled(cl)
         return cl.chat_json(
             stage="s5_success",
             system_prompt=sys_full,
@@ -194,6 +195,7 @@ def run_stage5_success(
         )
 
     def _run_ctrl() -> dict[str, Any]:
+        check_client_cancelled(cl)
         return cl.chat_json(
             stage="s5_control",
             system_prompt=sys_ctrl,

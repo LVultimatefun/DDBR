@@ -1017,6 +1017,94 @@ textarea {
   gap: 8px;
 }
 
+.two-col > *,
+.three-col > * {
+  min-width: 0;
+}
+
+.two-col select,
+.three-col select,
+.two-col input,
+.three-col input {
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.inline-warn {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 5px;
+  color: var(--warning);
+  vertical-align: middle;
+}
+
+.unknown-box {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.few-shot-popover {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.lock-pill.frozen {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--badge-info-bg);
+  color: var(--badge-info-text);
+  border: 1px solid var(--badge-info-border);
+  white-space: nowrap;
+}
+
+.watch-coverage-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.flag-modal-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: var(--warning-bg);
+  border: 1px solid var(--badge-warn-border);
+  color: var(--warning-text);
+  box-shadow: var(--shadow-elevated);
+}
+
+.flag-modal-bar input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .input-with-btn {
   display: flex;
   align-items: stretch;

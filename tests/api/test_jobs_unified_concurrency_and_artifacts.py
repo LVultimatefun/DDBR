@@ -21,6 +21,7 @@ from tests.api.conftest import (
     ingest_dir,
     make_client,
     seed_vlm_run,
+    write_workspace_config,
 )
 from tests.e2e.conftest import MockVlmServer
 from tests.e2e.helpers import make_synthetic_h5_raw_v3
@@ -574,3 +575,204 @@ def test_run_gt_eval_on_progress_unit(api_env: dict[str, Any]) -> None:
         assert rep1.metrics.episodes_evaluated == 2
     finally:
         repo.close()
+
+
+def test_batch_vlm_s1_only_rerun_refreshes_grounding_and_reuses_s2_s5_cache(
+    api_env: dict[str, Any],
+) -> None:
+    """POST /api/jobs with stage='s1_grounding' or 's1' refreshes S1 (including v1->v2) with 0 S2-S5 calls & preserves protected status."""
+    ws: Path = api_env["workspace"]
+    cfg_dir: Path = api_env["config_dir"]
+    mock_vlm: MockVlmServer = api_env["mock_vlm"]
+    ds_dir = api_env["data_root"] / "ds_s1_only"
+
+    make_synthetic_h5_raw_v3(ds_dir, name="ep_open.h5", duration_s=2.5, stationary=True)
+    make_synthetic_h5_raw_v3(ds_dir, name="ep_rev.h5", duration_s=2.5, stationary=True)
+
+    repo = Repository(ws)
+    try:
+        ep_open = ingest_dir(repo, cfg_dir, ws, ds_dir / "ep_open.h5", dataset="ds_s1_only")[0]
+        ep_rev = ingest_dir(repo, cfg_dir, ws, ds_dir / "ep_rev.h5", dataset="ds_s1_only")[0]
+    finally:
+        repo.close()
+
+    # Start with tracking disabled (schema_version=1) and initial target_object bbox [100, 100, 220, 220]
+    write_workspace_config(
+        ws,
+        extra_overrides={"vlm": {"s1_grounding": {"tracking": {"enabled": False}}}},
+    )
+    mock_vlm.set_stage_response(
+        "s1",
+        {
+            "objects": {
+                "target_object": {
+                    "visible": True,
+                    "bbox": [100, 100, 220, 220],
+                    "state": "initial",
+                    "status_kind": "neutral",
+                }
+            }
+        },
+    )
+
+    with make_client(ws, cfg_dir) as client:
+        r_warm = client.post(
+            "/api/jobs",
+            headers=LEAD_HEADERS,
+            json={"job_type": "batch_vlm", "episode_ids": [ep_open, ep_rev], "stage": "all"},
+        )
+        assert r_warm.status_code == 201
+        j_warm = _poll_job_until_done(client, r_warm.json()["job_id"])
+        assert j_warm["status"] == "completed", j_warm
+
+        ep_open_v1 = client.get(f"/api/episodes/{ep_open}", headers=LEAD_HEADERS).json()
+        assert ep_open_v1["grounding"]["schema_version"] == 1
+        assert ep_open_v1["grounding"]["object_tracks_2d"]["target_object"]["keyframes"][0]["bbox_norm_1000"] == [
+            100,
+            100,
+            220,
+            220,
+        ]
+        run_id_v1 = ep_open_v1["active_run_id"]
+        macro_v1 = ep_open_v1["macro_stages"]
+        segs_v1 = ep_open_v1["qc_segments"]
+        succ_v1 = ep_open_v1["success"]
+
+    repo_chk = Repository(ws)
+    try:
+        art_v1 = repo_chk.get_vlm_run(run_id_v1)
+        # Put ep_rev into protected 'reviewed' state
+        rev_run_before = repo_chk.get_episode_row(ep_rev)["active_run_id"]
+        assert rev_run_before is not None
+        repo_chk.claim_episode(ep_rev, "reviewer_1")
+        repo_chk.save_review(
+            ep_rev,
+            author="reviewer_1",
+            role="reviewer",
+            payload=ReviewWritePayload(
+                base_run_id=rev_run_before,
+                action="submit_review",
+                qc_segments=[],
+                success=SuccessVerdict(verdict="success", passed=True, confidence=0.95, summary="reviewed"),
+                watch_coverage=WatchCoverage(
+                    watched_intervals=[[0.0, 2.5]],
+                    watched_s=2.5,
+                    duration_s=2.5,
+                    coverage_ratio=1.0,
+                ),
+            ),
+            min_watch_coverage=0.95,
+        )
+    finally:
+        repo_chk.close()
+
+    # Enable dense BAFT tracking (schema_version=2) and update S1 bbox to [320, 240, 480, 420]
+    write_workspace_config(
+        ws,
+        extra_overrides={"vlm": {"s1_grounding": {"tracking": {"enabled": True}}}},
+    )
+    mock_vlm.reset()
+    mock_vlm.set_stage_response(
+        "s1",
+        {
+            "objects": {
+                "target_object": {
+                    "visible": True,
+                    "bbox": [320, 240, 480, 420],
+                    "state": "updated_v2",
+                    "status_kind": "good",
+                }
+            }
+        },
+    )
+
+    with make_client(ws, cfg_dir) as client:
+        r_s1 = client.post(
+            "/api/jobs",
+            headers=LEAD_HEADERS,
+            json={
+                "job_type": "batch_vlm",
+                "episode_ids": [ep_open],
+                "stage": "s1_grounding",
+                "fresh": False,
+            },
+        )
+        assert r_s1.status_code == 201
+        j_s1 = _poll_job_until_done(client, r_s1.json()["job_id"])
+        assert j_s1["status"] == "completed", j_s1
+
+        called_stages = {req["stage"] for req in mock_vlm.requests}
+        assert called_stages == {"S1"}, f"Expected only S1 calls, got {called_stages}"
+
+        ep_open_v2 = client.get(f"/api/episodes/{ep_open}", headers=LEAD_HEADERS).json()
+        run_id_v2 = ep_open_v2["active_run_id"]
+        assert run_id_v2 != run_id_v1
+        assert ep_open_v2["grounding"]["schema_version"] == 2
+        assert len(ep_open_v2["grounding"]["dense_times_s"]) > 0
+        obj_kf0 = ep_open_v2["grounding"]["object_tracks_2d"]["target_object"]["keyframes"][0]["bbox_norm_1000"]
+        assert obj_kf0 == [320, 240, 480, 420]
+        assert ep_open_v2["macro_stages"] == macro_v1
+        assert ep_open_v2["qc_segments"] == segs_v1
+        assert ep_open_v2["success"] == succ_v1
+
+        # Second S1-only rerun using short alias stage='s1' and fresh=True still executes S1 only
+        mock_vlm.reset()
+        mock_vlm.set_stage_response(
+            "s1",
+            {
+                "objects": {
+                    "target_object": {
+                        "visible": True,
+                        "bbox": [500, 300, 660, 480],
+                        "state": "updated_alias",
+                        "status_kind": "good",
+                    }
+                }
+            },
+        )
+        r_s1_alias = client.post(
+            "/api/jobs",
+            headers=LEAD_HEADERS,
+            json={
+                "job_type": "batch_vlm",
+                "episode_ids": [ep_open, ep_rev],
+                "stage": "s1",
+                "fresh": True,
+            },
+        )
+        assert r_s1_alias.status_code == 201
+        j_s1_alias = _poll_job_until_done(client, r_s1_alias.json()["job_id"])
+        assert j_s1_alias["status"] == "completed", j_s1_alias
+
+        called_alias = {req["stage"] for req in mock_vlm.requests}
+        assert called_alias == {"S1"}, f"Expected only S1 calls, got {called_alias}"
+
+        ep_open_v3 = client.get(f"/api/episodes/{ep_open}", headers=LEAD_HEADERS).json()
+        run_id_v3 = ep_open_v3["active_run_id"]
+        assert run_id_v3 != run_id_v2
+        assert ep_open_v3["grounding"]["schema_version"] == 2
+        assert ep_open_v3["grounding"]["object_tracks_2d"]["target_object"]["keyframes"][0]["bbox_norm_1000"] == [
+            500,
+            300,
+            660,
+            480,
+        ]
+        assert ep_open_v3["macro_stages"] == macro_v1
+        assert ep_open_v3["qc_segments"] == segs_v1
+        assert ep_open_v3["success"] == succ_v1
+
+    repo_after = Repository(ws)
+    try:
+        art_v2 = repo_after.get_vlm_run(run_id_v2)
+        art_v3 = repo_after.get_vlm_run(run_id_v3)
+        for art in (art_v2, art_v3):
+            assert art.stage_refs.s2_macro == art_v1.stage_refs.s2_macro
+            assert art.stage_refs.s3_discover == art_v1.stage_refs.s3_discover
+            assert art.stage_refs.s4_verify == art_v1.stage_refs.s4_verify
+            assert art.stage_refs.s5_success == art_v1.stage_refs.s5_success
+        # Protected 'reviewed' episode retains its status and active_run_id
+        row_rev = repo_after.get_episode_row(ep_rev)
+        assert row_rev["status"] == EpisodeStatus.REVIEWED.value
+        assert row_rev["active_run_id"] == rev_run_before
+    finally:
+        repo_after.close()

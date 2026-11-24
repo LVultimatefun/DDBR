@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { BrowserRouter, Link, Route, Routes, useLocation } from "react-router-dom";
 import { Activity, KeyRound, Layers, ListChecks, Moon, PackageCheck, Sun } from "lucide-react";
 import { JobCenterDrawer } from "./components/JobCenterDrawer";
@@ -17,16 +17,28 @@ const AuthModal: React.FC = () => {
   const [nextToken, setNextToken] = useState(token);
   const [nextUser, setNextUser] = useState(username);
   const [nextRole, setNextRole] = useState<ReviewRole>(role);
-  const prevOpenRef = useRef(false);
+  const [prevOpen, setPrevOpen] = useState(authPromptOpen);
 
-  useEffect(() => {
-    if (authPromptOpen && !prevOpenRef.current) {
+  if (authPromptOpen !== prevOpen) {
+    setPrevOpen(authPromptOpen);
+    if (authPromptOpen) {
       setNextToken(token);
       setNextUser(username);
       setNextRole(role);
     }
-    prevOpenRef.current = authPromptOpen;
-  }, [authPromptOpen, token, username, role]);
+  }
+
+  useEffect(() => {
+    if (!authPromptOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setAuthPromptOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [authPromptOpen, setAuthPromptOpen]);
 
   if (!authPromptOpen) return null;
 
@@ -40,7 +52,13 @@ const AuthModal: React.FC = () => {
   };
 
   return (
-    <div className="modal-backdrop" data-testid="auth-modal">
+    <div
+      className="modal-backdrop"
+      data-testid="auth-modal"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) setAuthPromptOpen(false);
+      }}
+    >
       <form className="modal-card" onSubmit={(e) => void handleSave(e)}>
         <h3>Credentials & Role</h3>
         <label className="field-group">

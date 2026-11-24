@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import random
 import re
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -47,6 +49,17 @@ class VlmError(RuntimeError):
 
 class BudgetExceeded(VlmError):
     """Episode or global token/call budget exhausted."""
+
+
+class VlmCancelledError(VlmError):
+    """Cooperative cancellation signal raised when a VLM job is cancelled mid-flight."""
+
+
+def check_client_cancelled(client: Any) -> None:
+    """Raise VlmCancelledError if a VlmClient (or test double) signals cancellation."""
+    is_c = getattr(client, "is_cancelled", None)
+    if callable(is_c) and is_c():
+        raise VlmCancelledError("VLM request cancelled")
 
 
 def normalize_stage_name(stage: str) -> str:
@@ -410,6 +423,7 @@ class VlmClient:
         stage_models: dict[str, str] | None = None,
         workspace_dir: Path | None = None,
         budget: BudgetTracker | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         src = config_manager or config or cfg
         ws_dir = workspace_dir
@@ -477,6 +491,7 @@ class VlmClient:
             or "gpt-4o"
         )
         self.budget = budget or BudgetTracker()
+        self._cancel_event = cancel_event or threading.Event()
 
         self._sem = threading.Semaphore(self.concurrency)
         self._http = httpx.Client(
@@ -495,11 +510,52 @@ class VlmClient:
         *,
         workspace_dir: Path | None = None,
         budget: BudgetTracker | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> "VlmClient":
-        return cls(config=config, workspace_dir=workspace_dir, budget=budget)
+        return cls(
+            config=config,
+            workspace_dir=workspace_dir,
+            budget=budget,
+            cancel_event=cancel_event,
+        )
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_event.is_set():
+            raise VlmCancelledError("VLM request cancelled")
+
+    def _abort_active_sockets(self) -> None:
+        """Shutdown active TCP sockets so threads blocked in recv() wake up immediately."""
+        transport = getattr(self._http, "_transport", None)
+        pool = getattr(transport, "_pool", None)
+        if pool is None:
+            return
+        conns = getattr(pool, "connections", None)
+        if not conns:
+            return
+        for conn in list(conns):
+            with contextlib.suppress(Exception):
+                inner = getattr(conn, "_connection", None)
+                ns = getattr(conn, "_network_stream", None) or getattr(
+                    inner, "_network_stream", None
+                )
+                sock = getattr(ns, "_sock", None) if ns is not None else None
+                if sock is not None:
+                    with contextlib.suppress(OSError):
+                        sock.shutdown(socket.SHUT_RDWR)
+
+    def cancel(self) -> None:
+        """Signal cooperative cancellation and abort in-flight HTTP requests immediately."""
+        self._cancel_event.set()
+        self._abort_active_sockets()
+        with contextlib.suppress(Exception):
+            self._http.close()
 
     def close(self) -> None:
-        self._http.close()
+        with contextlib.suppress(Exception):
+            self._http.close()
 
     def __enter__(self) -> "VlmClient":
         return self
@@ -690,6 +746,7 @@ class VlmClient:
         last_exc: Exception | None = None
         max_attempts = max(1, self.retries + 1)
         for attempt in range(max_attempts):
+            self._check_cancelled()
             try:
                 if self.provider == "gemini":
                     return self._post_gemini(
@@ -706,15 +763,29 @@ class VlmClient:
                     thinking_budget=thinking_budget,
                     max_tokens=max_tokens,
                 )
-            except (httpx.TimeoutException, httpx.TransportError, OSError, json.JSONDecodeError) as exc:
-                last_exc = exc
-                transient = True
+            except VlmCancelledError:
+                raise
             except VlmError as exc:
+                self._check_cancelled()
                 last_exc = exc
                 sc = getattr(exc, "_status_code", None)
                 bt = getattr(exc, "_body_text", "")
                 transient = sc is not None and _should_retry_http(int(sc), str(bt))
+            except (
+                httpx.TimeoutException,
+                httpx.TransportError,
+                httpx.HTTPError,
+                OSError,
+                json.JSONDecodeError,
+            ) as exc:
+                self._check_cancelled()
+                last_exc = exc
+                transient = True
+            except Exception:
+                self._check_cancelled()
+                raise
 
+            self._check_cancelled()
             if not transient or attempt >= max_attempts - 1:
                 break
             wait = min(
@@ -722,7 +793,9 @@ class VlmClient:
                 max(self.retry_min_wait_s, self.retry_min_wait_s * (2.0**attempt)),
             )
             jitter = wait * random.uniform(0.0, 0.25)
-            time.sleep(min(self.retry_max_wait_s, wait + jitter))
+            sleep_s = min(self.retry_max_wait_s, wait + jitter)
+            if self._cancel_event.wait(timeout=sleep_s):
+                raise VlmCancelledError("VLM request cancelled during retry wait")
 
         if isinstance(last_exc, VlmError):
             raise last_exc
@@ -747,6 +820,7 @@ class VlmClient:
         budget: BudgetTracker | None = None,
     ) -> dict[str, Any]:
         """Call VLM endpoint and parse a JSON dict, with HTTP + malformed-JSON retries."""
+        self._check_cancelled()
         eff_model = self.model_for_stage(stage, override=model)
         if messages is None:
             eff_messages = build_interleaved_messages(
@@ -789,10 +863,12 @@ class VlmClient:
         tracker = budget or self.budget
         last_json_err: Exception | None = None
         for _json_attempt in range(2):
+            self._check_cancelled()
             tracker.reserve()
             t0 = time.perf_counter()
             try:
                 with self._sem:
+                    self._check_cancelled()
                     text, usage = self._call_once_with_http_retries(
                         model=eff_model,
                         messages=eff_messages,
@@ -802,6 +878,7 @@ class VlmClient:
                     )
             finally:
                 tracker.release()
+            self._check_cancelled()
             elapsed = time.perf_counter() - t0
             tracker.record(
                 stage=stage,

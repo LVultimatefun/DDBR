@@ -12,7 +12,7 @@ from ..io.base import EpisodeView
 from ..io.media import compose_2x2_tile
 from ..models.annotation import ArmSpan, ArmState, ArmTimelines, MacroStage
 from ..models.taxonomy import TaskSpec
-from .client import BudgetTracker, VlmClient
+from .client import BudgetTracker, VlmClient, check_client_cancelled
 from .prompt_builder import PromptBuilder
 
 STAGE_PALETTE_RGB: list[list[int]] = [
@@ -253,16 +253,19 @@ def run_stage2_macro(
     thinking_budget = int(s2_cfg.get("thinking_budget", 1536))
     max_tokens = int(s2_cfg.get("max_tokens", 4096))
 
+    check_client_cancelled(cl)
     roles = ev.camera_roles
-    with ThreadPoolExecutor(max_workers=min(6, max(1, len(times_s)))) as pool:
-        tiles = list(
-            pool.map(
-                lambda t: compose_2x2_tile(
-                    ev.media, roles, t, cell_w=cell_w, cell_h=cell_h, include_header=True
-                ),
-                times_s,
-            )
+
+    def _build_tile(t: float) -> np.ndarray:
+        check_client_cancelled(cl)
+        return compose_2x2_tile(
+            ev.media, roles, t, cell_w=cell_w, cell_h=cell_h, include_header=True
         )
+
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(times_s)))) as pool:
+        tiles = list(pool.map(_build_tile, times_s))
+
+    check_client_cancelled(cl)
 
     pb = prompt_builder or (PromptBuilder(cm) if cm is not None else None)
     if pb is not None:
