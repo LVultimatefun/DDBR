@@ -1,5 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Lock, Plus, Scissors, ShieldAlert, ShieldCheck } from "lucide-react";
+import {
+  AlertTriangle,
+  Loader2,
+  Lock,
+  Magnet,
+  Plus,
+  Scissors,
+  ShieldAlert,
+  ShieldCheck,
+  Sparkles,
+} from "lucide-react";
 import type {
   ArmState,
   ArmTimelines,
@@ -9,6 +19,7 @@ import type {
   WatchCoverage,
 } from "../api/types";
 import { computeUnwatchedIntervals } from "../stores/reviewHistoryStore";
+import { useI18n } from "../stores/i18nStore";
 
 export interface StageSpanUpdate {
   stageId: string;
@@ -38,6 +49,9 @@ export interface FourTrackTimelineProps {
   onUpdateSegmentSpan?: (segId: string, tStart: number, tEnd: number) => void;
   onUpdateStageSpan?: (stageId: string, tStart: number, tEnd: number) => void;
   onUpdateStageSpans?: (updates: StageSpanUpdate[]) => void;
+  onAlignStagesToQc?: () => void;
+  onInferSubtasks?: () => void;
+  inferringSubtasks?: boolean;
 }
 
 type ActiveDrag =
@@ -58,6 +72,7 @@ type ActiveDrag =
       tEnd: number;
       origStart: number;
       origEnd: number;
+      snappedToQcTime?: number | null;
       neighbor?: {
         stageId: string;
         tStart: number;
@@ -91,7 +106,31 @@ const POLICY_CLASS: Record<SplicePolicy, string> = {
 
 const MIN_SPAN_S = 0.1;
 const MAGNETIC_GAP_S = 0.05;
+const QC_SNAP_THRESHOLD_S = 0.08;
 const MIN_BRUSH_SPAN_S = 0.2;
+
+function snapTimeToQcBoundary(
+  rawT: number,
+  qcSegments: QcSegment[],
+  minT: number,
+  maxT: number,
+): { value: number; snappedTo: number | null } {
+  let bestBoundary: number | null = null;
+  let bestDist = QC_SNAP_THRESHOLD_S + 1e-9;
+  for (const seg of qcSegments) {
+    for (const boundary of [seg.t_start, seg.t_end]) {
+      if (boundary < minT - 1e-9 || boundary > maxT + 1e-9) continue;
+      const dist = Math.abs(boundary - rawT);
+      if (dist <= bestDist) {
+        bestDist = dist;
+        bestBoundary = clamp(boundary, minT, maxT);
+      }
+    }
+  }
+  return bestBoundary !== null
+    ? { value: bestBoundary, snappedTo: bestBoundary }
+    : { value: rawT, snappedTo: null };
+}
 
 function pct(t: number, durationS: number): number {
   if (durationS <= 0) return 0;
@@ -140,7 +179,11 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
   onUpdateSegmentSpan,
   onUpdateStageSpan,
   onUpdateStageSpans,
+  onAlignStagesToQc,
+  onInferSubtasks,
+  inferringSubtasks = false,
 }) => {
+  const { t } = useI18n();
   const [zoom, setZoom] = useState<number>(1);
   const [activeDrag, setActiveDrag] = useState<ActiveDrag | null>(null);
 
@@ -351,11 +394,18 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
           linked && latest.neighbor
             ? Math.min(durationS, latest.neighbor.origEnd - MIN_SPAN_S)
             : durationS;
-        const nextEnd = clamp(t, Math.min(maxEnd, latest.origStart + MIN_SPAN_S), maxEnd);
+        const minEnd = Math.min(maxEnd, latest.origStart + MIN_SPAN_S);
+        const clampedEnd = clamp(t, minEnd, maxEnd);
+        const snapped =
+          !ev.altKey && qcSegments.length > 0
+            ? snapTimeToQcBoundary(clampedEnd, qcSegments, minEnd, maxEnd)
+            : { value: clampedEnd, snappedTo: null };
+        const nextEnd = snapped.value;
         latest = {
           ...latest,
           tStart: latest.origStart,
           tEnd: nextEnd,
+          snappedToQcTime: snapped.snappedTo,
           neighbor: latest.neighbor
             ? {
                 ...latest.neighbor,
@@ -370,11 +420,18 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
       } else {
         const minStart =
           linked && latest.neighbor ? Math.max(0, latest.neighbor.origStart + MIN_SPAN_S) : 0;
-        const nextStart = clamp(t, minStart, Math.max(minStart, latest.origEnd - MIN_SPAN_S));
+        const maxStart = Math.max(minStart, latest.origEnd - MIN_SPAN_S);
+        const clampedStart = clamp(t, minStart, maxStart);
+        const snapped =
+          !ev.altKey && qcSegments.length > 0
+            ? snapTimeToQcBoundary(clampedStart, qcSegments, minStart, maxStart)
+            : { value: clampedStart, snappedTo: null };
+        const nextStart = snapped.value;
         latest = {
           ...latest,
           tStart: nextStart,
           tEnd: latest.origEnd,
+          snappedToQcTime: snapped.snappedTo,
           neighbor: latest.neighbor
             ? {
                 ...latest.neighbor,
@@ -537,10 +594,39 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
   return (
     <div className="four-track-timeline" data-testid="four-track-timeline">
       <div className="timeline-toolbar">
-        <div className="timeline-title">Four-Track Synchronized Timeline</div>
+        <div className="timeline-title">{t("timeline.title")}</div>
         <div className="timeline-actions">
           {!readOnly && (
             <>
+              {onAlignStagesToQc && (
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={macroStages.length === 0 || qcSegments.length === 0}
+                  onClick={onAlignStagesToQc}
+                  data-testid="align-stages-qc-btn"
+                  title={t("timeline.alignToQcTitle")}
+                >
+                  <Magnet size={13} /> {t("timeline.alignToQc")}
+                </button>
+              )}
+              {onInferSubtasks && (
+                <button
+                  type="button"
+                  className="mini-btn accent"
+                  disabled={inferringSubtasks}
+                  onClick={onInferSubtasks}
+                  data-testid="infer-subtasks-btn"
+                  title={t("timeline.inferSubtasksTitle")}
+                >
+                  {inferringSubtasks ? (
+                    <Loader2 size={13} className="studio-spin" />
+                  ) : (
+                    <Sparkles size={13} />
+                  )}{" "}
+                  {inferringSubtasks ? t("timeline.inferring") : t("timeline.inferSubtasks")}
+                </button>
+              )}
               {onSplitMacroStage && (
                 <button
                   type="button"
@@ -548,9 +634,9 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                   disabled={!canSplitStage}
                   onClick={onSplitMacroStage}
                   data-testid="split-macro-stage-btn"
-                  title="Split macro stage at playhead (S)"
+                  title={t("timeline.splitStageTitle")}
                 >
-                  <Scissors size={13} /> Split Stage (S)
+                  <Scissors size={13} /> {t("timeline.splitStage")}
                 </button>
               )}
               <button
@@ -559,7 +645,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                 onClick={onAddMacroStage}
                 data-testid="add-macro-stage-btn"
               >
-                <Plus size={13} /> Add Macro Stage
+                <Plus size={13} /> {t("timeline.addSubtaskStage")}
               </button>
               <button
                 type="button"
@@ -567,7 +653,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                 onClick={onAddSegment}
                 data-testid="add-qc-segment-btn"
               >
-                <Plus size={13} /> Add QC Segment
+                <Plus size={13} /> {t("timeline.addQcSegment")}
               </button>
             </>
           )}
@@ -590,24 +676,24 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
         <div className="timeline-canvas" style={{ width: `${zoom * 100}%` }}>
           {/* Time Ruler */}
           <div className="track-row ruler-row">
-            <div className="track-label ruler-label">Timeline</div>
+            <div className="track-label ruler-label">{t("timeline.rulerLabel")}</div>
             <div
               ref={rulerRef}
               className="timeline-ruler"
               onClick={(e) => seekFromClientX(e.clientX, e.currentTarget)}
               role="slider"
-              aria-label="Playback timeline"
+              aria-label={t("timeline.rulerAria")}
               aria-valuemin={0}
               aria-valuemax={durationS}
               aria-valuenow={currentTime}
             >
-              {ticks.map((t, idx) => (
+              {ticks.map((tick, idx) => (
                 <span
                   key={idx}
                   className="ruler-tick"
-                  style={{ left: `${pct(t, durationS)}%` }}
+                  style={{ left: `${pct(tick, durationS)}%` }}
                 >
-                  {t.toFixed(1)}s
+                  {tick.toFixed(1)}s
                 </span>
               ))}
             </div>
@@ -615,12 +701,12 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
 
           {/* 4px Watched / Unwatched Heatmap Bar beneath Time Ruler */}
           <div className="track-row heatmap-row" data-testid="watch-heatmap-row">
-            <div className="track-label heatmap-label">Watch Map</div>
+            <div className="track-label heatmap-label">{t("timeline.watchMapLabel")}</div>
             <div
               className="watch-heatmap-track"
               data-testid="watch-heatmap-bar"
               onClick={(e) => seekFromClientX(e.clientX, e.currentTarget)}
-              title="Teal = watched intervals, dashed red = unwatched gaps (click an unwatched gap to seek)"
+              title={t("timeline.watchMapTitle")}
             >
               <div className="watch-heatmap-bg" />
               {watchedIntervals.map(([a, b], idx) => {
@@ -645,8 +731,14 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                     className="heatmap-unwatched-gap"
                     data-testid={`heatmap-unwatched-gap-${idx}`}
                     style={{ left: `${left}%`, width: `${width}%` }}
-                    aria-label={`Jump to unwatched gap ${g0.toFixed(1)}s to ${g1.toFixed(1)}s`}
-                    title={`Unwatched gap ${g0.toFixed(1)}s–${g1.toFixed(1)}s, click to seek`}
+                    aria-label={t("timeline.unwatchedGapAria", {
+                      start: g0.toFixed(1),
+                      end: g1.toFixed(1),
+                    })}
+                    title={t("timeline.unwatchedGapTitle", {
+                      start: g0.toFixed(1),
+                      end: g1.toFixed(1),
+                    })}
                     onClick={(e) => {
                       e.stopPropagation();
                       onSeek(g0);
@@ -657,11 +749,11 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
             </div>
           </div>
 
-          {/* Track 1: Macro Stages (Editable + Edge Resize + Magnetic Ripple) */}
+          {/* Track 1: Subtask Stages (Editable + Edge Resize + Magnetic Ripple + QC Snap) */}
           <div className="track-row" data-testid="track-macro-stages">
             <div className="track-label">
-              <span>1. Macro Stages</span>
-              <span className="track-badge editable">Editable</span>
+              <span>{t("timeline.track1Label")}</span>
+              <span className="track-badge editable">{t("timeline.badgeEditable")}</span>
             </div>
             <div
               ref={macroLaneRef}
@@ -691,7 +783,11 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                       width: `${width}%`,
                       backgroundColor: rgbCss(stage.color_rgb),
                     }}
-                    title={`${stage.label} (${bounds.tStart.toFixed(2)}s - ${bounds.tEnd.toFixed(2)}s)`}
+                    title={
+                      stage.instruction
+                        ? `${stage.label} (${bounds.tStart.toFixed(2)}s - ${bounds.tEnd.toFixed(2)}s)${t("timeline.stageInstructionSuffix", { instruction: stage.instruction })}`
+                        : `${stage.label} (${bounds.tStart.toFixed(2)}s - ${bounds.tEnd.toFixed(2)}s)`
+                    }
                     onClick={(e) => {
                       if (suppressClickRef.current) return;
                       e.stopPropagation();
@@ -704,7 +800,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                       <div
                         className="resize-handle resize-handle-left"
                         data-testid={`resize-left-stage-${stage.stage_id}`}
-                        title="Drag to adjust stage start (adjacent edges snap magnetically; hold Alt to detach)"
+                        title={t("timeline.resizeStageLeftTitle")}
                         onPointerDown={(e) => startStageEdgeDrag(e, stage, "left")}
                         onClick={(e) => e.stopPropagation()}
                       />
@@ -715,7 +811,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                         <button
                           type="button"
                           className="nudge-btn"
-                          title="Start -0.2s"
+                          title={t("timeline.nudgeStartMinus", { delta: "0.2" })}
                           onClick={(e) => {
                             e.stopPropagation();
                             onUpdateStageSpan(
@@ -730,7 +826,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                         <button
                           type="button"
                           className="nudge-btn"
-                          title="End +0.2s"
+                          title={t("timeline.nudgeEndPlus", { delta: "0.2" })}
                           onClick={(e) => {
                             e.stopPropagation();
                             onUpdateStageSpan(
@@ -748,7 +844,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                       <div
                         className="resize-handle resize-handle-right"
                         data-testid={`resize-right-stage-${stage.stage_id}`}
-                        title="Drag to adjust stage end (adjacent edges snap magnetically; hold Alt to detach)"
+                        title={t("timeline.resizeStageRightTitle")}
                         onPointerDown={(e) => startStageEdgeDrag(e, stage, "right")}
                         onClick={(e) => e.stopPropagation()}
                       />
@@ -762,9 +858,9 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
           {/* Track 2: Arm Timelines (Strictly READ-ONLY, zero buttons) */}
           <div className="track-row readonly-row" data-testid="track-arm-timelines">
             <div className="track-label">
-              <span>2. Arm States</span>
+              <span>{t("timeline.track2Label")}</span>
               <span className="track-badge readonly" data-testid="arm-timelines-readonly">
-                <Lock size={11} /> Read-Only
+                <Lock size={11} /> {t("timeline.badgeReadOnly")}
               </span>
             </div>
             <div className="track-lane dual-sublane" aria-readonly="true">
@@ -782,7 +878,12 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                         width: `${width}%`,
                         backgroundColor: ARM_STATE_COLORS[span.state],
                       }}
-                      title={`Left Arm [${span.state}] ${span.t_start.toFixed(2)}s-${span.t_end.toFixed(2)}s ${span.desc}`}
+                      title={t("timeline.armLeftTitle", {
+                        state: span.state,
+                        start: span.t_start.toFixed(2),
+                        end: span.t_end.toFixed(2),
+                        desc: span.desc,
+                      })}
                     >
                       <span>{span.state}</span>
                     </div>
@@ -803,7 +904,12 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                         width: `${width}%`,
                         backgroundColor: ARM_STATE_COLORS[span.state],
                       }}
-                      title={`Right Arm [${span.state}] ${span.t_start.toFixed(2)}s-${span.t_end.toFixed(2)}s ${span.desc}`}
+                      title={t("timeline.armRightTitle", {
+                        state: span.state,
+                        start: span.t_start.toFixed(2),
+                        end: span.t_end.toFixed(2),
+                        desc: span.desc,
+                      })}
                     >
                       <span>{span.state}</span>
                     </div>
@@ -816,8 +922,8 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
           {/* Track 3: QC Segments (Editable + Edge Resize + Drag-to-Create Brush) */}
           <div className="track-row" data-testid="track-qc-segments">
             <div className="track-label">
-              <span>3. QC Segments</span>
-              <span className="track-badge editable">Editable</span>
+              <span>{t("timeline.track3Label")}</span>
+              <span className="track-badge editable">{t("timeline.badgeEditable")}</span>
             </div>
             <div
               ref={qcLaneRef}
@@ -879,7 +985,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                       <div
                         className="resize-handle resize-handle-left"
                         data-testid={`resize-left-seg-${seg.seg_id}`}
-                        title="Drag to adjust segment start"
+                        title={t("timeline.resizeSegLeftTitle")}
                         onPointerDown={(e) => startSegmentEdgeDrag(e, seg, "left")}
                         onClick={(e) => e.stopPropagation()}
                       />
@@ -890,20 +996,23 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                       <span
                         className="guardrail-chip downgraded"
                         data-testid={`guardrail-downgraded-${seg.seg_id}`}
-                        title={seg.guardrail.downgrade_reason ?? "Guardrail downgraded to mask_loss"}
+                        title={seg.guardrail.downgrade_reason ?? t("timeline.downgradedDefaultTitle")}
                       >
-                        <ShieldAlert size={11} /> Downgraded
+                        <ShieldAlert size={11} /> {t("timeline.downgradedBadge")}
                       </span>
                     )}
                     {!seg.guardrail.downgraded && seg.guardrail.gate_type === "splice_gate" && (
-                      <span className="guardrail-chip passed" title="Splice guardrail passed">
+                      <span
+                        className="guardrail-chip passed"
+                        title={t("timeline.guardrailPassedTitle")}
+                      >
                         <ShieldCheck size={11} />
                       </span>
                     )}
                     {seg.guardrail.guardrail_override && (
                       <span
                         className="guardrail-chip override"
-                        title={seg.guardrail.override_reason ?? "Guardrail override"}
+                        title={seg.guardrail.override_reason ?? t("timeline.guardrailOverrideTitle")}
                       >
                         <AlertTriangle size={11} />
                       </span>
@@ -913,7 +1022,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                         <button
                           type="button"
                           className="nudge-btn"
-                          title="Start -0.1s"
+                          title={t("timeline.nudgeStartMinus", { delta: "0.1" })}
                           onClick={(e) => {
                             e.stopPropagation();
                             onUpdateSegmentSpan(
@@ -928,7 +1037,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                         <button
                           type="button"
                           className="nudge-btn"
-                          title="End +0.1s"
+                          title={t("timeline.nudgeEndPlus", { delta: "0.1" })}
                           onClick={(e) => {
                             e.stopPropagation();
                             onUpdateSegmentSpan(
@@ -946,7 +1055,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                       <div
                         className="resize-handle resize-handle-right"
                         data-testid={`resize-right-seg-${seg.seg_id}`}
-                        title="Drag to adjust segment end"
+                        title={t("timeline.resizeSegRightTitle")}
                         onPointerDown={(e) => startSegmentEdgeDrag(e, seg, "right")}
                         onClick={(e) => e.stopPropagation()}
                       />
@@ -961,9 +1070,9 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
           {showDiffTrack && (
             <div className="track-row diff-row" data-testid="track-ghost-vlm">
               <div className="track-label">
-                <span>4. VLM Raw Ref</span>
+                <span>{t("timeline.track4Label")}</span>
                 <span className="track-badge readonly">
-                  <Lock size={11} /> Ghost Diff
+                  <Lock size={11} /> {t("timeline.badgeGhostDiff")}
                 </span>
               </div>
               <div className="track-lane">
@@ -975,16 +1084,36 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                       key={`ghost-${seg.seg_id}`}
                       className={`track-block ghost-block ${POLICY_CLASS[seg.splice_policy]}`}
                       style={{ left: `${left}%`, width: `${width}%` }}
-                      title={`VLM Raw: ${seg.name || seg.label_id} (${seg.splice_policy}) ${seg.t_start.toFixed(2)}-${seg.t_end.toFixed(2)}s`}
+                      title={t("timeline.vlmGhostTitle", {
+                        name: seg.name || seg.label_id,
+                        policy: seg.splice_policy,
+                        start: seg.t_start.toFixed(2),
+                        end: seg.t_end.toFixed(2),
+                      })}
                       onClick={() => onSeek(seg.t_start)}
                     >
-                      <span className="block-text">VLM: {seg.name || seg.label_id}</span>
+                      <span className="block-text">
+                        {t("timeline.vlmGhostText", { name: seg.name || seg.label_id })}
+                      </span>
                     </div>
                   );
                 })}
               </div>
             </div>
           )}
+
+          {/* Cross-track QC magnetic snap indicator */}
+          {activeDrag?.kind === "stage" &&
+            activeDrag.snappedToQcTime !== null &&
+            activeDrag.snappedToQcTime !== undefined && (
+              <div className="timeline-snap-guide-overlay">
+                <div
+                  className="timeline-snap-guide"
+                  data-testid="qc-snap-guide"
+                  style={{ left: `${pct(activeDrag.snappedToQcTime, durationS)}%` }}
+                />
+              </div>
+            )}
 
           {/* Synchronized Playhead aligned with .track-lane */}
           <div className="timeline-playhead-overlay">

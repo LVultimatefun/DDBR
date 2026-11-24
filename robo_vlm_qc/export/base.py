@@ -265,20 +265,27 @@ def group_kept_pieces(
 def build_global_subtasks(
     kept_pieces: list[KeepPiece],
 ) -> tuple[list[dict[str, Any]], dict[str, list[int]]]:
-    """Deduplicate subtasks globally by `(label, label_en)` and remap piece indices.
+    """Deduplicate subtasks globally by `(label, label_en, instruction)` and remap piece indices.
 
     Returns:
-        - global_subtasks: list of dicts ``{subtask_index, subtask, stage_id, label, label_en}``
+        - global_subtasks: list of dicts ``{subtask_index, subtask, instruction, stage_id, label, label_en}``
         - remapped_indices: ``{piece.piece_id: list[int]}`` of length ``piece.total_rows``
     """
-    key_to_global: dict[tuple[str, str], int] = {}
+    key_to_global: dict[tuple[str, str, str], int] = {}
     global_subtasks: list[dict[str, Any]] = []
     remapped: dict[str, list[int]] = {}
 
     for piece in kept_pieces:
         local_to_global: dict[int, int] = {}
         for span in piece.subtasks:
-            key = (span.label.strip(), span.label_en.strip())
+            instr_raw = str(getattr(span, "instruction", "") or "").strip()
+            eff_instr = (
+                instr_raw
+                or span.label_en.strip()
+                or span.label.strip()
+                or span.stage_id
+            )
+            key = (span.label.strip(), span.label_en.strip(), eff_instr)
             if key not in key_to_global:
                 g_idx = len(global_subtasks)
                 key_to_global[key] = g_idx
@@ -291,6 +298,7 @@ def build_global_subtasks(
                     {
                         "subtask_index": g_idx,
                         "subtask": subtask_text,
+                        "instruction": eff_instr,
                         "stage_id": span.stage_id,
                         "label": span.label,
                         "label_en": span.label_en,

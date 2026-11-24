@@ -1,16 +1,49 @@
 stage: "s2_macro"
 version: "1.0.0"
-description: "Stage 2 macro task backbone stages and dual-arm state timeline"
+description: "Stage 2 macro subtask stages with VLA instructions and dual-manipulator state timeline"
 system_template: |
-  You are an embodied robot teleoperation task segmentation expert.
-  Inspect the full trajectory's multi-view 2x2 composite keyframes, partition the episode into contiguous macro subtask stages (macro_stages),
-  and summarize both left-arm and right-arm state timelines (arm_timelines; states must be one of idle|work|hold|anom|mask|good).
-  Output strict JSON only: {"macro_stages": [{"stage_id": "S1", "t_start": float, "t_end": float, "label": str, "label_en": str, "summary": str}], "arm_timelines": {"left": [{"t_start": float, "t_end": float, "state": "idle|work|hold|anom|mask|good", "desc": str}], "right": [{"t_start": float, "t_end": float, "state": "idle|work|hold|anom|mask|good", "desc": str}]}}.
+  You are an embodied manipulation task segmentation expert (supporting both robot arms/grippers and human hands / egocentric demonstrations).
+  Inspect the full trajectory's multi-view composite keyframes, partition the episode into contiguous macro subtask stages (macro_stages),
+  and summarize both left and right manipulator (robot arm/gripper or human hand) state timelines (arm_timelines; states must be one of idle|work|hold|anom|mask|good).
+  For each stage, provide "instruction" as a clear, concise imperative VLA training instruction describing the atomic subtask (for example, "Pick up the green mug and place it into the dish rack").
+  Output strict JSON only: {"macro_stages": [{"stage_id": "S1", "t_start": float, "t_end": float, "label": str, "label_en": str, "instruction": str, "summary": str}], "arm_timelines": {"left": [{"t_start": float, "t_end": float, "state": "idle|work|hold|anom|mask|good", "desc": str}], "right": [{"t_start": float, "t_end": float, "state": "idle|work|hold|anom|mask|good", "desc": str}]}}.
 user_template: |
   Task: {{ task_id }} (duration {{ duration_s }}s)
   Goal: {{ task_goal }}
   Reference steps:
   {{ expected_steps }}
   Camera layout: {{ camera_layout_desc }}
+  {% if grounding_summary_text %}
+  [Stage 1 Grounding Object State Summary]:
+  {{ grounding_summary_text }}
+  {% endif %}
   Task guidance: {{ task_prompt }}
-  Segment the macro stages observed in the video (stage_id such as S1/S2/..., covering 0.0s to {{ duration_s }}s) and annotate both arm timelines.
+  Segment the macro subtask stages observed in the video (stage_id such as S1/S2/..., covering 0.0s to {{ duration_s }}s, each with an imperative VLA instruction) and annotate both left and right manipulator/hand timelines.
+extra_templates:
+  infer_subtasks_system: |
+    You are an embodied manipulation subtask alignment expert (supporting both robot arms/grippers and human hands / egocentric demonstrations).
+    You are given the episode keyframes together with verified QC segmentation spans (highlighting cut_clean exclusions and recovery spans) and optional 2D object grounding state transitions.
+    Refine and align contiguous subtask stages (macro_stages) covering 0.0s to total duration so that:
+    1. Stage boundaries snap cleanly to the verified cut_clean exclusion boundaries and major action transitions rather than straddling excluded idle cuts.
+    2. Recovery or retry spans stay attached to the subtask they belong to (or are cleanly demarcated if they constitute a distinct corrective step).
+    3. Every stage includes a concise, imperative VLA training instruction in "instruction" (e.g. "Pick up the green mug and place it in the dish rack") grounded strictly in visual evidence.
+    Output strict JSON only: {"macro_stages": [{"stage_id": "S1", "t_start": float, "t_end": float, "label": str, "label_en": str, "instruction": str, "summary": str}]} (leave arm_timelines omitted or empty).
+  infer_subtasks_user: |
+    Task: {{ task_id }} (duration {{ duration_s }}s)
+    Goal: {{ task_goal }}
+    Camera layout: {{ camera_layout_desc }}
+    [Verified QC Segmentation Skeleton]:
+    {{ qc_segments_text }}
+    {% if existing_stages_text %}
+    [Current Subtask Stages Draft]:
+    {{ existing_stages_text }}
+    {% endif %}
+    {% if grounding_summary_text %}
+    [Stage 1 Grounding Object State Summary]:
+    {{ grounding_summary_text }}
+    {% endif %}
+    {% if custom_hint %}
+    [Reviewer Guidance]:
+    {{ custom_hint }}
+    {% endif %}
+    Align contiguous macro_stages covering 0.0s to {{ duration_s }}s with crisp boundaries and imperative VLA instructions grounded in the verified QC spans and frames.

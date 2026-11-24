@@ -232,4 +232,121 @@ describe("Shell, Theme, Toast, Live Job Pill & JobCenterDrawer", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByTestId("job-center-drawer")).toBeNull());
   });
+
+  it("shows locked Export Studio button for Reviewer (opening auth modal) and Model / API modal button for Lead", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/settings/vlm") {
+          return new Response(
+            JSON.stringify({
+              provider: "openai_compat",
+              base_url: "https://api.openai.com/v1",
+              api_key_env: "OPENAI_API_KEY",
+              api_key_configured: true,
+              api_key_masked: "sk-***abcd",
+              thinking_mode: "disabled",
+              stage_models: { s1_grounding: "gpt-4o" },
+              presets: [],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+      }),
+    );
+
+    // 1. Reviewer sees locked Export Studio nav button and NO Model / API button
+    const { unmount } = render(
+      <AuthProvider initialAuth={{ token: "rev-token", username: "rev_1", role: "reviewer" }}>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("queue-page")).toBeInTheDocument());
+    expect(screen.queryByTestId("open-vlm-settings-btn")).toBeNull();
+    const lockedExportBtn = screen.getByTestId("nav-export-locked");
+    expect(lockedExportBtn).toHaveAttribute(
+      "title",
+      "Lead role required to export datasets — click to switch role",
+    );
+    fireEvent.click(lockedExportBtn);
+    expect(await screen.findByTestId("auth-modal")).toBeInTheDocument();
+    unmount();
+
+    // 2. Lead sees Model / API button in TopNav opening VlmSettingsModal
+    render(
+      <AuthProvider initialAuth={{ token: "lead-token", username: "lead_1", role: "lead" }}>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("queue-page")).toBeInTheDocument());
+    expect(screen.queryByTestId("nav-export-locked")).toBeNull();
+    const vlmBtn = screen.getByTestId("open-vlm-settings-btn");
+    fireEvent.click(vlmBtn);
+    expect(await screen.findByTestId("vlm-settings-modal")).toBeInTheDocument();
+    expect(await screen.findByTestId("vlm-api-key-badge")).toHaveTextContent(
+      "Configured (sk-***abcd)",
+    );
+  });
+
+  it("toggles Chinese/English bilingual UI via TopNav locale button and persists to localStorage", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.startsWith("/api/jobs")) {
+          return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+      }),
+    );
+
+    render(
+      <AuthProvider initialAuth={{ token: "lead-token", username: "lead_1", role: "lead" }}>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("queue-page")).toBeInTheDocument());
+    const localeBtn = screen.getByTestId("locale-toggle-btn");
+    expect(localeBtn).toHaveTextContent("中文");
+    expect(document.documentElement.lang).toBe("en");
+    expect(screen.getByTestId("nav-export")).toHaveTextContent("Export Studio");
+    expect(screen.getByTestId("open-vlm-settings-btn")).toHaveTextContent("Model / API");
+
+    // Switch to Chinese
+    fireEvent.click(localeBtn);
+    expect(localeBtn).toHaveTextContent("EN");
+    expect(document.documentElement.lang).toBe("zh-CN");
+    expect(window.localStorage.getItem("robo_vlm_qc.locale")).toBe("zh");
+    expect(screen.getByTestId("nav-export")).toHaveTextContent("导出中心");
+    expect(screen.getByTestId("nav-lab")).toHaveTextContent("VLM 实验室");
+    expect(screen.getByTestId("open-vlm-settings-btn")).toHaveTextContent("模型 / API");
+    expect(screen.getByTestId("current-role-badge")).toHaveTextContent("组长: lead_1");
+
+    // Open JobCenterDrawer in Chinese
+    fireEvent.click(screen.getByTestId("live-job-pill"));
+    expect(await screen.findByTestId("job-center-drawer")).toHaveTextContent("异步任务中心");
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    // Open AuthModal in Chinese
+    fireEvent.click(screen.getByTestId("open-auth-modal"));
+    expect(await screen.findByTestId("auth-modal")).toHaveTextContent("凭证与角色设置");
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    // Switch back to English
+    fireEvent.click(localeBtn);
+    expect(document.documentElement.lang).toBe("en");
+    expect(window.localStorage.getItem("robo_vlm_qc.locale")).toBe("en");
+    expect(screen.getByTestId("nav-export")).toHaveTextContent("Export Studio");
+  });
 });

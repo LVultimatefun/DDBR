@@ -1110,4 +1110,195 @@ describe("Review Studio NLE, Multi-Cam, Live Splice, Shortcuts & Lead Workflows"
       expect(screen.getByTestId("grounding-version-badge")).toHaveTextContent("v2 Dense"),
     );
   });
+
+  it("10. ReviewStudioPage: Infer Subtasks from QC (undoable), Align Stages to QC Cuts, Rerun S1 with Custom Objects, SuccessPanel Now stamp, and Lead Open in Export Studio", async () => {
+    const ep = makeResolvedEpisode({
+      episode_id: "demo_ds/ep_001",
+      status: "vlm_ready",
+      qc_segments: [
+        makeQcSegment({
+          seg_id: "seg_cut",
+          t_start: 4.85,
+          t_end: 5.5,
+          splice_policy: "cut_clean",
+          mask_side: null,
+        }),
+      ],
+      macro_stages: [
+        {
+          stage_id: "M1",
+          t_start: 0.0,
+          t_end: 5.0,
+          label: "Pick Object",
+          label_en: "pick_object",
+          summary: "Grasp block",
+          color_rgb: [59, 130, 246],
+        },
+        {
+          stage_id: "M2",
+          t_start: 5.0,
+          t_end: 10.0,
+          label: "Place in Bin",
+          label_en: "place_in_bin",
+          summary: "Place block",
+          color_rgb: [16, 185, 129],
+        },
+      ],
+    });
+
+    const inferBodies: Array<Record<string, unknown>> = [];
+    const jobBodies: Array<Record<string, unknown>> = [];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/infer-subtasks") && init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+          inferBodies.push(body);
+          return new Response(
+            JSON.stringify({
+              episode_id: "demo_ds/ep_001",
+              used_grounding: true,
+              used_segments_count: 1,
+              macro_stages: [
+                {
+                  stage_id: "S1",
+                  t_start: 0.0,
+                  t_end: 4.85,
+                  label: "Grasp Green Mug",
+                  label_en: "grasp_green_mug",
+                  summary: "Pick up green mug",
+                  instruction: "Pick up the green mug from the counter",
+                  color_rgb: [59, 130, 246],
+                },
+                {
+                  stage_id: "S2",
+                  t_start: 5.5,
+                  t_end: 10.0,
+                  label: "Place in Rack",
+                  label_en: "place_in_rack",
+                  summary: "Place mug into rack",
+                  instruction: "Place the green mug upright in the dish rack",
+                  color_rgb: [16, 185, 129],
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith("/api/jobs") && init?.method === "POST") {
+          const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+          jobBodies.push(body);
+          return new Response(
+            JSON.stringify(
+              makeJobStatus({
+                job_id: "job_custom_s1",
+                job_type: "batch_vlm",
+                status: "queued",
+                progress_done: 0,
+                progress_total: 1,
+                params: body,
+              }),
+            ),
+            { status: 201 },
+          );
+        }
+        if (url.endsWith("/runs")) {
+          return new Response(
+            JSON.stringify({ episode_id: "demo_ds/ep_001", active_run_id: "run_001", runs: [] }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith("/reviews")) {
+          return new Response(JSON.stringify({ items: [] }), { status: 200 });
+        }
+        if (url.includes("/api/episodes/demo_ds/ep_001")) {
+          return new Response(JSON.stringify(ep), { status: 200 });
+        }
+        if (url.includes("/api/settings")) {
+          return new Response(JSON.stringify({ min_watch_coverage: 0.95, batch_vlm_concurrency: 4 }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({ schema_version: "1.0", version: 1, categories: [], labels: [] }), {
+          status: 200,
+        });
+      }),
+    );
+
+    render(
+      <AuthProvider initialAuth={{ token: "lead-tok", username: "lead_1", role: "lead" }}>
+        <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+          <LocationEcho />
+          <Routes>
+            <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+            <Route path="/export" element={<div data-testid="export-studio-route">Export Studio</div>} />
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("review-studio-page")).toBeInTheDocument());
+
+    // 10a. Align Stages to QC Cuts snaps M1.t_end & M2.t_start (5.0 -> 4.85, within 0.25s) and is Undoable
+    fireEvent.click(screen.getByTestId("align-stages-qc-btn"));
+    fireEvent.click(screen.getByTestId("macro-stage-M1"));
+    expect((screen.getByLabelText("Stage end") as HTMLInputElement).value).toBe("4.85");
+    fireEvent.click(screen.getByTestId("undo-btn"));
+    expect((screen.getByLabelText("Stage end") as HTMLInputElement).value).toBe("5");
+
+    // 10b. Infer Subtasks from QC POSTs current qc_segments & macro_stages, applies result into undoable history
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("infer-subtasks-btn"));
+    });
+    await waitFor(() => expect(inferBodies).toHaveLength(1));
+    expect(Array.isArray(inferBodies[0].qc_segments)).toBe(true);
+    expect(screen.getByTestId("macro-stage-S1")).toBeInTheDocument();
+    expect(screen.getByTestId("macro-stage-S2")).toBeInTheDocument();
+    expect((screen.getByTestId("stage-instruction-input") as HTMLTextAreaElement).value).toBe(
+      "Pick up the green mug from the counter",
+    );
+
+    // Ctrl+Z undoes inferred subtasks cleanly back to M1/M2
+    fireEvent.click(screen.getByTestId("undo-btn"));
+    expect(screen.getByTestId("macro-stage-M1")).toBeInTheDocument();
+    expect(screen.queryByTestId("macro-stage-S1")).toBeNull();
+
+    // 10c. Rerun S1 with Custom Objects modal submits custom_objects array to /api/jobs
+    fireEvent.click(screen.getByTestId("rerun-vlm-menu-toggle"));
+    fireEvent.click(screen.getByTestId("rerun-vlm-custom-objects-btn"));
+    expect(screen.getByTestId("custom-objects-modal")).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("custom-objects-input"), {
+      target: { value: "green mug, dish rack" },
+    });
+    expect(screen.getByTestId("custom-objects-preview")).toHaveTextContent("green mug");
+    expect(screen.getByTestId("custom-objects-preview")).toHaveTextContent("dish rack");
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("submit-custom-objects-btn"));
+    });
+    await waitFor(() => expect(jobBodies).toHaveLength(1));
+    expect(jobBodies[0]).toEqual({
+      job_type: "batch_vlm",
+      episode_ids: ["demo_ds/ep_001"],
+      stage: "s1_grounding",
+      fresh: false,
+      custom_objects: ["green mug", "dish rack"],
+    });
+
+    // 10d. SuccessPanel receives live currentTime so clicking Now stamps current playhead
+    fireEvent.click(screen.getByText("+0.5s"));
+    fireEvent.click(screen.getByText("Success Verdict"));
+    fireEvent.click(screen.getByTestId("criterion-now-0"));
+    expect(screen.getByTestId("criterion-seek-0")).toHaveTextContent("0.50s");
+
+    // 10e. Lead Export popover -> Open in Export Studio navigates with pre-filled query params
+    // Note: clear unsaved confirm for navigation (useNavigate doesn't trigger anchor click guard)
+    fireEvent.click(screen.getByTestId("studio-export-btn"));
+    fireEvent.click(screen.getByTestId("export-open-studio-btn"));
+    await waitFor(() => expect(screen.getByTestId("export-studio-route")).toBeInTheDocument());
+    expect(screen.getByTestId("location-echo")).toHaveTextContent(
+      "/export?episode_ids=demo_ds%2Fep_001&dataset=demo_ds&include_status=vlm_ready",
+    );
+  });
 });

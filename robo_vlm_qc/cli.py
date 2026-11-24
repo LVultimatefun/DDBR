@@ -512,6 +512,18 @@ def render_mp4_cmd(
 )
 @click.option("--min-piece-s", type=float, default=None)
 @click.option("--context-window-s", type=float, default=2.0, show_default=True)
+@click.option(
+    "--state-schema-mode",
+    type=click.Choice(["auto", "preserve_native", "canonical_81d"]),
+    default=None,
+    help="LeRobot v3 state/action schema mode (defaults to config or auto).",
+)
+@click.option(
+    "--split-by-subtask",
+    is_flag=True,
+    default=False,
+    help="Split each kept piece along aligned subtask boundaries into independent episodes.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Print JSON summary.")
 @click.pass_context
 def export_cmd(
@@ -529,6 +541,8 @@ def export_cmd(
     smooth_tail: str | None,
     min_piece_s: float | None,
     context_window_s: float,
+    state_schema_mode: str | None,
+    split_by_subtask: bool,
     as_json: bool,
 ) -> None:
     """Export curated slices using PieceSlicer and transactional exporters."""
@@ -551,6 +565,11 @@ def export_cmd(
         if smooth_tail is not None
         else str(exp_cfg.get("smooth_tail", "on_jump"))
     )
+    eff_schema_mode = (
+        state_schema_mode
+        if state_schema_mode is not None
+        else str(exp_cfg.get("state_schema_mode", "auto"))
+    )
     eff_statuses = (
         [EpisodeStatus(s) for s in statuses]
         if statuses
@@ -569,6 +588,8 @@ def export_cmd(
             context_window_s=context_window_s,
             dataset_filter=dataset,
             task_filter=task_id,
+            state_schema_mode=eff_schema_mode,  # type: ignore[arg-type]
+            split_by_subtask=bool(split_by_subtask),
         )
     except Exception as exc:
         click.echo(f"Invalid export parameters: {exc}", err=True)
@@ -855,6 +876,199 @@ def eval_cmd(
         table.add_row("total_tokens", str(m.total_tokens))
         table.add_row("cache_hit_rate", f"{m.cache_hit_rate:.4f}")
         console.print(table)
+
+
+@main.command("config-vlm")
+@click.option(
+    "--preset",
+    type=click.Choice(["openai", "dashscope", "gemini", "vllm", "custom"], case_sensitive=False),
+    default=None,
+    help="Apply a built-in VLM preset (openai|dashscope|gemini|vllm|custom).",
+)
+@click.option(
+    "--provider",
+    type=click.Choice(["openai_compat", "gemini"], case_sensitive=False),
+    default=None,
+    help="VLM API provider protocol.",
+)
+@click.option("--base-url", default=None, help="VLM API base URL (http:// or https://).")
+@click.option(
+    "--api-key",
+    default=None,
+    help="API key to save securely into <workspace>/.env (0600); never written to YAML.",
+)
+@click.option(
+    "--api-key-env",
+    default=None,
+    help="Environment variable name used to look up the API key (e.g. OPENAI_API_KEY).",
+)
+@click.option(
+    "--model",
+    default=None,
+    help="Unified model name applied across all S1-S5 stages.",
+)
+@click.option(
+    "--thinking-mode",
+    type=click.Choice(["auto", "dashscope", "disabled"], case_sensitive=False),
+    default=None,
+    help="Reasoning/thinking request parameter mode.",
+)
+@click.option(
+    "--test",
+    "run_test",
+    is_flag=True,
+    default=False,
+    help="Send a minimal connectivity probe to verify the configured VLM endpoint.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print sanitized JSON summary.")
+@click.pass_context
+def config_vlm_cmd(
+    ctx: click.Context,
+    preset: str | None,
+    provider: str | None,
+    base_url: str | None,
+    api_key: str | None,
+    api_key_env: str | None,
+    model: str | None,
+    thinking_mode: str | None,
+    run_test: bool,
+    as_json: bool,
+) -> None:
+    """Configure workspace VLM API provider/model/key (safe YAML + 0600 .env) and optionally probe connectivity."""
+    from .api.routers.settings import (
+        apply_vlm_settings_update,
+        load_vlm_presets,
+        probe_vlm_connection,
+        read_vlm_settings_dict,
+    )
+    from .config import default_config_dir
+
+    workspace: Path = ctx.obj["workspace"]
+    config_dir: Path | None = ctx.obj["config_dir"]
+    eff_cfg_dir = Path(config_dir).resolve() if config_dir is not None else default_config_dir()
+
+    eff_provider = provider.lower() if provider else None
+    eff_base_url = base_url
+    eff_api_key_env = api_key_env
+    eff_thinking_mode = thinking_mode.lower() if thinking_mode else None
+    eff_default_model = model
+    eff_stage_models: dict[str, str] | None = None
+
+    if preset is not None:
+        preset_key = preset.strip().lower()
+        presets_by_id = {p["id"]: p for p in load_vlm_presets(eff_cfg_dir)}
+        p_item = presets_by_id.get(preset_key)
+        if p_item is None:
+            raise click.BadParameter(f"Unknown preset: {preset!r}", param_hint="'--preset'")
+        if eff_provider is None:
+            eff_provider = str(p_item["provider"])
+        if eff_base_url is None and str(p_item.get("base_url") or "").strip():
+            eff_base_url = str(p_item["base_url"])
+        if eff_api_key_env is None and str(p_item.get("api_key_env") or "").strip():
+            eff_api_key_env = str(p_item["api_key_env"])
+        if eff_thinking_mode is None:
+            eff_thinking_mode = str(p_item["thinking_mode"])
+        if eff_default_model is None:
+            p_sm = {
+                k: str(v)
+                for k, v in (p_item.get("stage_models") or {}).items()
+                if str(v).strip()
+            }
+            if p_sm:
+                eff_stage_models = p_sm
+
+    has_updates = any(
+        x is not None
+        for x in (
+            eff_provider,
+            eff_base_url,
+            eff_api_key_env,
+            eff_thinking_mode,
+            eff_default_model,
+            eff_stage_models,
+        )
+    ) or bool(api_key and api_key.strip())
+
+    try:
+        if has_updates:
+            cfg_mgr = apply_vlm_settings_update(
+                workspace=workspace,
+                config_dir=eff_cfg_dir,
+                provider=eff_provider,  # type: ignore[arg-type]
+                base_url=eff_base_url,
+                api_key_env=eff_api_key_env,
+                api_key=api_key,
+                thinking_mode=eff_thinking_mode,  # type: ignore[arg-type]
+                default_model=eff_default_model,
+                stage_models=eff_stage_models,
+                reason="cli_config_vlm",
+            )
+        else:
+            cfg_mgr = ConfigManager(config_dir=eff_cfg_dir, workspace_dir=workspace)
+    except ValueError as exc:
+        if as_json:
+            click.echo(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        else:
+            click.echo(f"Invalid VLM configuration: {exc}", err=True)
+        sys.exit(2)
+
+    sanitized = read_vlm_settings_dict(
+        cfg_mgr,
+        workspace=workspace,
+        config_dir=eff_cfg_dir,
+    )
+    test_result: dict[str, Any] | None = None
+    if run_test:
+        test_result = probe_vlm_connection(
+            cfg=cfg_mgr,
+            workspace=workspace,
+            model=eff_default_model,
+        )
+
+    ok_flag = True if test_result is None else bool(test_result["ok"])
+    report: dict[str, Any] = {
+        "ok": ok_flag,
+        "workspace": str(workspace),
+        "updated": has_updates,
+        "provider": sanitized["provider"],
+        "base_url": sanitized["base_url"],
+        "api_key_env": sanitized["api_key_env"],
+        "api_key_configured": sanitized["api_key_configured"],
+        "api_key_masked": sanitized["api_key_masked"],
+        "thinking_mode": sanitized["thinking_mode"],
+        "stage_models": sanitized["stage_models"],
+    }
+    if test_result is not None:
+        report["test"] = test_result
+
+    if as_json:
+        click.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        console = Console()
+        table = Table(title="robo_vlm_qc VLM configuration")
+        table.add_column("Setting", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("provider", str(report["provider"]))
+        table.add_row("base_url", str(report["base_url"]))
+        table.add_row("api_key_env", str(report["api_key_env"]))
+        table.add_row(
+            "api_key",
+            report["api_key_masked"] if report["api_key_configured"] else "(not configured)",
+        )
+        table.add_row("thinking_mode", str(report["thinking_mode"]))
+        for st_key, st_model in report["stage_models"].items():
+            table.add_row(f"model.{st_key}", str(st_model))
+        if test_result is not None:
+            status_str = (
+                f"OK ({test_result['latency_ms']} ms)"
+                if test_result["ok"]
+                else f"FAILED ({test_result['detail']})"
+            )
+            table.add_row("connectivity_test", status_str)
+        console.print(table)
+
+    if not ok_flag:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

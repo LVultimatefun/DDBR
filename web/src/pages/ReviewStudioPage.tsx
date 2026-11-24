@@ -5,7 +5,10 @@ import {
   ArrowLeft,
   CheckCircle,
   ChevronDown,
+  Download,
+  ExternalLink,
   Eye,
+  FileJson,
   Flag,
   History,
   Keyboard,
@@ -18,6 +21,7 @@ import {
   Undo2,
   Unlock,
   Video,
+  X,
   XCircle,
 } from "lucide-react";
 import {
@@ -32,6 +36,7 @@ import {
   getLabLabels,
   getSettings,
   getSharedLabels,
+  inferSubtasks,
   listEpisodeRuns,
   listEpisodes,
   listReviews,
@@ -64,6 +69,7 @@ import {
   normalizeSegmentTriplet,
 } from "../constants/labels";
 import { useAuth } from "../stores/authStore";
+import { useI18n } from "../stores/i18nStore";
 import { useJobs } from "../stores/jobStore";
 import {
   canReviewerSubmit,
@@ -139,6 +145,7 @@ export const ReviewStudioPage: React.FC = () => {
   } = useAuth();
   const jobStore = useJobs();
   const toast = useToast();
+  const { t } = useI18n();
 
   const [episode, setEpisode] = useState<ResolvedEpisode | null>(null);
   const [reviews, setReviews] = useState<HumanReviewArtifact[]>([]);
@@ -160,6 +167,10 @@ export const ReviewStudioPage: React.FC = () => {
   const [loopSegmentEnabled, setLoopSegmentEnabled] = useState<boolean>(false);
   const [shortcutsOpen, setShortcutsOpen] = useState<boolean>(false);
   const [rerunMenuOpen, setRerunMenuOpen] = useState<boolean>(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState<boolean>(false);
+  const [customObjectsModalOpen, setCustomObjectsModalOpen] = useState<boolean>(false);
+  const [customObjectsInput, setCustomObjectsInput] = useState<string>("");
+  const [inferringSubtasks, setInferringSubtasks] = useState<boolean>(false);
   const [rerunning, setRerunning] = useState<boolean>(false);
   const [cancellingRerun, setCancellingRerun] = useState<boolean>(false);
   const [localRerunJobId, setLocalRerunJobId] = useState<string | null>(null);
@@ -189,6 +200,7 @@ export const ReviewStudioPage: React.FC = () => {
   const splitGridRef = useRef<HTMLDivElement | null>(null);
   const appliedDeepLinkKeyRef = useRef<string>("");
   const rerunMenuWrapRef = useRef<HTMLDivElement | null>(null);
+  const exportMenuWrapRef = useRef<HTMLDivElement | null>(null);
 
   const history = useReviewHistory({
     qc_segments: [],
@@ -362,7 +374,7 @@ export const ReviewStudioPage: React.FC = () => {
         if (err instanceof ApiError && err.status === 401) {
           setAuthPromptOpen(true);
         }
-        setError(err instanceof Error ? err.message : "Failed to load episode details");
+        setError(err instanceof Error ? err.message : t("studio.errLoadEpisode"));
       } finally {
         if (seq === loadSeqRef.current) {
           setLoading(false);
@@ -381,6 +393,10 @@ export const ReviewStudioPage: React.FC = () => {
     setCancellingRerun(false);
     setRerunCompletedReady(false);
     setRerunCompletedRunId(null);
+    setExportMenuOpen(false);
+    setCustomObjectsModalOpen(false);
+    setCustomObjectsInput("");
+    setInferringSubtasks(false);
   }, [episodeId, isLead, deepLinkRunId]);
 
   useEffect(() => {
@@ -435,16 +451,16 @@ export const ReviewStudioPage: React.FC = () => {
         const errDetail = tracked.summary?.errors?.[0]?.error;
         notify(
           tracked.status === "cancelled"
-            ? `Single-episode VLM rerun job ${tracked.job_id} cancelled; episode status reverted`
+            ? t("studio.toastRerunCancelled", { jobId: tracked.job_id })
             : errDetail
-              ? `Single-episode VLM rerun job ${tracked.job_id} failed: ${errDetail}`
-              : `Single-episode VLM rerun job ${tracked.job_id} failed`,
+              ? t("studio.toastRerunFailedDetail", { jobId: tracked.job_id, detail: errDetail })
+              : t("studio.toastRerunFailed", { jobId: tracked.job_id }),
           tracked.status === "cancelled" ? "warning" : "error",
         );
         void loadEpisodeData();
       }
     },
-    [loadRunsCatalog, loadEpisodeData, notify],
+    [loadRunsCatalog, loadEpisodeData, notify, t],
   );
 
   // Watch jobStore for completion/cancellation/failure of our triggered single-episode local VLM rerun
@@ -533,6 +549,18 @@ export const ReviewStudioPage: React.FC = () => {
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [rerunMenuOpen]);
 
+  // Close export popover when clicking outside
+  useEffect(() => {
+    if (!exportMenuOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (exportMenuWrapRef.current && !exportMenuWrapRef.current.contains(e.target as Node)) {
+        setExportMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [exportMenuOpen]);
+
   // Load label catalog separately so role probe updates do not discard unsaved edits / undo history
   useEffect(() => {
     if (authProbing) return;
@@ -571,14 +599,14 @@ export const ReviewStudioPage: React.FC = () => {
         })
         .catch((err) => {
           if (err instanceof ApiError && err.status === 409) {
-            setError("Claim lease expired or was taken by another reviewer. Please re-claim or refresh.");
+            setError(t("studio.errClaimExpired"));
             setClaimedBy(null);
             setClaimExpiresAt(null);
           }
         });
     }, 60_000);
     return () => window.clearInterval(timer);
-  }, [episodeId, isClaimedByMe, isGtFrozen, username]);
+  }, [episodeId, isClaimedByMe, isGtFrozen, username, t]);
 
   // Unsaved-changes guard: browser beforeunload
   useEffect(() => {
@@ -602,14 +630,14 @@ export const ReviewStudioPage: React.FC = () => {
       if (!anchor || anchor.target === "_blank" || anchor.hasAttribute("download")) return;
       const href = anchor.getAttribute("href");
       if (!href || href.startsWith("#")) return;
-      if (!window.confirm("You have unsaved review edits. Are you sure you want to leave Review Studio?")) {
+      if (!window.confirm(t("studio.confirmLeaveUnsaved"))) {
         e.preventDefault();
         e.stopPropagation();
       }
     };
     document.addEventListener("click", onDocumentClick, true);
     return () => document.removeEventListener("click", onDocumentClick, true);
-  }, [hasUnsavedChanges]);
+  }, [hasUnsavedChanges, t]);
 
   const handleWatchInterval = useCallback(
     (t0: number, t1: number) => {
@@ -668,7 +696,7 @@ export const ReviewStudioPage: React.FC = () => {
       (st) => splitT >= st.t_start + 0.1 && splitT <= st.t_end - 0.1,
     );
     if (idx < 0) {
-      notify("Move the playhead inside a macro stage (at least 0.1s from edges) to split", "warning");
+      notify(t("studio.toastSplitNeedPlayhead"), "warning");
       return;
     }
     const target = history.state.macro_stages[idx];
@@ -692,8 +720,8 @@ export const ReviewStudioPage: React.FC = () => {
     setSelectedStageId(secondHalf.stage_id);
     setSelectedSegmentId(null);
     setActiveTab("segment");
-    notify(`Split macro stage at ${splitT.toFixed(2)}s`, "info");
-  }, [currentTime, episode, history, isReadOnly, notify]);
+    notify(t("studio.toastSplitDone", { t: splitT.toFixed(2) }), "info");
+  }, [currentTime, episode, history, isReadOnly, notify, t]);
 
   const handleUpdateStageSpans = useCallback(
     (updates: StageSpanUpdate[]) => {
@@ -710,6 +738,151 @@ export const ReviewStudioPage: React.FC = () => {
     [history, isReadOnly],
   );
 
+  const handleAlignStagesToQc = useCallback(() => {
+    if (!episode || isReadOnly) return;
+    const cutBoundaries = history.state.qc_segments
+      .filter((seg) => seg.splice_policy === "cut_clean")
+      .flatMap((seg) => [seg.t_start, seg.t_end]);
+    if (cutBoundaries.length === 0) {
+      notify(t("studio.toastNoCutClean"), "info");
+      return;
+    }
+
+    const ALIGN_THRESHOLD_S = 0.25;
+    const findNearestCut = (tVal: number): number | null => {
+      let best: number | null = null;
+      let bestDist = ALIGN_THRESHOLD_S + 1e-9;
+      for (const b of cutBoundaries) {
+        const d = Math.abs(b - tVal);
+        if (d <= bestDist) {
+          bestDist = d;
+          best = b;
+        }
+      }
+      return best;
+    };
+
+    let changedEdges = 0;
+    const maxDur = episode.meta.duration_s;
+    const nextStages = history.state.macro_stages.map((st) => {
+      const snapStart = findNearestCut(st.t_start);
+      const snapEnd = findNearestCut(st.t_end);
+      let nextStart =
+        snapStart !== null ? Math.max(0, Math.min(maxDur, Number(snapStart.toFixed(2)))) : st.t_start;
+      let nextEnd =
+        snapEnd !== null ? Math.max(0, Math.min(maxDur, Number(snapEnd.toFixed(2)))) : st.t_end;
+
+      if (nextEnd - nextStart < 0.1) {
+        // Keep stage valid (minimum 0.1s span); prefer keeping whichever edge moved less
+        const dStart = snapStart !== null ? Math.abs(nextStart - st.t_start) : Infinity;
+        const dEnd = snapEnd !== null ? Math.abs(nextEnd - st.t_end) : Infinity;
+        if (dStart <= dEnd) {
+          nextEnd = st.t_end;
+          if (nextEnd - nextStart < 0.1) nextStart = st.t_start;
+        } else {
+          nextStart = st.t_start;
+          if (nextEnd - nextStart < 0.1) nextEnd = st.t_end;
+        }
+      }
+
+      if (Math.abs(nextStart - st.t_start) > 1e-4) changedEdges += 1;
+      if (Math.abs(nextEnd - st.t_end) > 1e-4) changedEdges += 1;
+
+      return Math.abs(nextStart - st.t_start) > 1e-4 || Math.abs(nextEnd - st.t_end) > 1e-4
+        ? { ...st, t_start: nextStart, t_end: nextEnd }
+        : st;
+    });
+
+    if (changedEdges === 0) {
+      notify(t("studio.toastAlreadyAligned"), "info");
+      return;
+    }
+
+    history.applyEdit((prev) => ({
+      ...prev,
+      macro_stages: nextStages,
+    }));
+    notify(t("studio.toastAlignedEdges", { count: changedEdges }), "success");
+  }, [episode, history, isReadOnly, notify, t]);
+
+  const handleInferSubtasks = useCallback(async () => {
+    if (!episode || isReadOnly || inferringSubtasks) return;
+    setInferringSubtasks(true);
+    setError(null);
+    try {
+      const res = await inferSubtasks(episodeId, {
+        qc_segments: history.state.qc_segments,
+        macro_stages: history.state.macro_stages,
+      });
+      if (Array.isArray(res.macro_stages) && res.macro_stages.length > 0) {
+        history.applyEdit((prev) => ({
+          ...prev,
+          macro_stages: res.macro_stages,
+        }));
+        setSelectedStageId((prev) =>
+          prev && res.macro_stages.some((st) => st.stage_id === prev)
+            ? prev
+            : res.macro_stages[0].stage_id,
+        );
+        setSelectedSegmentId(null);
+        setActiveTab("segment");
+        notify(
+          t("studio.toastInferredSubtasks", {
+            stages: res.macro_stages.length,
+            segments: res.used_segments_count,
+            grounding: res.used_grounding ? t("studio.toastInferredWithGrounding") : "",
+          }),
+          "success",
+        );
+      } else {
+        notify(t("studio.toastInferEmpty"), "warning");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("studio.errInferSubtasks"));
+    } finally {
+      setInferringSubtasks(false);
+    }
+  }, [episode, episodeId, history, inferringSubtasks, isReadOnly, notify, t]);
+
+  const handleDownloadEpisodeJson = useCallback(() => {
+    if (!episode) return;
+    setExportMenuOpen(false);
+    const payload = {
+      episode_id: episode.episode_id,
+      meta: episode.meta,
+      qc_segments: history.state.qc_segments,
+      macro_stages: history.state.macro_stages,
+      success: history.state.success,
+      notes,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const safeName = episode.episode_id.replace(/[^a-zA-Z0-9._-]+/g, "_");
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${safeName}_annotations.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    notify(
+      t("studio.toastDownloadedJson", { filename: `${safeName}_annotations.json` }),
+      "success",
+    );
+  }, [episode, history.state, notes, notify, t]);
+
+  const handleOpenExportStudio = useCallback(() => {
+    if (!episode) return;
+    setExportMenuOpen(false);
+    if (!isLead) {
+      setAuthPromptOpen(true);
+      notify(t("studio.toastExportNeedsLead"), "warning");
+      return;
+    }
+    const targetUrl = `/export?episode_ids=${encodeURIComponent(episode.episode_id)}&dataset=${encodeURIComponent(episode.meta.dataset)}&include_status=${encodeURIComponent(episode.status)}`;
+    navigate(targetUrl);
+  }, [episode, isLead, navigate, notify, setAuthPromptOpen, t]);
+
   const handleClaim = async () => {
     try {
       const res = await claimEpisode(episodeId, username);
@@ -725,9 +898,9 @@ export const ReviewStudioPage: React.FC = () => {
             }
           : prev,
       );
-      notify(`Claimed lock: ${res.claimed_by}`, "success");
+      notify(t("studio.toastClaimed", { user: res.claimed_by }), "success");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to claim episode");
+      setError(err instanceof Error ? err.message : t("studio.errClaimFailed"));
     }
   };
 
@@ -737,9 +910,9 @@ export const ReviewStudioPage: React.FC = () => {
       setClaimedBy(null);
       setClaimExpiresAt(null);
       setEpisode((prev) => (prev ? { ...prev, status: res.status } : prev));
-      notify("Claim lock released", "info");
+      notify(t("studio.toastReleased"), "info");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to release claim");
+      setError(err instanceof Error ? err.message : t("studio.errReleaseFailed"));
     }
   };
 
@@ -753,7 +926,7 @@ export const ReviewStudioPage: React.FC = () => {
         for (const cand of candidates) {
           try {
             await claimEpisode(cand.episode_id, username);
-            notify(`Auto-claimed next episode: ${cand.episode_id}`, "success");
+            notify(t("studio.toastAutoClaimed", { id: cand.episode_id }), "success");
             navigate(`/review/${encodeEpPath(cand.episode_id)}`);
             return true;
           } catch {
@@ -772,7 +945,7 @@ export const ReviewStudioPage: React.FC = () => {
         ).find((item) => item.episode_id !== episodeId);
 
       if (nextLead) {
-        notify(`Auto-advanced to next episode: ${nextLead.episode_id}`, "success");
+        notify(t("studio.toastAutoAdvanced", { id: nextLead.episode_id }), "success");
         navigate(`/review/${encodeEpPath(nextLead.episode_id)}`);
         return true;
       }
@@ -780,18 +953,21 @@ export const ReviewStudioPage: React.FC = () => {
     } catch {
       return false;
     }
-  }, [episodeId, isLead, navigate, notify, username]);
+  }, [episodeId, isLead, navigate, notify, username, t]);
 
   const handleSubmitAction = useCallback(
     async (action: ReviewAction) => {
       if (!episode || isReadOnly) return;
       if (!episode.active_run_id) {
-        setError("This episode has no VLM run yet and cannot be reviewed");
+        setError(t("studio.errNoVlmRun"));
         return;
       }
       if (!isLead && action === "submit_review" && !canReviewerSubmit(watchCoverage, minWatchCoverage)) {
         setError(
-          `Insufficient watch coverage (${(watchCoverage.coverage_ratio * 100).toFixed(1)}% < ${Math.round(minWatchCoverage * 100)}%). Watch the episode before submitting review.`,
+          t("studio.errWatchCoverage", {
+            pct: (watchCoverage.coverage_ratio * 100).toFixed(1),
+            minPct: Math.round(minWatchCoverage * 100),
+          }),
         );
         return;
       }
@@ -805,7 +981,7 @@ export const ReviewStudioPage: React.FC = () => {
       try {
         const sanitizedStages = history.state.macro_stages.map((st, idx) => ({
           ...st,
-          label: st.label.trim() || `Stage ${idx + 1}`,
+          label: st.label.trim() || t("studio.stageFallbackLabel", { index: idx + 1 }),
         }));
         const payload = buildReviewWritePayload({
           baseRunId: episode.active_run_id,
@@ -822,7 +998,7 @@ export const ReviewStudioPage: React.FC = () => {
         initialNotesRef.current = notes;
         setReviews((prev) => [saved, ...prev]);
         setFlagDialogOpen(false);
-        notify(`Action "${action}" submitted (rev: ${saved.rev_id})`, "success");
+        notify(t("studio.toastActionSubmitted", { action, revId: saved.rev_id }), "success");
         if (action === "save_draft") {
           setEpisode((prev) =>
             prev
@@ -850,7 +1026,7 @@ export const ReviewStudioPage: React.FC = () => {
           }
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to submit review");
+        setError(err instanceof Error ? err.message : t("studio.errSubmitFailed"));
       } finally {
         setSaving(false);
       }
@@ -869,6 +1045,7 @@ export const ReviewStudioPage: React.FC = () => {
       autoAdvance,
       tryAutoAdvanceNext,
       loadEpisodeData,
+      t,
     ],
   );
 
@@ -876,13 +1053,16 @@ export const ReviewStudioPage: React.FC = () => {
     try {
       const job = await createJob({ job_type: "render_mp4", episode_ids: [episodeId] });
       jobStore.trackJob(job);
-      notify(`Triggered 1080p Studio MP4 render job: ${job.job_id}`, "info");
+      notify(t("studio.toastRenderMp4", { jobId: job.job_id }), "info");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to trigger MP4 render");
+      setError(err instanceof Error ? err.message : t("studio.errRenderMp4"));
     }
   };
 
-  const handleLocalRerunVlm = async (mode: "s3_s4" | "s1_grounding" | "s1_s5") => {
+  const handleLocalRerunVlm = async (
+    mode: "s3_s4" | "s1_grounding" | "s1_s5",
+    customObjects?: string[],
+  ) => {
     if (isGtFrozen) return;
     setRerunMenuOpen(false);
     setRerunning(true);
@@ -890,28 +1070,51 @@ export const ReviewStudioPage: React.FC = () => {
     setRerunCompletedRunId(null);
     setError(null);
     try {
-      const job = await createJob({
-        job_type: "batch_vlm",
+      const cleanedCustomObjects = customObjects?.map((s) => s.trim()).filter(Boolean);
+      const jobPayload = {
+        job_type: "batch_vlm" as const,
         episode_ids: [episodeId],
         stage: mode,
         fresh: mode === "s1_s5",
-      });
+        ...(cleanedCustomObjects && cleanedCustomObjects.length > 0
+          ? { custom_objects: cleanedCustomObjects }
+          : {}),
+      };
+      const job = await createJob(jobPayload);
       setLocalRerunJobId(job.job_id);
       jobStore.trackJob(job);
       const label =
         mode === "s3_s4"
-          ? "S3/S4 rerun (cached)"
+          ? t("studio.rerunModeS3S4")
           : mode === "s1_grounding"
-            ? "S1 only rerun (refresh 2D boxes, reuse S2-S5 cache)"
-            : "Full S1-S5 rerun";
-      notify(`Submitted single-episode ${label} job: ${job.job_id}`, "info");
+            ? cleanedCustomObjects && cleanedCustomObjects.length > 0
+              ? t("studio.rerunModeCustomS1", { objects: cleanedCustomObjects.join(", ") })
+              : t("studio.rerunModeS1")
+            : t("studio.rerunModeFull");
+      notify(t("studio.toastRerunSubmitted", { label, jobId: job.job_id }), "info");
       if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
         handleRerunTerminalJob(job);
       }
     } catch (err) {
       setRerunning(false);
-      setError(err instanceof Error ? err.message : "Failed to trigger local VLM rerun");
+      setError(err instanceof Error ? err.message : t("studio.errRerunVlm"));
     }
+  };
+
+  const parsedCustomObjects = useMemo(
+    () =>
+      customObjectsInput
+        .split(/[,，\n]+/)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    [customObjectsInput],
+  );
+
+  const handleSubmitCustomObjectsS1 = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (parsedCustomObjects.length === 0 || rerunning || isGtFrozen) return;
+    setCustomObjectsModalOpen(false);
+    await handleLocalRerunVlm("s1_grounding", parsedCustomObjects);
   };
 
   const handleCancelLocalRerun = async () => {
@@ -929,10 +1132,7 @@ export const ReviewStudioPage: React.FC = () => {
         setLocalRerunJobId(null);
         // Avoid duplicate cancel toast when JobProvider already emits notifyJobCancelled
         if (!jobStore.isProvided) {
-          notify(
-            `Single-episode VLM rerun job ${jobId} cancelled; episode status reverted`,
-            "warning",
-          );
+          notify(t("studio.toastRerunCancelled", { jobId }), "warning");
         }
         await loadEpisodeData();
       }
@@ -943,21 +1143,15 @@ export const ReviewStudioPage: React.FC = () => {
 
   const handleSwitchRunVersion = async (nextRunId: string) => {
     if (nextRunId === selectedRunId) return;
-    if (
-      nextRunId &&
-      hasUnsavedChanges &&
-      !window.confirm(
-        "You have unsaved edits. Switching to a historical run read-only view will discard unsaved drafts. Continue?",
-      )
-    ) {
+    if (nextRunId && hasUnsavedChanges && !window.confirm(t("studio.confirmHistoricalSwitch"))) {
       return;
     }
     setSelectedRunId(nextRunId);
     await loadEpisodeData(nextRunId);
     if (nextRunId) {
-      notify(`Switched to read-only historical run: ${nextRunId}`, "info");
+      notify(t("studio.toastSwitchedRun", { runId: nextRunId }), "info");
     } else {
-      notify("Returned to active review view", "info");
+      notify(t("studio.toastReturnedActive"), "info");
     }
   };
 
@@ -1012,6 +1206,11 @@ export const ReviewStudioPage: React.FC = () => {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        if (customObjectsModalOpen) {
+          e.preventDefault();
+          setCustomObjectsModalOpen(false);
+          return;
+        }
         if (shortcutsOpen) {
           e.preventDefault();
           setShortcutsOpen(false);
@@ -1025,6 +1224,11 @@ export const ReviewStudioPage: React.FC = () => {
         if (rerunMenuOpen) {
           e.preventDefault();
           setRerunMenuOpen(false);
+          return;
+        }
+        if (exportMenuOpen) {
+          e.preventDefault();
+          setExportMenuOpen(false);
           return;
         }
         return;
@@ -1047,6 +1251,7 @@ export const ReviewStudioPage: React.FC = () => {
 
       // Block global Studio shortcuts while any modal, drawer, or flag dialog is open
       const hasOpenOverlay =
+        customObjectsModalOpen ||
         shortcutsOpen ||
         flagDialogOpen ||
         Boolean(document.querySelector(".modal-backdrop, .drawer-backdrop"));
@@ -1265,9 +1470,11 @@ export const ReviewStudioPage: React.FC = () => {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    customObjectsModalOpen,
     shortcutsOpen,
     flagDialogOpen,
     rerunMenuOpen,
+    exportMenuOpen,
     episode,
     isReadOnly,
     saving,
@@ -1285,7 +1492,7 @@ export const ReviewStudioPage: React.FC = () => {
   if (loading) {
     return (
       <div className="page-container" data-testid="review-studio-loading">
-        Loading Review Studio ({episodeId})...
+        {t("studio.loading", { id: episodeId })}
       </div>
     );
   }
@@ -1293,9 +1500,9 @@ export const ReviewStudioPage: React.FC = () => {
   if (!episode) {
     return (
       <div className="page-container" data-testid="review-studio-error">
-        <div className="error-banner">{error ?? "Episode not found"}</div>
+        <div className="error-banner">{error ?? t("studio.notFound")}</div>
         <Link className="secondary-btn" to="/">
-          Back to Work Queue
+          {t("studio.backToQueue")}
         </Link>
         {toast.StandaloneHost}
       </div>
@@ -1312,24 +1519,32 @@ export const ReviewStudioPage: React.FC = () => {
       {/* Top Studio Header */}
       <div className="studio-header">
         <div className="studio-title-group">
-          <Link className="icon-link" to="/" title="Back to queue" data-testid="studio-back-link">
+          <Link
+            className="icon-link"
+            to="/"
+            title={t("studio.backToQueueTitle")}
+            data-testid="studio-back-link"
+          >
             <ArrowLeft size={16} />
           </Link>
           <div>
             <div className="studio-ep-id">
               <span className="mono">{episode.episode_id}</span>
               <span className="status-tag" style={{ backgroundColor: statusMeta.color }}>
-                {statusMeta.label}
+                {t(`status.${episode.status}`)}
               </span>
               {hasUnsavedChanges && (
                 <span className="dirty-indicator" data-testid="unsaved-indicator">
-                  ● Unsaved
+                  {t("studio.unsaved")}
                 </span>
               )}
             </div>
             <div className="muted small">
-              Task: {episode.meta.task_id} · Duration: {episode.meta.duration_s.toFixed(2)}s · Run:{" "}
-              {episode.selected_run_id ?? episode.active_run_id ?? "None"}
+              {t("studio.metaSummary", {
+                task: episode.meta.task_id,
+                dur: episode.meta.duration_s.toFixed(2),
+                run: episode.selected_run_id ?? episode.active_run_id ?? t("studio.none"),
+              })}
             </div>
           </div>
         </div>
@@ -1342,19 +1557,21 @@ export const ReviewStudioPage: React.FC = () => {
                 <History size={13} className="muted" />
                 <select
                   className="run-switcher-select"
-                  aria-label="Switch VLM run version"
+                  aria-label={t("studio.runSwitcherAria")}
                   data-testid="run-version-select"
                   value={selectedRunId}
                   onChange={(e) => void handleSwitchRunVersion(e.target.value)}
                 >
                   <option value="">
-                    Active View ({episode.active_run_id ?? "No Run"})
+                    {t("studio.activeViewOption", {
+                      run: episode.active_run_id ?? t("studio.noRun"),
+                    })}
                   </option>
                   {availableRuns.map((r) => (
                     <option key={r.run_id} value={r.run_id}>
                       {r.run_id}
-                      {r.run_id === episode.active_run_id ? " [Active]" : ""}
-                      {r.is_eval_sandbox ? " [Sandbox]" : ""} · {r.prompt_version}
+                      {r.run_id === episode.active_run_id ? t("studio.runTagActive") : ""}
+                      {r.is_eval_sandbox ? t("studio.runTagSandbox") : ""} · {r.prompt_version}
                     </option>
                   ))}
                 </select>
@@ -1367,19 +1584,16 @@ export const ReviewStudioPage: React.FC = () => {
                   disabled={rerunning || isGtFrozen}
                   onClick={() => void handleLocalRerunVlm("s3_s4")}
                   data-testid="rerun-vlm-s3s4-btn"
-                  title={
-                    isGtFrozen
-                      ? "GT is frozen; VLM rerun is disabled"
-                      : "Reuse S1/S2/S5 cache and quickly rerun S3/S4"
-                  }
+                  title={isGtFrozen ? t("studio.rerunDisabledGt") : t("studio.rerunS3S4Title")}
                 >
-                  <Sparkles size={13} /> {rerunning ? "Rerunning..." : "Rerun S3/S4"}
+                  <Sparkles size={13} />{" "}
+                  {rerunning ? t("studio.rerunning") : t("studio.rerunS3S4")}
                 </button>
                 <button
                   type="button"
                   className="mini-btn accent rerun-caret-btn"
                   disabled={rerunning || isGtFrozen}
-                  aria-label="Expand VLM rerun options"
+                  aria-label={t("studio.rerunMenuToggleAria")}
                   data-testid="rerun-vlm-menu-toggle"
                   onClick={() => setRerunMenuOpen((v) => !v)}
                 >
@@ -1393,10 +1607,8 @@ export const ReviewStudioPage: React.FC = () => {
                       data-testid="rerun-vlm-opt-s3s4"
                       onClick={() => void handleLocalRerunVlm("s3_s4")}
                     >
-                      <strong>Rerun S3/S4 Only</strong>
-                      <span className="rerun-menu-desc">
-                        Reuse S1/S2/S5 stage caches and refresh anomaly discovery &amp; verification
-                      </span>
+                      <strong>{t("studio.rerunOptS3S4Title")}</strong>
+                      <span className="rerun-menu-desc">{t("studio.rerunOptS3S4Desc")}</span>
                     </button>
                     <button
                       type="button"
@@ -1404,10 +1616,20 @@ export const ReviewStudioPage: React.FC = () => {
                       data-testid="rerun-vlm-s1-btn"
                       onClick={() => void handleLocalRerunVlm("s1_grounding")}
                     >
-                      <strong>Rerun S1 Only (Refresh 2D Boxes, Reuse S2-S5 Cache)</strong>
-                      <span className="rerun-menu-desc">
-                        Refresh 2D boxes and frame-level tracking while preserving S2–S5 caches
-                      </span>
+                      <strong>{t("studio.rerunOptS1Title")}</strong>
+                      <span className="rerun-menu-desc">{t("studio.rerunOptS1Desc")}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="rerun-menu-item"
+                      data-testid="rerun-vlm-custom-objects-btn"
+                      onClick={() => {
+                        setRerunMenuOpen(false);
+                        setCustomObjectsModalOpen(true);
+                      }}
+                    >
+                      <strong>{t("studio.rerunOptCustomTitle")}</strong>
+                      <span className="rerun-menu-desc">{t("studio.rerunOptCustomDesc")}</span>
                     </button>
                     <button
                       type="button"
@@ -1415,10 +1637,8 @@ export const ReviewStudioPage: React.FC = () => {
                       data-testid="rerun-vlm-all-btn"
                       onClick={() => void handleLocalRerunVlm("s1_s5")}
                     >
-                      <strong>Full Rerun S1–S5</strong>
-                      <span className="rerun-menu-desc">
-                        Bypass caches and rerun all 5 VLM stages from scratch
-                      </span>
+                      <strong>{t("studio.rerunOptAllTitle")}</strong>
+                      <span className="rerun-menu-desc">{t("studio.rerunOptAllDesc")}</span>
                     </button>
                   </div>
                 )}
@@ -1431,9 +1651,10 @@ export const ReviewStudioPage: React.FC = () => {
                   disabled={cancellingRerun}
                   data-testid="cancel-rerun-vlm-btn"
                   onClick={() => void handleCancelLocalRerun()}
-                  title="Cancel this single-episode VLM rerun and revert episode status immediately"
+                  title={t("studio.cancelRerunTitle")}
                 >
-                  <XCircle size={12} /> {cancellingRerun ? "Cancelling..." : "Cancel Rerun"}
+                  <XCircle size={12} />{" "}
+                  {cancellingRerun ? t("studio.cancellingRerun") : t("studio.cancelRerun")}
                 </button>
               )}
 
@@ -1456,7 +1677,7 @@ export const ReviewStudioPage: React.FC = () => {
                     void loadEpisodeData(nextRun);
                   }}
                 >
-                  <RefreshCw size={12} /> Load New Run
+                  <RefreshCw size={12} /> {t("studio.loadNewRun")}
                 </button>
               )}
             </>
@@ -1469,9 +1690,9 @@ export const ReviewStudioPage: React.FC = () => {
               disabled={!history.canUndo || isReadOnly}
               onClick={history.undo}
               data-testid="undo-btn"
-              title="Undo (Ctrl+Z)"
+              title={t("studio.undoTitle")}
             >
-              <Undo2 size={14} /> Undo ({history.undoCount})
+              <Undo2 size={14} /> {t("studio.undo", { count: history.undoCount })}
             </button>
             <button
               type="button"
@@ -1479,17 +1700,17 @@ export const ReviewStudioPage: React.FC = () => {
               disabled={!history.canRedo || isReadOnly}
               onClick={history.redo}
               data-testid="redo-btn"
-              title="Redo (Ctrl+Shift+Z)"
+              title={t("studio.redoTitle")}
             >
-              <Redo2 size={14} /> Redo ({history.redoCount})
+              <Redo2 size={14} /> {t("studio.redo", { count: history.redoCount })}
             </button>
             <button
               type="button"
               className="mini-btn"
               onClick={() => setShortcutsOpen((v) => !v)}
               data-testid="open-shortcuts-btn"
-              title="Keyboard shortcuts (?)"
-              aria-label="Open keyboard shortcuts"
+              title={t("studio.shortcutsTitle")}
+              aria-label={t("studio.shortcutsAria")}
             >
               <Keyboard size={14} /> ?
             </button>
@@ -1498,7 +1719,7 @@ export const ReviewStudioPage: React.FC = () => {
           <div className="claim-controls">
             {isGtFrozen ? (
               <span className="lock-pill frozen" data-testid="gt-frozen-banner">
-                <Lock size={13} /> GT Frozen (Read-Only)
+                <Lock size={13} /> {t("studio.gtFrozenBanner")}
               </span>
             ) : isClaimedByMe ? (
               <button
@@ -1507,7 +1728,7 @@ export const ReviewStudioPage: React.FC = () => {
                 onClick={() => void handleRelease()}
                 data-testid="release-claim-btn"
               >
-                <Unlock size={14} /> Release Lock ({claimedBy})
+                <Unlock size={14} /> {t("studio.releaseLock", { user: claimedBy ?? "" })}
               </button>
             ) : (
               <button
@@ -1517,12 +1738,17 @@ export const ReviewStudioPage: React.FC = () => {
                 onClick={() => void handleClaim()}
                 data-testid="claim-btn"
               >
-                <Lock size={14} /> {isClaimedByOther ? `Claimed by ${claimedBy}` : "Claim Lock"}
+                <Lock size={14} />{" "}
+                {isClaimedByOther
+                  ? t("studio.claimedBy", { user: claimedBy ?? "" })
+                  : t("studio.claimLock")}
               </button>
             )}
             {claimExpiresAt && (
               <span className="muted small">
-                Lease until {new Date(claimExpiresAt * 1000).toLocaleTimeString()}
+                {t("studio.leaseUntil", {
+                  time: new Date(claimExpiresAt * 1000).toLocaleTimeString(),
+                })}
               </span>
             )}
           </div>
@@ -1534,9 +1760,10 @@ export const ReviewStudioPage: React.FC = () => {
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
             <Eye size={14} />
             <span>
-              <strong>Read-Only Compare Mode</strong>: viewing historical VLM run{" "}
-              <code className="mono">{selectedRunId || episode.selected_run_id}</code> (does not
-              modify human reviews or frozen GT)
+              <strong>{t("studio.historicalTitle")}</strong>
+              {t("studio.historicalPrefix")}
+              <code className="mono">{selectedRunId || episode.selected_run_id}</code>
+              {t("studio.historicalSuffix")}
             </span>
           </span>
           <button
@@ -1545,15 +1772,16 @@ export const ReviewStudioPage: React.FC = () => {
             data-testid="exit-historical-run-btn"
             onClick={() => void handleSwitchRunVersion("")}
           >
-            Return to Active View
+            {t("studio.returnActiveView")}
           </button>
         </div>
       )}
 
       {isClaimedByOther && (
         <div className="warning-banner" data-testid="claim-conflict-banner">
-          <AlertTriangle size={15} /> This episode is currently locked by <strong>{claimedBy}</strong>{" "}
-          (read-only preview).
+          <AlertTriangle size={15} /> {t("studio.claimConflictPrefix")}
+          <strong>{claimedBy}</strong>
+          {t("studio.claimConflictSuffix")}
         </div>
       )}
       {error && (
@@ -1627,9 +1855,10 @@ export const ReviewStudioPage: React.FC = () => {
                 stage_id: `M${history.state.macro_stages.length + 1}_${Date.now().toString(36).slice(-3)}`,
                 t_start: t0,
                 t_end: t1 > t0 ? t1 : Number(maxDur.toFixed(2)),
-                label: "New Macro Stage",
+                label: t("studio.newSubtaskStageLabel"),
                 label_en: "new_stage",
                 summary: "",
+                instruction: "",
                 color_rgb: [59, 130, 246],
               };
               history.applyEdit((prev) => ({
@@ -1659,6 +1888,9 @@ export const ReviewStudioPage: React.FC = () => {
               }));
             }}
             onUpdateStageSpans={handleUpdateStageSpans}
+            onAlignStagesToQc={handleAlignStagesToQc}
+            onInferSubtasks={() => void handleInferSubtasks()}
+            inferringSubtasks={inferringSubtasks}
           />
         </div>
 
@@ -1667,13 +1899,13 @@ export const ReviewStudioPage: React.FC = () => {
           className={`studio-split-resizer ${draggingSplit ? "dragging" : ""}`}
           role="separator"
           aria-orientation="vertical"
-          aria-label="Resize left and right studio panes"
+          aria-label={t("studio.splitResizerAria")}
           aria-valuenow={leftPanePct}
           aria-valuemin={MIN_LEFT_PCT}
           aria-valuemax={MAX_LEFT_PCT}
           tabIndex={0}
           data-testid="studio-split-resizer"
-          title="Drag horizontally to resize player and inspector panes (50%–75%)"
+          title={t("studio.splitResizerTitle")}
           onPointerDown={startSplitDrag}
           onKeyDown={handleSplitKeyDown}
         />
@@ -1685,14 +1917,14 @@ export const ReviewStudioPage: React.FC = () => {
               className={`tab-btn ${activeTab === "segment" ? "active" : ""}`}
               onClick={() => setActiveTab("segment")}
             >
-              Segment / Stage
+              {t("studio.tabSegmentStage")}
             </button>
             <button
               type="button"
               className={`tab-btn ${activeTab === "success" ? "active" : ""}`}
               onClick={() => setActiveTab("success")}
             >
-              Success Verdict
+              {t("studio.tabSuccess")}
             </button>
             {canViewDiff && (
               <button
@@ -1701,7 +1933,7 @@ export const ReviewStudioPage: React.FC = () => {
                 onClick={() => setActiveTab("diff")}
                 data-testid="diff-tab-btn"
               >
-                VLM Diff &amp; History
+                {t("studio.tabDiff")}
               </button>
             )}
           </div>
@@ -1757,6 +1989,8 @@ export const ReviewStudioPage: React.FC = () => {
             {activeTab === "success" && (
               <SuccessPanel
                 success={history.state.success}
+                currentTime={currentTime}
+                durationS={episode.meta.duration_s}
                 readOnly={isReadOnly}
                 onChange={(nextSuccess) => {
                   history.applyEdit((prev) => ({
@@ -1783,7 +2017,7 @@ export const ReviewStudioPage: React.FC = () => {
                 reviews={reviews}
                 onRestoreSnapshot={(rev) => {
                   history.restoreSnapshot(rev);
-                  notify(`Restored snapshot ${rev.rev_id} to edit stack (save or submit to commit)`, "info");
+                  notify(t("studio.toastRestoredSnapshot", { revId: rev.rev_id }), "info");
                 }}
                 onSeek={setCurrentTime}
               />
@@ -1796,14 +2030,14 @@ export const ReviewStudioPage: React.FC = () => {
       <div className="studio-footer" data-testid="studio-action-footer">
         <div className="footer-left">
           <div className="watch-coverage-badge" data-testid="watch-coverage-badge">
-            <span>Watch Coverage: </span>
+            <span>{t("studio.watchCoverageLabel")}</span>
             <strong>{watchPct}%</strong>
-            <span className="muted"> (Required ≥ {minWatchPct}%)</span>
+            <span className="muted">{t("studio.watchCoverageReq", { pct: minWatchPct })}</span>
           </div>
           <input
             type="text"
             className="notes-input"
-            placeholder="Review notes (notes)..."
+            placeholder={t("studio.notesPlaceholder")}
             disabled={isReadOnly}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
@@ -1823,7 +2057,7 @@ export const ReviewStudioPage: React.FC = () => {
                 }
               }}
             />
-            <span>Auto-advance on submit</span>
+            <span>{t("studio.autoAdvance")}</span>
           </label>
         </div>
 
@@ -1835,7 +2069,7 @@ export const ReviewStudioPage: React.FC = () => {
             onClick={() => void handleSubmitAction("save_draft")}
             data-testid="action-save-draft"
           >
-            <Save size={14} /> Save Draft
+            <Save size={14} /> {t("studio.saveDraft")}
           </button>
 
           <button
@@ -1844,13 +2078,13 @@ export const ReviewStudioPage: React.FC = () => {
             disabled={saving || isReadOnly || reviewerSubmitBlocked}
             title={
               reviewerSubmitBlocked
-                ? `Watch coverage must reach ${minWatchPct}% before submitting review`
-                : "Submit review"
+                ? t("studio.submitBlockedTitle", { pct: minWatchPct })
+                : t("studio.submitTitle")
             }
             onClick={() => void handleSubmitAction("submit_review")}
             data-testid="action-submit-review"
           >
-            <CheckCircle size={14} /> Submit Review
+            <CheckCircle size={14} /> {t("studio.submitReview")}
           </button>
 
           <button
@@ -1860,7 +2094,7 @@ export const ReviewStudioPage: React.FC = () => {
             onClick={() => setFlagDialogOpen((v) => !v)}
             data-testid="action-flag-btn"
           >
-            <Flag size={14} /> Flag Issue
+            <Flag size={14} /> {t("studio.flagIssue")}
           </button>
 
           {canApprove && (
@@ -1871,7 +2105,7 @@ export const ReviewStudioPage: React.FC = () => {
               onClick={() => void handleSubmitAction("approve")}
               data-testid="action-approve"
             >
-              <ShieldCheck size={14} /> Approve
+              <ShieldCheck size={14} /> {t("studio.approve")}
             </button>
           )}
 
@@ -1883,7 +2117,7 @@ export const ReviewStudioPage: React.FC = () => {
               onClick={() => void handleSubmitAction("freeze_gt")}
               data-testid="action-freeze-gt"
             >
-              <Lock size={14} /> Freeze as GT
+              <Lock size={14} /> {t("studio.freezeGt")}
             </button>
           )}
 
@@ -1894,9 +2128,56 @@ export const ReviewStudioPage: React.FC = () => {
               onClick={() => void handleRenderSingleMp4()}
               data-testid="action-render-mp4"
             >
-              <Video size={14} /> Render 1080p MP4
+              <Video size={14} /> {t("studio.renderMp4")}
             </button>
           )}
+
+          <div
+            className="export-menu-wrap"
+            ref={exportMenuWrapRef}
+            data-testid="studio-export-menu-wrap"
+          >
+            <button
+              type="button"
+              className="secondary-btn"
+              aria-expanded={exportMenuOpen}
+              onClick={() => setExportMenuOpen((v) => !v)}
+              data-testid="studio-export-btn"
+            >
+              <Download size={14} /> {t("studio.exportBtn")} <ChevronDown size={13} />
+            </button>
+            {exportMenuOpen && (
+              <div className="export-popover" data-testid="studio-export-menu">
+                <button
+                  type="button"
+                  className="rerun-menu-item"
+                  data-testid="export-download-json-btn"
+                  onClick={handleDownloadEpisodeJson}
+                >
+                  <strong style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                    <FileJson size={13} /> {t("studio.exportJsonTitle")}
+                  </strong>
+                  <span className="rerun-menu-desc">{t("studio.exportJsonDesc")}</span>
+                </button>
+                <button
+                  type="button"
+                  className="rerun-menu-item"
+                  data-testid="export-open-studio-btn"
+                  onClick={handleOpenExportStudio}
+                >
+                  <strong style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                    {isLead ? <ExternalLink size={13} /> : <Lock size={13} />}{" "}
+                    {t("studio.exportStudioTitle")}
+                  </strong>
+                  <span className="rerun-menu-desc">
+                    {isLead
+                      ? t("studio.exportStudioDescLead")
+                      : t("studio.exportStudioDescReviewer")}
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1904,7 +2185,7 @@ export const ReviewStudioPage: React.FC = () => {
         <div className="flag-modal-bar" data-testid="flag-reason-bar">
           <input
             type="text"
-            placeholder="Describe why this episode is flagged (flagged_reason)..."
+            placeholder={t("studio.flagPlaceholder")}
             value={flaggedReason}
             onChange={(e) => setFlaggedReason(e.target.value)}
           />
@@ -1913,15 +2194,83 @@ export const ReviewStudioPage: React.FC = () => {
             className="warning-btn compact"
             onClick={() => void handleSubmitAction("flag")}
           >
-            Confirm Flag
+            {t("studio.confirmFlag")}
           </button>
           <button
             type="button"
             className="mini-btn"
             onClick={() => setFlagDialogOpen(false)}
           >
-            Cancel
+            {t("common.cancel")}
           </button>
+        </div>
+      )}
+
+      {customObjectsModalOpen && (
+        <div
+          className="modal-backdrop"
+          data-testid="custom-objects-modal"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setCustomObjectsModalOpen(false);
+          }}
+        >
+          <form
+            className="modal-card custom-objects-modal-card"
+            onSubmit={(e) => void handleSubmitCustomObjectsS1(e)}
+          >
+            <div className="inspector-header">
+              <h3 style={{ margin: 0 }}>{t("studio.customObjTitle")}</h3>
+              <button
+                type="button"
+                className="mini-btn"
+                aria-label={t("studio.customObjCloseAria")}
+                onClick={() => setCustomObjectsModalOpen(false)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <p className="muted small" style={{ margin: 0 }}>
+              {t("studio.customObjDesc")}
+            </p>
+            <label className="field-group">
+              <span>{t("studio.customObjLabel")}</span>
+              <input
+                type="text"
+                autoFocus
+                data-testid="custom-objects-input"
+                value={customObjectsInput}
+                onChange={(e) => setCustomObjectsInput(e.target.value)}
+                placeholder={t("studio.customObjPlaceholder")}
+              />
+            </label>
+            {parsedCustomObjects.length > 0 && (
+              <div className="custom-objects-tags" data-testid="custom-objects-preview">
+                {parsedCustomObjects.map((obj, idx) => (
+                  <span key={`${obj}-${idx}`} className="custom-object-tag">
+                    {obj}
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="footer-actions" style={{ justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                className="secondary-btn compact"
+                onClick={() => setCustomObjectsModalOpen(false)}
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="submit"
+                className="primary-btn compact"
+                disabled={parsedCustomObjects.length === 0 || rerunning}
+                data-testid="submit-custom-objects-btn"
+              >
+                <Sparkles size={13} />{" "}
+                {t("studio.customObjSubmit", { count: parsedCustomObjects.length })}
+              </button>
+            </div>
+          </form>
         </div>
       )}
 

@@ -7,11 +7,11 @@ description: Fallback quality-control specification when no task-specific templa
 goal: Safely and reliably complete the intended tabletop or mobile manipulation task.
 criteria:
   - Target object reaches the intended goal state or placement.
-  - No unrecovered drops or damage occur, and robot arms return to a safe or completed pose.
+  - No unrecovered drops or damage occur, and manipulators (robot arms/grippers or human hands) finish in a safe or completed pose.
 steps:
-  - Approach and grasp the target object or tool.
+  - Approach and grasp the target object or tool with the active manipulator (robot arm/gripper or human hand).
   - Transport, align, and execute the core manipulation step.
-  - Complete placement or handover and retract the arms safely.
+  - Complete placement or handover and retract the manipulators (robot arms/grippers or human hands) safely.
 task_prompt: |
-  No task-specific template is matched. Use open-vocabulary recognition to identify the actively manipulated objects and containers, and objectively describe actions and final completion state.
+  No task-specific template is matched. Use open-vocabulary recognition to identify the objects and containers actively interacted with by manipulators (robot arms/grippers or human hands), and objectively describe actions and final completion state.
 grounding_objects: []

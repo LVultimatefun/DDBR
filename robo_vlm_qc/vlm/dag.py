@@ -39,7 +39,7 @@ from .client import (
     normalize_stage_name,
 )
 from .prompt_builder import PromptBuilder
-from .stage1_grounding import run_stage1_grounding
+from .stage1_grounding import normalize_custom_objects, run_stage1_grounding
 from .stage2_macro import run_stage2_macro
 from .stage3_discover import run_stage3_discover
 from .stage4_verify import run_stage4_verify
@@ -107,6 +107,7 @@ class VlmDag:
         few_shot_items: Sequence[FewShotItem] | None = None,
         fresh: bool = False,
         fresh_stages: Sequence[str] | set[str] | None = None,
+        custom_objects: Sequence[str] | None = None,
         is_eval_sandbox: bool = False,
         persist: bool = True,
         cancel_event: threading.Event | None = None,
@@ -192,9 +193,12 @@ class VlmDag:
 
             _check_cancelled()
             ep_fp = ev.meta.episode_fingerprint
+            norm_custom_objs = normalize_custom_objects(custom_objects)
+            s1_extra = {"custom_objects": norm_custom_objs} if norm_custom_objs else None
             s1_key = StageCache.compute_key(
                 episode_fingerprint=ep_fp,
                 stage_basis=self.cfg.s1_cache_basis(t_spec.task_id),
+                extra=s1_extra,
             )
             s2_key = StageCache.compute_key(
                 episode_fingerprint=ep_fp,
@@ -224,6 +228,7 @@ class VlmDag:
                     prompt_builder=self.prompt_builder,
                     budget=ep_budget,
                     cancel_event=cancel_event or self._cancel_event,
+                    custom_objects=norm_custom_objs or None,
                 )
                 _check_cancelled()
                 self.cache.put(s1_key, grounding.model_dump(mode="json"))
@@ -255,6 +260,7 @@ class VlmDag:
                     cfg=self.cfg,
                     prompt_builder=self.prompt_builder,
                     budget=ep_budget,
+                    grounding=grounding,
                 )
                 _check_cancelled()
                 self.cache.put(

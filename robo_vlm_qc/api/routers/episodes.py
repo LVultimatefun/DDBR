@@ -16,8 +16,19 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from ...guardrail import apply_hallucination_check, apply_splice_gate
 from ...guardrail.visual_gate import evaluate_visual_segment
 from ...io.media import encode_jpeg_bytes
-from ...models.annotation import GuardrailMetrics, MaskSide, QcSegment, SplicePolicy
+from ...models.annotation import (
+    GroundingResult,
+    GuardrailMetrics,
+    MacroStage,
+    MaskSide,
+    QcSegment,
+    SplicePolicy,
+)
+from ...models.review import EpisodeStatus
 from ...store import NotFoundError
+from ...vlm.client import VlmClient, VlmError
+from ...vlm.prompt_builder import PromptBuilder
+from ...vlm.stage2_macro import infer_subtasks_from_segments
 from ..auth import AuthContext, get_app_state, require_auth, require_lead
 from ..state import AppState
 
@@ -349,6 +360,85 @@ def _check_splice_sync(
         "compute_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         "mode": "skipped",
     }
+
+
+class InferSubtasksRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    qc_segments: list[QcSegment]
+    macro_stages: list[MacroStage] = Field(default_factory=list)
+    custom_hint: str | None = None
+
+
+def _infer_subtasks_sync(
+    state: AppState, ep_id: str, payload: InferSubtasksRequest
+) -> dict[str, Any]:
+    cfg = state.get_config()
+    row = state.repo.get_episode_row(ep_id)
+    if row["status"] == EpisodeStatus.GT_FROZEN.value:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Episode {ep_id!r} is gt_frozen and cannot re-infer subtasks",
+        )
+    meta = state.repo.get_episode_meta(ep_id)
+
+    grounding: GroundingResult | None = None
+    active_run_id = row.get("active_run_id")
+    if active_run_id:
+        try:
+            run_art = state.repo.get_vlm_run(str(active_run_id))
+            if run_art.grounding and run_art.grounding.object_tracks_2d:
+                grounding = run_art.grounding
+        except NotFoundError:
+            grounding = None
+
+    if meta.task_id and meta.task_id != "_default":
+        task_spec = cfg.get_task(meta.task_id)
+    else:
+        hint = meta.extra_meta.get("h5_task_name") or meta.extra_meta.get("ep_task_str")
+        task_spec = cfg.resolve_task(meta.dataset, str(hint) if hint else None)
+
+    pb = PromptBuilder(cfg)
+    with state.open_view(meta, cfg) as view:
+        with VlmClient.from_config(cfg, workspace_dir=state.workspace) as vlm_client:
+            inferred = infer_subtasks_from_segments(
+                view=view,
+                qc_segments=payload.qc_segments,
+                macro_stages=payload.macro_stages,
+                grounding=grounding,
+                custom_hint=payload.custom_hint,
+                task=task_spec,
+                client=vlm_client,
+                cfg=cfg,
+                prompt_builder=pb,
+            )
+
+    return {
+        "episode_id": ep_id,
+        "macro_stages": [st.model_dump(mode="json") for st in inferred],
+        "used_grounding": grounding is not None,
+        "used_segments_count": len(payload.qc_segments),
+    }
+
+
+@router.post("/{ep_id:path}/infer-subtasks")
+async def infer_episode_subtasks(
+    ep_id: str,
+    payload: InferSubtasksRequest,
+    auth: AuthContext = Depends(require_auth),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    _ = auth
+    try:
+        return await run_in_threadpool(_infer_subtasks_sync, state, ep_id, payload)
+    except HTTPException:
+        raise
+    except (NotFoundError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValidationError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except VlmError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/{ep_id:path}/check-splice")

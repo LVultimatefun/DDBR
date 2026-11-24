@@ -226,7 +226,7 @@ def _ingest_and_approve(
                 ep_ids.append(meta.episode_id)
                 dur = meta.duration_s
                 art = VlmRunArtifact(
-                    run_id=f"run_{meta.stem}",
+                    run_id=f"run_{meta.dataset}_{meta.stem}",
                     episode_id=meta.episode_id,
                     created_at=1.0,
                     config_fingerprint=ConfigFingerprintSnapshot(
@@ -501,3 +501,373 @@ def test_badcase_pairs_export_emits_metadata_and_zero_kept_is_clean(tmp_path: Pa
         assert (out_bp / "meta" / "badcases_and_pairs.json").is_file()
         bp_doc = json.loads((out_bp / "meta" / "badcases_and_pairs.json").read_text("utf-8"))
         assert len(bp_doc["badcases"]) == 1
+
+
+def _make_native_dim_lerobot_v3(
+    ds_dir: Path,
+    *,
+    state_dim: int = 14,
+    action_dim: int | None = 14,
+    state_names: list[str] | None = None,
+    action_names: list[str] | None = None,
+    duration_s: float = 2.0,
+) -> Path:
+    n_frames = max(10, int(round(duration_s * 30.0)))
+    (ds_dir / "meta" / "episodes" / "chunk-000").mkdir(parents=True, exist_ok=True)
+    (ds_dir / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
+    cam_keys = ("observation.images.main", "observation.images.left_wrist")
+    for ck in cam_keys:
+        _make_mp4(ds_dir / "videos" / ck / "chunk-000" / "file-000.mp4", n_frames=n_frames)
+
+    t_norm = np.linspace(0.0, 1.0, n_frames, dtype=np.float32)
+    states = np.stack([t_norm * (i + 1) * 0.1 for i in range(state_dim)], axis=1).astype(np.float32)
+    s_names = state_names or [f"joint_{i}" for i in range(state_dim)]
+
+    cols: dict[str, Any] = {
+        "observation.state": pa.array(states.tolist(), type=pa.list_(pa.float32(), state_dim)),
+        "timestamp": pa.array([i / 30.0 for i in range(n_frames)], type=pa.float32()),
+        "frame_index": pa.array(list(range(n_frames)), type=pa.int64()),
+        "episode_index": pa.array([0] * n_frames, type=pa.int64()),
+        "index": pa.array(list(range(n_frames)), type=pa.int64()),
+        "task_index": pa.array([0] * n_frames, type=pa.int64()),
+    }
+    features: dict[str, Any] = {
+        "observation.state": {"dtype": "float32", "shape": [state_dim], "names": s_names},
+    }
+    if action_dim is not None:
+        actions = np.stack([t_norm * (i + 1) * 0.12 for i in range(action_dim)], axis=1).astype(
+            np.float32
+        )
+        a_names = action_names or [f"cmd_{i}" for i in range(action_dim)]
+        cols["action"] = pa.array(actions.tolist(), type=pa.list_(pa.float32(), action_dim))
+        features["action"] = {"dtype": "float32", "shape": [action_dim], "names": a_names}
+
+    pq.write_table(pa.table(cols), ds_dir / "data" / "chunk-000" / "file-000.parquet")
+    pq.write_table(
+        pa.table({"task_index": pa.array([0], type=pa.int64()), "task": pa.array(["pick_and_place"])}),
+        ds_dir / "meta" / "tasks.parquet",
+    )
+    ep_row: dict[str, Any] = {
+        "episode_index": 0,
+        "length": n_frames,
+        "tasks": ["pick_and_place"],
+        "data/chunk_index": 0,
+        "data/file_index": 0,
+        "dataset_from_index": 0,
+        "dataset_to_index": n_frames,
+    }
+    for ck in cam_keys:
+        ep_row[f"videos/{ck}/chunk_index"] = 0
+        ep_row[f"videos/{ck}/file_index"] = 0
+        ep_row[f"videos/{ck}/from_timestamp"] = 0.0
+        ep_row[f"videos/{ck}/to_timestamp"] = float((n_frames - 1) / 30.0)
+    pq.write_table(
+        pa.Table.from_pylist([ep_row]),
+        ds_dir / "meta" / "episodes" / "chunk-000" / "file-000.parquet",
+    )
+    for ck in cam_keys:
+        features[ck] = {"dtype": "video", "shape": [96, 128, 3]}
+    info = {
+        "codebase_version": "v3.0",
+        "robot_type": "aloha_bimanual",
+        "total_episodes": 1,
+        "total_frames": n_frames,
+        "total_tasks": 1,
+        "chunks_size": 1000,
+        "fps": 30,
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        "features": features,
+    }
+    (ds_dir / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
+    return ds_dir
+
+
+def test_lerobot_v3_native_14d_preservation_video_only_and_preserve_native_conflicts(
+    tmp_path: Path,
+) -> None:
+    import pytest
+
+    ws = tmp_path / "ws_native"
+    cfg_mgr = ConfigManager(workspace_dir=ws)
+    aloha_state_names = [
+        "left_waist", "left_shoulder", "left_elbow", "left_forearm_roll",
+        "left_wrist_angle", "left_wrist_rotate", "left_gripper",
+        "right_waist", "right_shoulder", "right_elbow", "right_forearm_roll",
+        "right_wrist_angle", "right_wrist_rotate", "right_gripper",
+    ]
+    aloha_action_names = [f"{nm}_cmd" for nm in aloha_state_names]
+
+    aloha_dir = _make_native_dim_lerobot_v3(
+        tmp_path / "aloha_14d",
+        state_dim=14,
+        action_dim=14,
+        state_names=aloha_state_names,
+        action_names=aloha_action_names,
+        duration_s=2.0,
+    )
+    franka_dir = _make_native_dim_lerobot_v3(
+        tmp_path / "franka_7d",
+        state_dim=7,
+        action_dim=7,
+        state_names=[f"franka_j{i}" for i in range(7)],
+        action_names=[f"franka_a{i}" for i in range(7)],
+        duration_s=2.0,
+    )
+    vid_dir = _make_synthetic_video_dir(tmp_path / "ego_vid", duration_s=2.0)
+
+    mid_cut = [
+        QcSegment(
+            seg_id="s_cut",
+            t_start=0.8,
+            t_end=1.1,
+            label_id="mid_idle_freeze",
+            training_role="badcase",
+            splice_policy="cut_clean",
+            mask_side=None,
+            vlm_raw_policy="cut_clean",
+        )
+    ]
+    aloha_ep = _ingest_and_approve(ws, cfg_mgr, aloha_dir, passed=True, qc_segments=mid_cut)[0]
+    franka_ep = _ingest_and_approve(ws, cfg_mgr, franka_dir, passed=True)[0]
+    vid_ep = _ingest_and_approve(ws, cfg_mgr, vid_dir, passed=True)[0]
+
+    repo = Repository(ws)
+    try:
+        res_aloha = repo.resolve_episode(aloha_ep)
+        res_franka = repo.resolve_episode(franka_ep)
+        res_vid = repo.resolve_episode(vid_ep)
+    finally:
+        repo.close()
+
+    with (
+        _open_view_via_discover(res_aloha.meta, cfg_mgr) as v_aloha,
+        _open_view_via_discover(res_franka.meta, cfg_mgr) as v_franka,
+        _open_view_via_discover(res_vid.meta, cfg_mgr) as v_vid,
+    ):
+        # Adapter preserves native state_names & action_names on KinematicsData
+        assert v_aloha.kinematics is not None
+        assert v_aloha.kinematics.state_names == aloha_state_names
+        assert v_aloha.kinematics.action_names == aloha_action_names
+
+        # 1. Native 14D preservation in state_schema_mode="auto" + round-trip
+        r_auto = ExportRecipe(
+            name="bc_clean",
+            format="lerobot_v3",
+            state_schema_mode="auto",
+            tail_frames=4,
+            smooth_tail="always",
+        )
+        p_aloha = PieceSlicer(cfg_mgr).slice(res_aloha, v_aloha, r_auto)
+        out_14d = tmp_path / "out_aloha_14d"
+        m_14d = get_exporter("lerobot_v3").export(
+            p_aloha, [res_aloha], {aloha_ep: v_aloha}, out_14d, r_auto
+        )
+        assert m_14d.pieces_exported == 2
+
+        info_14 = json.loads((out_14d / "meta" / "info.json").read_text("utf-8"))
+        assert info_14["features"]["observation.state"]["shape"] == [14]
+        assert info_14["features"]["observation.state"]["names"] == aloha_state_names
+        assert info_14["features"]["action"]["shape"] == [14]
+        assert info_14["features"]["action"]["names"] == aloha_action_names
+
+        stats_14 = json.loads((out_14d / "meta" / "stats.json").read_text("utf-8"))
+        assert len(stats_14["observation.state"]["mean"]) == 14
+        assert len(stats_14["action"]["mean"]) == 14
+
+        tbl_14 = pq.read_table(out_14d / "data" / "chunk-000" / "file-000.parquet")
+        assert len(tbl_14["observation.state"][0].as_py()) == 14
+        assert len(tbl_14["action"][0].as_py()) == 14
+
+        # Round-trip 14D dataset through LeRobotAdapter
+        ad = LeRobotAdapter()
+        rt_handles = ad.discover(out_14d)
+        assert len(rt_handles) == 2
+        with ad.open(rt_handles[0]) as rt_v:
+            assert rt_v.kinematics is not None
+            assert rt_v.kinematics.raw_state is not None
+            assert rt_v.kinematics.raw_state.shape[1] == 14
+            assert rt_v.kinematics.raw_action is not None
+            assert rt_v.kinematics.raw_action.shape[1] == 14
+            assert rt_v.kinematics.state_names == aloha_state_names
+            assert rt_v.kinematics.action_names == aloha_action_names
+
+        # 2. Pure video_dir export in auto mode omits dummy 81D observation.state & action
+        p_vid = PieceSlicer(cfg_mgr).slice(res_vid, v_vid, r_auto)
+        out_vid_only = tmp_path / "out_video_only"
+        m_vid = get_exporter("lerobot_v3").export(
+            p_vid, [res_vid], {vid_ep: v_vid}, out_vid_only, r_auto
+        )
+        assert m_vid.episodes_included == 1
+        info_vid = json.loads((out_vid_only / "meta" / "info.json").read_text("utf-8"))
+        assert "observation.state" not in info_vid["features"]
+        assert "action" not in info_vid["features"]
+        assert "observation.images.main" in info_vid["features"]
+        stats_vid = json.loads((out_vid_only / "meta" / "stats.json").read_text("utf-8"))
+        assert "observation.state" not in stats_vid
+        assert "action" not in stats_vid
+        tbl_vid = pq.read_table(out_vid_only / "data" / "chunk-000" / "file-000.parquet")
+        assert "observation.state" not in tbl_vid.column_names
+        assert "action" not in tbl_vid.column_names
+        assert {"subtask_index", "task_index", "timestamp", "frame_index", "episode_index"}.issubset(
+            set(tbl_vid.column_names)
+        )
+        # Round-trip pure video LeRobot v3 through LeRobotAdapter
+        rt_vid_handles = ad.discover(out_vid_only)
+        assert len(rt_vid_handles) == 1
+        with ad.open(rt_vid_handles[0]) as rt_vv:
+            assert rt_vv.kinematics is None
+            fr = rt_vv.media.read_frame_rgb("main", 0.0)
+            assert fr.ndim == 3 and fr.shape[2] == 3
+
+        # Explicit canonical_81d still emits 81D for pure video
+        r_81 = ExportRecipe(
+            name="bc_clean", format="lerobot_v3", state_schema_mode="canonical_81d"
+        )
+        out_vid_81 = tmp_path / "out_video_81d"
+        get_exporter("lerobot_v3").export(
+            p_vid, [res_vid], {vid_ep: v_vid}, out_vid_81, r_81
+        )
+        info_v81 = json.loads((out_vid_81 / "meta" / "info.json").read_text("utf-8"))
+        assert info_v81["features"]["observation.state"]["shape"] == [81]
+        assert info_v81["features"]["action"]["shape"] == [81]
+
+        # 3. preserve_native raises ValueError cleanly on heterogeneous 14D + 7D dims
+        p_franka = PieceSlicer(cfg_mgr).slice(res_franka, v_franka, r_auto)
+        r_pres = ExportRecipe(
+            name="bc_clean", format="lerobot_v3", state_schema_mode="preserve_native"
+        )
+        with pytest.raises(ValueError, match="Heterogeneous native state/action dimensions"):
+            get_exporter("lerobot_v3").export(
+                p_aloha + p_franka,
+                [res_aloha, res_franka],
+                {aloha_ep: v_aloha, franka_ep: v_franka},
+                tmp_path / "out_conflict",
+                r_pres,
+            )
+        # While auto cleanly falls back to canonical_81d for mixed 14D + 7D
+        out_mix_14_7 = tmp_path / "out_mix_14_7"
+        get_exporter("lerobot_v3").export(
+            p_aloha + p_franka,
+            [res_aloha, res_franka],
+            {aloha_ep: v_aloha, franka_ep: v_franka},
+            out_mix_14_7,
+            r_auto,
+        )
+        info_mix = json.loads((out_mix_14_7 / "meta" / "info.json").read_text("utf-8"))
+        assert info_mix["features"]["observation.state"]["shape"] == [81]
+
+
+def test_lerobot_v3_split_by_subtask_exports_per_subtask_episodes_and_instructions(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "ws_sub"
+    cfg_mgr = ConfigManager(workspace_dir=ws)
+    vid_dir = _make_synthetic_video_dir(tmp_path / "ego_subtask", duration_s=2.0)
+
+    repo = Repository(ws)
+    try:
+        h = auto_detect(vid_dir)[0]
+        with get_adapter(h.adapter_type).open(h) as v:
+            meta = v.meta
+        repo.ingest_episode(meta)
+        ep_id = meta.episode_id
+        stages = [
+            MacroStage(
+                stage_id="S1",
+                t_start=0.0,
+                t_end=1.0,
+                label="抓取绿杯",
+                label_en="pick_mug",
+                instruction="Pick up the green mug from the counter",
+            ),
+            MacroStage(
+                stage_id="S2",
+                t_start=1.0,
+                t_end=2.0,
+                label="放入沥水架",
+                label_en="place_mug",
+                instruction="Place the green mug onto the dish rack",
+            ),
+        ]
+        art = VlmRunArtifact(
+            run_id="run_sub_1",
+            episode_id=ep_id,
+            created_at=1.0,
+            config_fingerprint=ConfigFingerprintSnapshot(
+                model_routing={},
+                prompt_bundle_version="1",
+                label_taxonomy_version="1",
+                task_spec_version="1",
+            ),
+            macro_stages=stages,
+            qc_segments=[],
+            success=SuccessVerdict(passed=True, verdict="success", confidence=0.96),
+        )
+        repo.save_vlm_run_artifact(art)
+        repo.save_review(
+            ep_id,
+            "lead_sub",
+            "lead",
+            ReviewWritePayload(
+                base_run_id="run_sub_1",
+                action="approve",
+                qc_segments=[],
+                success=art.success,
+                macro_stages=stages,
+                watch_coverage=WatchCoverage(
+                    watched_intervals=[(0.0, 2.0)],
+                    watched_s=2.0,
+                    duration_s=2.0,
+                    coverage_ratio=1.0,
+                    confirmed=True,
+                ),
+            ),
+        )
+        res = repo.resolve_episode(ep_id)
+    finally:
+        repo.close()
+
+    r_split = ExportRecipe(
+        name="bc_clean",
+        format="lerobot_v3",
+        state_schema_mode="auto",
+        split_by_subtask=True,
+    )
+    out_dir = tmp_path / "out_subtask_eps"
+    with _open_view_via_discover(res.meta, cfg_mgr) as view:
+        pieces = PieceSlicer(cfg_mgr).slice(res, view, r_split)
+        manifest = get_exporter("lerobot_v3").export(
+            pieces, [res], {ep_id: view}, out_dir, r_split
+        )
+
+    assert manifest.pieces_exported == 2
+    info = json.loads((out_dir / "meta" / "info.json").read_text("utf-8"))
+    assert info["total_episodes"] == 2
+    assert info["total_tasks"] == 2
+    assert "observation.state" not in info["features"]
+
+    tasks_tbl = pq.read_table(out_dir / "meta" / "tasks.parquet").to_pandas()
+    assert list(tasks_tbl["task"]) == [
+        "Pick up the green mug from the counter",
+        "Place the green mug onto the dish rack",
+    ]
+    ep_tbl = pq.read_table(
+        out_dir / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    ).to_pandas()
+    assert len(ep_tbl) == 2
+    assert list(ep_tbl["tasks"].iloc[0]) == ["Pick up the green mug from the counter"]
+    assert list(ep_tbl["tasks"].iloc[1]) == ["Place the green mug onto the dish rack"]
+    assert list(ep_tbl["task_index"]) == [0, 1]
+
+    sub_tbl = pq.read_table(out_dir / "meta" / "subtasks.parquet").to_pandas()
+    assert "instruction" in sub_tbl.columns
+    assert list(sub_tbl["instruction"]) == [
+        "Pick up the green mug from the counter",
+        "Place the green mug onto the dish rack",
+    ]
+
+    cam_dirs = sorted({p.parents[1] for p in (out_dir / "videos").rglob("*.mp4")})
+    assert len(cam_dirs) == 1
+    tot_f = sum(_ffprobe_info(mp4)["nb_frames"] for mp4 in sorted(cam_dirs[0].rglob("*.mp4")))
+    assert tot_f == manifest.total_frames

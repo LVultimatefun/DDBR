@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_VISUAL_LABELS } from "../constants/labels";
 import type { DiagnosisErrorItem } from "../api/types";
 import { AuthProvider } from "../stores/authStore";
+import { I18nProvider } from "../stores/i18nStore";
 import { VlmLabPage } from "./VlmLabPage";
 
 function buildMockFixtures() {
@@ -324,6 +325,7 @@ function buildMockFixtures() {
 describe("VlmLabPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    window.localStorage.removeItem("robo_vlm_qc.locale");
   });
 
   it("blocks Reviewer role with 403 guard without calling lab endpoints", () => {
@@ -1054,5 +1056,106 @@ describe("VlmLabPage", () => {
     expect(promptLoadCount).toBeGreaterThanOrEqual(2);
     expect(taskLoadCount).toBeGreaterThanOrEqual(2);
     expect(screen.getByTestId("lab-info-banner")).toHaveTextContent("Safely rolled back");
+  });
+
+  it("renders Chinese headings, tabs, KPIs, and history drawer cleanly when locale is zh", async () => {
+    const fx = buildMockFixtures();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.startsWith("/api/lab/labels")) return new Response(JSON.stringify(fx.labelsDoc), { status: 200 });
+        if (url.startsWith("/api/lab/prompts")) return new Response(JSON.stringify(fx.promptsDoc), { status: 200 });
+        if (url.startsWith("/api/lab/tasks")) return new Response(JSON.stringify(fx.tasksDoc), { status: 200 });
+        if (url.startsWith("/api/lab/diagnosis")) return new Response(JSON.stringify(fx.diagnosisDoc), { status: 200 });
+        if (url.startsWith("/api/lab/unknowns")) return new Response(JSON.stringify(fx.unknownsDoc), { status: 200 });
+        if (url.startsWith("/api/lab/few-shots")) {
+          return new Response(
+            JSON.stringify({ items: fx.fewShotItems, total: fx.fewShotItems.length }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/lab/eval/compare")) {
+          return new Response(
+            JSON.stringify({
+              evals: [fx.evalCandidate, fx.evalBaseline],
+              baseline: fx.evalBaseline,
+              candidate: fx.evalCandidate,
+              deltas: null,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/lab/history")) {
+          return new Response(JSON.stringify({ items: [] }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    const { unmount } = render(
+      <I18nProvider initialLocale="zh">
+        <AuthProvider initialAuth={{ token: "rev-token", username: "rev_1", role: "reviewer" }}>
+          <MemoryRouter>
+            <VlmLabPage />
+          </MemoryRouter>
+        </AuthProvider>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByTestId("lab-forbidden")).toHaveTextContent("403 — 无访问权限");
+    expect(screen.getByTestId("lab-forbidden")).toHaveTextContent("VLM 实验室仅限组长（Lead）使用");
+    unmount();
+
+    render(
+      <I18nProvider initialLocale="zh">
+        <AuthProvider initialAuth={{ token: "lead-token", username: "lead_1", role: "lead" }}>
+          <MemoryRouter>
+            <VlmLabPage />
+          </MemoryRouter>
+        </AuthProvider>
+      </I18nProvider>,
+    );
+
+    // Main heading & tabs
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("VLM 实验室闭环迭代工作台（组长）");
+    expect(screen.getByTestId("tab-diagnosis")).toHaveTextContent("误差诊断与未知分流");
+    expect(screen.getByTestId("tab-few-shots")).toHaveTextContent("Few-Shot 错题本");
+    expect(screen.getByTestId("tab-taxonomy")).toHaveTextContent("标签 / 提示词 / 任务规范");
+    expect(screen.getByTestId("tab-eval")).toHaveTextContent("GT 评测沙箱");
+
+    // Tab 1: Diagnosis & Unknown Triage
+    await waitFor(() =>
+      expect(screen.getByTestId("diagnosis-kpi-strip")).toHaveTextContent("已评测 GT 片段"),
+    );
+    expect(screen.getByTestId("kpi-bucket-fp_overflag")).toHaveTextContent("误报过检");
+    expect(screen.getByTestId("unknown-triage-panel")).toHaveTextContent("未知异常分流池");
+
+    // Tab 2: Few-Shot Mistake Book
+    fireEvent.click(screen.getByTestId("tab-few-shots"));
+    await waitFor(() =>
+      expect(screen.getByTestId("lab-panel-few-shots")).toHaveTextContent("视觉 / 文本 Few-Shot 错题本"),
+    );
+    expect(screen.getByTestId("open-manual-fewshot-btn")).toHaveTextContent("新增 Few-Shot 案例");
+
+    // Tab 3: Taxonomy + History Drawer
+    fireEvent.click(screen.getByTestId("tab-taxonomy"));
+    expect(screen.getByTestId("taxonomy-subtab-labels")).toHaveTextContent("视觉标签 (labels.yaml)");
+    expect(screen.getByTestId("taxonomy-subtab-prompts")).toHaveTextContent("各阶段提示词 (S1–S5)");
+    expect(screen.getByTestId("taxonomy-subtab-tasks")).toHaveTextContent("任务规范 (TaskSpec)");
+
+    fireEvent.click(screen.getByTestId("open-history-drawer-btn"));
+    const drawer = await screen.findByTestId("lab-history-drawer");
+    expect(drawer).toHaveTextContent(".history/ 配置快照与回滚");
+    expect(drawer).toHaveTextContent("历史归档快照 (0)");
+    fireEvent.click(screen.getByTestId("close-history-drawer-btn"));
+
+    // Tab 4: GT Eval Sandbox
+    fireEvent.click(screen.getByTestId("tab-eval"));
+    await waitFor(() =>
+      expect(screen.getByTestId("eval-compare-panel")).toHaveTextContent("版本指标对比与一键发布"),
+    );
+    expect(screen.getByTestId("eval-runner-controls")).toHaveTextContent("GT 回归评测沙箱");
+    expect(screen.getByTestId("promote-btn")).toHaveTextContent("一键发布为生效配置");
   });
 });

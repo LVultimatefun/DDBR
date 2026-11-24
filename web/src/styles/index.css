@@ -99,15 +99,18 @@ body {
   color: var(--role-lead-text);
 }
 
-.theme-toggle-btn {
+.theme-toggle-btn,
+.locale-toggle-btn {
   background: var(--surface);
   color: var(--text);
   border: 1px solid var(--border);
   padding: 4px 9px;
   font-size: 12px;
+  font-weight: 600;
 }
 
-.theme-toggle-btn:hover {
+.theme-toggle-btn:hover,
+.locale-toggle-btn:hover {
   background: var(--hover-bg);
 }
 
@@ -1644,4 +1647,230 @@ textarea:focus-visible,
 a:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* Locked Reviewer Export Studio Nav Button */
+.nav-link-locked {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  opacity: 0.78;
+  font-size: 13px;
+}
+
+.nav-link-locked:hover {
+  opacity: 1;
+  color: var(--text);
+  background: var(--surface-alt);
+  border-color: var(--primary);
+}
+
+/* Workspace Settings Popover Divider */
+.settings-popover-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 2px 0;
+}
+
+/* ExportPage Scoped Episodes Pill Banner & Smart Empty Banner */
+.scoped-episodes-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: var(--badge-info-bg);
+  border: 1px solid var(--badge-info-border);
+  color: var(--badge-info-text);
+  font-size: 13px;
+}
+
+.scoped-episodes-info {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.scoped-episodes-chips {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.scoped-episode-chip {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.checkbox-feature-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+
+.checkbox-feature-card input[type="checkbox"] {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.checkbox-feature-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.empty-export-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--warning-bg);
+  border: 1px solid var(--warning);
+  color: var(--warning-text);
+}
+
+.empty-export-banner-copy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 280px;
+}
+
+/* VLM Settings Modal */
+.vlm-modal-card {
+  gap: 12px;
+}
+
+.vlm-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+  gap: 8px;
+}
+
+.vlm-preset-card {
+  background: var(--surface-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  text-align: left;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.vlm-preset-card:hover {
+  border-color: var(--primary);
+  background: var(--hover-bg);
+}
+
+.vlm-preset-card.selected {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.vlm-preset-title {
+  font-weight: 700;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.vlm-preset-sub {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.3;
+}
+
+.vlm-key-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vlm-stage-routing-box {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.vlm-stage-routing-toggle {
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 9px 11px;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 0;
+}
+
+.vlm-stage-routing-toggle:hover {
+  background: var(--hover-bg);
+}
+
+.vlm-stage-routing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+  padding: 10px 11px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.vlm-test-result {
+  padding: 10px 12px;
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vlm-test-result.ok {
+  background: var(--success-bg);
+  border: 1px solid var(--success-border);
+  color: var(--success-text);
+}
+
+.vlm-test-result.fail {
+  background: var(--error-bg);
+  border: 1px solid var(--danger);
+  color: var(--error-text);
+}
+
+.vlm-test-result-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.vlm-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
 }

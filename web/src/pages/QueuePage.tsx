@@ -4,8 +4,10 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
+  Cpu,
   Download,
   FolderPlus,
+  PackageCheck,
   Play,
   RefreshCw,
   Settings,
@@ -33,8 +35,14 @@ import type {
 import { useEventStream } from "../api/useEventStream";
 import { FacetCombobox } from "../components/FacetCombobox";
 import { IngestModal } from "../components/IngestModal";
-import { ALL_EPISODE_STATUSES, EPISODE_STATUS_META } from "../constants/labels";
+import { VlmSettingsModal } from "../components/VlmSettingsModal";
+import {
+  ALL_EPISODE_STATUSES,
+  EPISODE_STATUS_META,
+  getEpisodeStatusLabel,
+} from "../constants/labels";
 import { useAuth } from "../stores/authStore";
+import { useI18n } from "../stores/i18nStore";
 import { useJobs } from "../stores/jobStore";
 import { useToast } from "../stores/toastStore";
 
@@ -66,6 +74,9 @@ function formatUpdatedAt(ts: number): string {
 
 export const QueuePage: React.FC = () => {
   const { isLead, username, token, noAuth, authProbing, setAuthPromptOpen } = useAuth();
+  const { locale, t } = useI18n();
+  const tRef = useRef(t);
+  tRef.current = t;
   const jobStore = useJobs();
   const toast = useToast();
   const navigate = useNavigate();
@@ -131,6 +142,7 @@ export const QueuePage: React.FC = () => {
   const [vlmStage, setVlmStage] = useState<string>("");
   const [localActiveJob, setLocalActiveJob] = useState<JobStatus | null>(null);
   const [ingestOpen, setIngestOpen] = useState(false);
+  const [vlmModalOpen, setVlmModalOpen] = useState(false);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsLoading, setSettingsLoading] = useState(false);
@@ -171,7 +183,7 @@ export const QueuePage: React.FC = () => {
       setMinWatchCoverage(cfg.min_watch_coverage);
       setBatchConcurrency(cfg.batch_vlm_concurrency);
     } catch (err) {
-      setSettingsError(err instanceof Error ? err.message : "Failed to load workspace settings");
+      setSettingsError(err instanceof Error ? err.message : t("queue.errLoadSettings"));
     } finally {
       setSettingsLoading(false);
     }
@@ -182,11 +194,11 @@ export const QueuePage: React.FC = () => {
     const cov = Number(minWatchCoverage);
     const conc = Math.trunc(Number(batchConcurrency));
     if (!Number.isFinite(cov) || cov < 0 || cov > 1) {
-      setSettingsError("min_watch_coverage must be between 0.0 and 1.0");
+      setSettingsError(t("queue.errMinWatchRange"));
       return;
     }
     if (!Number.isInteger(conc) || conc < 1 || conc > 32) {
-      setSettingsError("batch_vlm_concurrency must be an integer between 1 and 32");
+      setSettingsError(t("queue.errConcurrencyRange"));
       return;
     }
     setSettingsSaving(true);
@@ -200,12 +212,15 @@ export const QueuePage: React.FC = () => {
       setBatchConcurrency(updated.batch_vlm_concurrency);
       setSettingsOpen(false);
       toast.showToast({
-        message: `Workspace settings saved (min watch ${Math.round(updated.min_watch_coverage * 100)}%, VLM concurrency ${updated.batch_vlm_concurrency})`,
+        message: t("queue.toastSettingsSaved", {
+          pct: Math.round(updated.min_watch_coverage * 100),
+          concurrency: updated.batch_vlm_concurrency,
+        }),
         variant: "success",
         testId: "queue-settings-toast",
       });
     } catch (err) {
-      setSettingsError(err instanceof Error ? err.message : "Failed to save workspace settings");
+      setSettingsError(err instanceof Error ? err.message : t("queue.errSaveSettings"));
     } finally {
       setSettingsSaving(false);
     }
@@ -289,7 +304,7 @@ export const QueuePage: React.FC = () => {
       if (status === 401) {
         setAuthPromptOpen(true);
       }
-      setError(err instanceof Error ? err.message : "Failed to load queue");
+      setError(err instanceof Error ? err.message : tRef.current("queue.errLoadQueue"));
     } finally {
       if (seq === queueSeqRef.current) {
         setLoading(false);
@@ -425,7 +440,7 @@ export const QueuePage: React.FC = () => {
       const res = await listEpisodes({ status: "vlm_ready", limit: 10 });
       const candidates = (res.items ?? []).filter((ep) => ep.status === "vlm_ready");
       if (candidates.length === 0) {
-        setError("No episodes currently ready for review (vlm_ready)");
+        setError(t("queue.errNoReadyClaim"));
         return;
       }
       let lastErr: unknown = null;
@@ -445,12 +460,12 @@ export const QueuePage: React.FC = () => {
       }
       setError(
         lastErr instanceof Error
-          ? `Claim conflict: all candidates were already claimed (${lastErr.message})`
-          : "No claimable episodes currently available",
+          ? t("queue.errClaimConflict", { msg: lastErr.message })
+          : t("queue.errNoClaimable"),
       );
       void fetchQueue();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to claim episode");
+      setError(err instanceof Error ? err.message : t("queue.errClaimFailed"));
     } finally {
       setClaimingNext(false);
     }
@@ -466,7 +481,7 @@ export const QueuePage: React.FC = () => {
     setLocalActiveJob(job);
     jobStore.trackJob(job);
     toast.showToast({
-      message: `Submitted job ${job.job_id} (${job.job_type})`,
+      message: t("queue.toastJobSubmitted", { jobId: job.job_id, jobType: job.job_type }),
       variant: "info",
       testId: "queue-job-toast",
     });
@@ -475,7 +490,7 @@ export const QueuePage: React.FC = () => {
   const handleTriggerJob = async (jobType: "batch_vlm" | "render_mp4") => {
     if (selectedIds.length === 0) {
       toast.showToast({
-        message: "Select at least one episode first",
+        message: t("queue.toastSelectOne"),
         variant: "warning",
         testId: "queue-job-toast",
       });
@@ -493,11 +508,35 @@ export const QueuePage: React.FC = () => {
       }
     } catch (err) {
       toast.showToast({
-        message: err instanceof Error ? err.message : "Failed to create batch job",
+        message: err instanceof Error ? err.message : t("queue.toastCreateJobFailed"),
         variant: "error",
         testId: "queue-job-toast",
       });
     }
+  };
+
+  const handleExportSelected = () => {
+    if (selectedIds.length === 0) {
+      toast.showToast({
+        message: t("queue.toastSelectOne"),
+        variant: "warning",
+        testId: "queue-job-toast",
+      });
+      return;
+    }
+    const selectedSet = new Set(selectedIds);
+    const selectedRows = episodes.filter((ep) => selectedSet.has(ep.episode_id));
+    const statuses = Array.from(new Set(selectedRows.map((ep) => ep.status)));
+    const datasets = Array.from(new Set(selectedRows.map((ep) => ep.dataset).filter(Boolean)));
+    const params = new URLSearchParams();
+    params.set("episode_ids", selectedIds.join(","));
+    if (statuses.length > 0) {
+      params.set("include_status", statuses.join(","));
+    }
+    if (datasets.length === 1) {
+      params.set("dataset", datasets[0]);
+    }
+    navigate(`/export?${params.toString()}`);
   };
 
   const handleCancelActiveJob = async (jobId: string) => {
@@ -511,8 +550,8 @@ export const QueuePage: React.FC = () => {
         toast.showToast({
           message:
             updated.job_type === "batch_vlm"
-              ? `Job ${updated.job_id} cancelled; unfinished episode statuses reverted`
-              : `Job ${updated.job_id} (${updated.job_type}) cancelled`,
+              ? t("queue.toastVlmCancelled", { jobId: updated.job_id })
+              : t("queue.toastJobCancelled", { jobId: updated.job_id, jobType: updated.job_type }),
           variant: "warning",
           testId: "queue-job-toast",
         });
@@ -532,11 +571,9 @@ export const QueuePage: React.FC = () => {
     <div className="page-container" data-testid="queue-page">
       <div className="page-header">
         <div>
-          <h1>{isLead ? "Global QC Queue & Batch Dispatch (Lead)" : "Episode Review Queue (Reviewer)"}</h1>
+          <h1>{isLead ? t("queue.titleLead") : t("queue.titleReviewer")}</h1>
           <p className="subtitle">
-            {isLead
-              ? "Filter across all statuses, trigger batch VLM / 1080p MP4 jobs, and adjudicate reviews"
-              : "Claim episodes, refine 3-layer annotations (QC segments / success / macro stages), and flag edge cases"}
+            {isLead ? t("queue.subtitleLead") : t("queue.subtitleReviewer")}
           </p>
         </div>
 
@@ -549,7 +586,7 @@ export const QueuePage: React.FC = () => {
               onClick={handleClaimNext}
               data-testid="claim-next-btn"
             >
-              <Play size={15} /> {claimingNext ? "Claiming..." : "Claim Next Episode"}
+              <Play size={15} /> {claimingNext ? t("queue.claiming") : t("queue.claimNext")}
             </button>
           )}
           {isLead && (
@@ -560,7 +597,7 @@ export const QueuePage: React.FC = () => {
                 onClick={() => setIngestOpen(true)}
                 data-testid="open-ingest-modal-btn"
               >
-                <FolderPlus size={15} /> Ingest Data
+                <FolderPlus size={15} /> {t("queue.ingestData")}
               </button>
               <div className="settings-popover-anchor" ref={settingsWrapRef}>
                 <button
@@ -570,7 +607,7 @@ export const QueuePage: React.FC = () => {
                   data-testid="open-settings-popover-btn"
                   aria-expanded={settingsOpen}
                 >
-                  <Settings size={14} /> Workspace Settings
+                  <Settings size={14} /> {t("queue.workspaceSettings")}
                 </button>
                 {settingsOpen && (
                   <form
@@ -579,23 +616,25 @@ export const QueuePage: React.FC = () => {
                     onSubmit={(e) => void handleSaveSettings(e)}
                   >
                     <div className="section-header-row">
-                      <strong>Workspace Settings</strong>
+                      <strong>{t("queue.workspaceSettings")}</strong>
                       <button
                         type="button"
                         className="mini-btn"
                         onClick={() => setSettingsOpen(false)}
-                        aria-label="Close settings popover"
+                        aria-label={t("queue.closeSettingsAria")}
                       >
                         <X size={13} />
                       </button>
                     </div>
                     {settingsLoading ? (
-                      <div className="muted small">Loading settings...</div>
+                      <div className="muted small">{t("queue.loadingSettings")}</div>
                     ) : (
                       <>
                         <label className="field-group">
                           <span>
-                            Min Watch Coverage (min_watch_coverage · {Math.round(minWatchCoverage * 100)}%)
+                            {t("queue.minWatchCoverage", {
+                              pct: Math.round(minWatchCoverage * 100),
+                            })}
                           </span>
                           <input
                             type="number"
@@ -608,7 +647,7 @@ export const QueuePage: React.FC = () => {
                           />
                         </label>
                         <label className="field-group">
-                          <span>Batch VLM Concurrency (batch_vlm_concurrency · 1–32)</span>
+                          <span>{t("queue.batchConcurrency")}</span>
                           <input
                             type="number"
                             min={1}
@@ -626,7 +665,7 @@ export const QueuePage: React.FC = () => {
                             className="secondary-btn compact"
                             onClick={() => setSettingsOpen(false)}
                           >
-                            Cancel
+                            {t("common.cancel")}
                           </button>
                           <button
                             type="submit"
@@ -634,9 +673,21 @@ export const QueuePage: React.FC = () => {
                             disabled={settingsSaving}
                             data-testid="save-settings-btn"
                           >
-                            {settingsSaving ? "Saving..." : "Save Settings"}
+                            {settingsSaving ? t("common.saving") : t("queue.saveSettings")}
                           </button>
                         </div>
+                        <div className="settings-popover-divider" />
+                        <button
+                          type="button"
+                          className="secondary-btn compact"
+                          data-testid="settings-open-vlm-modal-btn"
+                          onClick={() => {
+                            setSettingsOpen(false);
+                            setVlmModalOpen(true);
+                          }}
+                        >
+                          <Cpu size={13} /> {t("queue.configureVlm")}
+                        </button>
                       </>
                     )}
                   </form>
@@ -645,7 +696,7 @@ export const QueuePage: React.FC = () => {
             </>
           )}
           <button type="button" className="secondary-btn" onClick={() => void fetchQueue()}>
-            <RefreshCw size={14} /> Refresh
+            <RefreshCw size={14} /> {t("common.refresh")}
           </button>
         </div>
       </div>
@@ -662,7 +713,7 @@ export const QueuePage: React.FC = () => {
                 setReviewerTab("vlm_ready");
               }}
             >
-              Ready for Review (vlm_ready)
+              {t("queue.tabReadyForReview")}
             </button>
             <button
               type="button"
@@ -672,7 +723,7 @@ export const QueuePage: React.FC = () => {
                 setReviewerTab("my_claimed");
               }}
             >
-              My Claimed ({myClaimedCount})
+              {t("queue.tabMyClaimed", { count: myClaimedCount })}
             </button>
             <button
               type="button"
@@ -682,11 +733,11 @@ export const QueuePage: React.FC = () => {
                 setReviewerTab("submitted");
               }}
             >
-              Submitted / Flagged
+              {t("queue.tabSubmittedFlagged")}
             </button>
           </div>
           <div className="reviewer-stats">
-            <span>Operator: {username}</span>
+            <span>{t("queue.operator", { username })}</span>
           </div>
         </div>
       )}
@@ -703,7 +754,7 @@ export const QueuePage: React.FC = () => {
                 setStatusFilter("");
               }}
             >
-              All ({allCount})
+              {t("queue.allCount", { count: allCount })}
             </button>
             {ALL_EPISODE_STATUSES.map((st) => (
               <button
@@ -715,7 +766,7 @@ export const QueuePage: React.FC = () => {
                   setStatusFilter(st);
                 }}
               >
-                {EPISODE_STATUS_META[st].label} ({statusCounts[st] ?? 0})
+                {getEpisodeStatusLabel(st, locale)} ({statusCounts[st] ?? 0})
               </button>
             ))}
           </div>
@@ -723,8 +774,8 @@ export const QueuePage: React.FC = () => {
           <div className="filter-toolbar" data-testid="lead-filter-toolbar">
             <input
               type="text"
-              aria-label="Search episodes"
-              placeholder="Search episode ID..."
+              aria-label={t("queue.searchAria")}
+              placeholder={t("queue.searchPlaceholder")}
               data-testid="queue-search-input"
               value={searchQuery}
               onChange={(e) => {
@@ -733,7 +784,7 @@ export const QueuePage: React.FC = () => {
               }}
             />
             <FacetCombobox
-              placeholder="Filter by dataset (dataset)"
+              placeholder={t("queue.filterDatasetPlaceholder")}
               value={datasetFilter}
               onChange={(val) => {
                 setPage(0);
@@ -742,7 +793,7 @@ export const QueuePage: React.FC = () => {
               options={facets?.datasets ?? []}
             />
             <FacetCombobox
-              placeholder="Filter by task (task_id)"
+              placeholder={t("queue.filterTaskPlaceholder")}
               value={taskFilter}
               onChange={(val) => {
                 setPage(0);
@@ -751,7 +802,7 @@ export const QueuePage: React.FC = () => {
               options={facets?.task_ids ?? []}
             />
             <select
-              aria-label="Adapter filter"
+              aria-label={t("queue.adapterFilterAria")}
               data-testid="adapter-filter-select"
               value={adapterFilter}
               onChange={(e) => {
@@ -759,7 +810,7 @@ export const QueuePage: React.FC = () => {
                 setAdapterFilter(e.target.value);
               }}
             >
-              <option value="">All Adapters</option>
+              <option value="">{t("queue.allAdapters")}</option>
               {adapterOptions.map((ad) => (
                 <option key={ad} value={ad}>
                   {ad}
@@ -767,19 +818,19 @@ export const QueuePage: React.FC = () => {
               ))}
             </select>
             <select
-              aria-label="Outcome filter"
+              aria-label={t("queue.outcomeFilterAria")}
               value={passedFilter}
               onChange={(e) => {
                 setPage(0);
                 setPassedFilter(e.target.value as "all" | "true" | "false");
               }}
             >
-              <option value="all">All Outcomes</option>
-              <option value="true">Passed only (passed=true)</option>
-              <option value="false">Failed only (passed=false)</option>
+              <option value="all">{t("queue.allOutcomes")}</option>
+              <option value="true">{t("queue.passedOnly")}</option>
+              <option value="false">{t("queue.failedOnly")}</option>
             </select>
             <select
-              aria-label="Sort field"
+              aria-label={t("queue.sortFieldAria")}
               data-testid="queue-sort-by"
               value={sortBy}
               onChange={(e) => {
@@ -787,15 +838,15 @@ export const QueuePage: React.FC = () => {
                 setSortBy(e.target.value as EpisodeSortField);
               }}
             >
-              <option value="episode_id">Sort: Episode ID</option>
-              <option value="updated_at">Sort: Updated At</option>
-              <option value="duration_s">Sort: Duration</option>
-              <option value="cut_ratio">Sort: Cut Ratio</option>
-              <option value="mask_ratio">Sort: Mask Ratio</option>
-              <option value="badcase_count">Sort: Badcase Count</option>
+              <option value="episode_id">{t("queue.sortEpisodeId")}</option>
+              <option value="updated_at">{t("queue.sortUpdatedAt")}</option>
+              <option value="duration_s">{t("queue.sortDuration")}</option>
+              <option value="cut_ratio">{t("queue.sortCutRatio")}</option>
+              <option value="mask_ratio">{t("queue.sortMaskRatio")}</option>
+              <option value="badcase_count">{t("queue.sortBadcaseCount")}</option>
             </select>
             <select
-              aria-label="Sort direction"
+              aria-label={t("queue.sortDirAria")}
               data-testid="queue-sort-dir"
               value={sortDir}
               onChange={(e) => {
@@ -803,8 +854,8 @@ export const QueuePage: React.FC = () => {
                 setSortDir(e.target.value as SortDir);
               }}
             >
-              <option value="asc">Asc</option>
-              <option value="desc">Desc</option>
+              <option value="asc">{t("queue.sortAsc")}</option>
+              <option value="desc">{t("queue.sortDesc")}</option>
             </select>
             <label className="checkbox-inline">
               <input
@@ -815,24 +866,24 @@ export const QueuePage: React.FC = () => {
                   setDowngradedOnly(e.target.checked);
                 }}
               />
-              <span>Guardrail downgraded only</span>
+              <span>{t("queue.downgradedOnly")}</span>
             </label>
           </div>
 
           <div className="batch-job-bar" data-testid="lead-batch-controls">
-            <span>Selected: {selectedIds.length}</span>
+            <span>{t("queue.selectedCount", { count: selectedIds.length })}</span>
             <select
-              aria-label="Rerun stage"
+              aria-label={t("queue.rerunStageAria")}
               data-testid="batch-vlm-stage-select"
               value={vlmStage}
               onChange={(e) => setVlmStage(e.target.value)}
             >
-              <option value="">Full DAG (S1–S5)</option>
-              <option value="s1_grounding">Rerun S1 only (refresh 2D boxes, reuse S2-S5 cache)</option>
-              <option value="s3_s4">Rerun S3/S4 only (Discover + Verify)</option>
-              <option value="s3_discover">Rerun S3 only (Discover)</option>
-              <option value="s4_verify">Rerun S4 only (Verify)</option>
-              <option value="s5_success">Rerun S5 only (Success)</option>
+              <option value="">{t("queue.stageFullDag")}</option>
+              <option value="s1_grounding">{t("queue.stageS1Only")}</option>
+              <option value="s3_s4">{t("queue.stageS3S4")}</option>
+              <option value="s3_discover">{t("queue.stageS3Only")}</option>
+              <option value="s4_verify">{t("queue.stageS4Only")}</option>
+              <option value="s5_success">{t("queue.stageS5Only")}</option>
             </select>
             <button
               type="button"
@@ -840,7 +891,7 @@ export const QueuePage: React.FC = () => {
               onClick={() => void handleTriggerJob("batch_vlm")}
               data-testid="batch-vlm-btn"
             >
-              <Play size={14} /> Run Batch VLM
+              <Play size={14} /> {t("queue.runBatchVlm")}
             </button>
             <button
               type="button"
@@ -848,7 +899,21 @@ export const QueuePage: React.FC = () => {
               onClick={() => void handleTriggerJob("render_mp4")}
               data-testid="batch-render-btn"
             >
-              <Video size={14} /> Batch Render 1080p MP4
+              <Video size={14} /> {t("queue.batchRenderMp4")}
+            </button>
+            <button
+              type="button"
+              className="accent-btn compact"
+              disabled={selectedIds.length === 0}
+              onClick={handleExportSelected}
+              data-testid="queue-export-selected-btn"
+              title={
+                selectedIds.length === 0
+                  ? t("queue.exportSelectedEmptyTitle")
+                  : t("queue.exportSelectedTitle", { count: selectedIds.length })
+              }
+            >
+              <PackageCheck size={14} /> {t("queue.exportSelected", { count: selectedIds.length })}
             </button>
           </div>
 
@@ -856,15 +921,23 @@ export const QueuePage: React.FC = () => {
             <div className="job-progress-banner" data-testid="active-job-banner">
               <div>
                 <strong>
-                  Job {activeJob.job_id} ({activeJob.job_type})
+                  {t("queue.jobBannerTitle", { jobId: activeJob.job_id, jobType: activeJob.job_type })}
                 </strong>{" "}
-                — Status: {activeJob.status} ({activeJob.progress_done}/{activeJob.progress_total})
+                —{" "}
+                {t("queue.jobBannerStatus", {
+                  status: activeJob.status,
+                  done: activeJob.progress_done,
+                  total: activeJob.progress_total,
+                })}
                 {activeJob.summary?.errors && activeJob.summary.errors.length > 0 && (
                   <div className="small delta-neg" data-testid="active-job-error-summary">
-                    Error: {activeJob.summary.errors[0].episode_id ? `${activeJob.summary.errors[0].episode_id}: ` : ""}
-                    {activeJob.summary.errors[0].error || "Job execution failed"}
+                    {t("common.error")}:{" "}
+                    {activeJob.summary.errors[0].episode_id
+                      ? `${activeJob.summary.errors[0].episode_id}: `
+                      : ""}
+                    {activeJob.summary.errors[0].error || t("queue.jobExecFailed")}
                     {activeJob.summary.errors.length > 1
-                      ? ` (+${activeJob.summary.errors.length - 1} more)`
+                      ? ` (${t("common.more", { count: activeJob.summary.errors.length - 1 })})`
                       : ""}
                   </div>
                 )}
@@ -876,7 +949,7 @@ export const QueuePage: React.FC = () => {
                     className="danger-btn compact"
                     onClick={() => void handleCancelActiveJob(activeJob.job_id)}
                   >
-                    Cancel Job
+                    {t("queue.cancelJob")}
                   </button>
                 )}
                 {activeJob.status === "completed" &&
@@ -887,7 +960,10 @@ export const QueuePage: React.FC = () => {
                       href={jobStore.artifactDownloadUrl(activeJob.job_id, idx)}
                       download={art.name || undefined}
                     >
-                      <Download size={13} /> Download {art.name || `Artifact #${idx + 1}`}
+                      <Download size={13} />{" "}
+                      {t("queue.downloadArtifact", {
+                        name: art.name || t("queue.artifactFallback", { index: idx + 1 }),
+                      })}
                     </a>
                   ))}
                 {(activeJob.status === "completed" ||
@@ -898,9 +974,9 @@ export const QueuePage: React.FC = () => {
                     className="mini-btn"
                     data-testid="dismiss-active-job-btn"
                     onClick={() => setLocalActiveJob(null)}
-                    aria-label="Dismiss job banner"
+                    aria-label={t("queue.dismissBannerAria")}
                   >
-                    <X size={13} /> Dismiss
+                    <X size={13} /> {t("common.dismiss")}
                   </button>
                 )}
               </div>
@@ -919,7 +995,7 @@ export const QueuePage: React.FC = () => {
                 <th>
                   <input
                     type="checkbox"
-                    aria-label="Select all"
+                    aria-label={t("queue.selectAllAria")}
                     checked={
                       displayRows.length > 0 &&
                       displayRows.every((r) => selectedIds.includes(r.episode_id))
@@ -938,14 +1014,14 @@ export const QueuePage: React.FC = () => {
                     data-testid="sort-col-episode_id"
                     onClick={() => toggleSortColumn("episode_id")}
                   >
-                    Episode ID {renderSortIcon("episode_id")}
+                    {t("queue.colEpisodeId")} {renderSortIcon("episode_id")}
                   </button>
                 ) : (
-                  "Episode ID"
+                  t("queue.colEpisodeId")
                 )}
               </th>
-              <th>Task / Adapter</th>
-              <th>Status</th>
+              <th>{t("queue.colTaskAdapter")}</th>
+              <th>{t("queue.colStatus")}</th>
               <th>
                 {isLead ? (
                   <button
@@ -954,13 +1030,13 @@ export const QueuePage: React.FC = () => {
                     data-testid="sort-col-duration_s"
                     onClick={() => toggleSortColumn("duration_s")}
                   >
-                    Duration / FPS {renderSortIcon("duration_s")}
+                    {t("queue.colDurationFps")} {renderSortIcon("duration_s")}
                   </button>
                 ) : (
-                  "Duration / FPS"
+                  t("queue.colDurationFps")
                 )}
               </th>
-              <th>Outcome</th>
+              <th>{t("queue.colOutcome")}</th>
               <th>
                 {isLead ? (
                   <div className="sort-col-group">
@@ -970,7 +1046,7 @@ export const QueuePage: React.FC = () => {
                       data-testid="sort-col-badcase_count"
                       onClick={() => toggleSortColumn("badcase_count")}
                     >
-                      Badcase {renderSortIcon("badcase_count")}
+                      {t("queue.colBadcase")} {renderSortIcon("badcase_count")}
                     </button>
                     <span>/</span>
                     <button
@@ -979,12 +1055,12 @@ export const QueuePage: React.FC = () => {
                       data-testid="sort-col-cut_ratio"
                       onClick={() => toggleSortColumn("cut_ratio")}
                     >
-                      Cut {renderSortIcon("cut_ratio")}
+                      {t("queue.colCut")} {renderSortIcon("cut_ratio")}
                     </button>
-                    <span>/ Mask</span>
+                    <span>/ {t("queue.colMask")}</span>
                   </div>
                 ) : (
-                  "Badcase / Cut / Mask"
+                  t("queue.colBadcaseCutMask")
                 )}
               </th>
               {isLead && (
@@ -995,39 +1071,38 @@ export const QueuePage: React.FC = () => {
                     data-testid="sort-col-updated_at"
                     onClick={() => toggleSortColumn("updated_at")}
                   >
-                    Updated {renderSortIcon("updated_at")}
+                    {t("queue.colUpdated")} {renderSortIcon("updated_at")}
                   </button>
                 </th>
               )}
-              <th>Claimed By</th>
-              <th>Action</th>
+              <th>{t("queue.colClaimedBy")}</th>
+              <th>{t("queue.colAction")}</th>
             </tr>
           </thead>
           <tbody>
             {loading && displayRows.length === 0 ? (
               <tr>
                 <td colSpan={isLead ? 10 : 8} className="empty-cell">
-                  Loading...
+                  {t("common.loading")}
                 </td>
               </tr>
             ) : displayRows.length === 0 ? (
               <tr>
                 <td colSpan={isLead ? 10 : 8} className="empty-cell">
-                  No matching episodes found
+                  {t("queue.emptyTable")}
                 </td>
               </tr>
             ) : (
               displayRows.map((ep) => {
-                const meta = EPISODE_STATUS_META[ep.status] ?? {
-                  label: ep.status,
-                  color: "#64748b",
-                };
+                const meta = EPISODE_STATUS_META[ep.status];
+                const statusLabel = getEpisodeStatusLabel(ep.status, locale);
+                const statusColor = meta?.color ?? "#64748b";
                 const passedText =
                   ep.resolved_passed === null || ep.resolved_passed === undefined
-                    ? "Unsure"
+                    ? t("queue.outcomeUnsure")
                     : ep.resolved_passed
-                      ? "Pass"
-                      : "Fail";
+                      ? t("queue.outcomePass")
+                      : t("queue.outcomeFail");
                 return (
                   <tr key={ep.episode_id} data-testid={`episode-row-${ep.episode_id}`}>
                     {isLead && (
@@ -1045,11 +1120,14 @@ export const QueuePage: React.FC = () => {
                       <div className="muted small">{ep.adapter_type}</div>
                     </td>
                     <td>
-                      <span className="status-tag" style={{ backgroundColor: meta.color }}>
-                        {meta.label}
+                      <span className="status-tag" style={{ backgroundColor: statusColor }}>
+                        {statusLabel}
                       </span>
                       {ep.guardrail_downgraded && (
-                        <span className="inline-warn" title="Contains guardrail-downgraded segments">
+                        <span
+                          className="inline-warn"
+                          title={t("queue.guardrailDowngradedTitle")}
+                        >
                           <ShieldAlert size={13} />
                         </span>
                       )}
@@ -1059,14 +1137,17 @@ export const QueuePage: React.FC = () => {
                     </td>
                     <td>{passedText}</td>
                     <td>
-                      {ep.badcase_count ?? 0} segs · cut {((ep.cut_ratio ?? 0) * 100).toFixed(0)}% ·
-                      mask {((ep.mask_ratio ?? 0) * 100).toFixed(0)}%
+                      {t("queue.rowStats", {
+                        segs: ep.badcase_count ?? 0,
+                        cut: ((ep.cut_ratio ?? 0) * 100).toFixed(0),
+                        mask: ((ep.mask_ratio ?? 0) * 100).toFixed(0),
+                      })}
                     </td>
                     {isLead && <td className="mono small muted">{formatUpdatedAt(ep.updated_at)}</td>}
                     <td>{ep.claimed_by ?? "—"}</td>
                     <td>
                       <Link className="link-btn" to={`/review/${encodeEpPath(ep.episode_id)}`}>
-                        Open Studio
+                        {t("queue.openStudio")}
                       </Link>
                     </td>
                   </tr>
@@ -1086,11 +1167,14 @@ export const QueuePage: React.FC = () => {
             onClick={() => setPage((p) => Math.max(0, p - 1))}
             data-testid="queue-prev-page"
           >
-            Previous
+            {t("queue.prevPage")}
           </button>
           <span className="muted small">
-            Page {page + 1} / {Math.max(1, Math.ceil(totalEpisodes / PAGE_SIZE))} ({totalEpisodes}{" "}
-            total)
+            {t("queue.pageSummary", {
+              current: page + 1,
+              pages: Math.max(1, Math.ceil(totalEpisodes / PAGE_SIZE)),
+              total: totalEpisodes,
+            })}
           </span>
           <button
             type="button"
@@ -1099,17 +1183,20 @@ export const QueuePage: React.FC = () => {
             onClick={() => setPage((p) => p + 1)}
             data-testid="queue-next-page"
           >
-            Next
+            {t("queue.nextPage")}
           </button>
         </div>
       )}
 
       {isLead && (
-        <IngestModal
-          open={ingestOpen}
-          onClose={() => setIngestOpen(false)}
-          onJobCreated={handleTrackSubmittedJob}
-        />
+        <>
+          <IngestModal
+            open={ingestOpen}
+            onClose={() => setIngestOpen(false)}
+            onJobCreated={handleTrackSubmittedJob}
+          />
+          <VlmSettingsModal open={vlmModalOpen} onClose={() => setVlmModalOpen(false)} />
+        </>
       )}
       {toast.StandaloneHost}
     </div>

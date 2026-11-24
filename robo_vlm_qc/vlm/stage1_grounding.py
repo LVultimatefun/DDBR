@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Sequence
@@ -13,7 +14,7 @@ import numpy as np
 from ..config import ConfigManager
 from ..io.base import EpisodeView
 from ..models.annotation import GroundingKeyframe, GroundingResult, GroundingTrack
-from ..models.taxonomy import TaskSpec
+from ..models.taxonomy import GroundingObjectSpec, TaskSpec
 from .client import (
     BudgetExceeded,
     BudgetTracker,
@@ -40,6 +41,150 @@ STATIC_OBJECT_DEFAULTS: dict[str, str] = {
     "source_tray": "stationary",
     "target_tray": "stationary",
 }
+
+_NON_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def slugify_object_id(raw: str, *, fallback_idx: int = 1) -> str:
+    """Convert an arbitrary object name into a clean snake_case GroundingObjectSpec id."""
+    slug = _NON_SLUG_RE.sub("_", str(raw or "").strip().lower()).strip("_")
+    if not slug:
+        slug = f"object_{max(1, int(fallback_idx))}"
+    if not slug[0].isalnum():
+        slug = f"obj_{slug}"
+    return slug[:48]
+
+
+def normalize_custom_objects(custom_objects: Sequence[str] | None) -> list[str]:
+    """Return deduplicated, stripped custom object names preserving input order."""
+    if not custom_objects:
+        return []
+    out: list[str] = []
+    seen_low: set[str] = set()
+    for item in custom_objects:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        low = cleaned.lower()
+        if low in seen_low:
+            continue
+        seen_low.add(low)
+        out.append(cleaned)
+    return out
+
+
+def build_custom_grounding_objects(
+    custom_objects: Sequence[str] | None,
+) -> list[GroundingObjectSpec]:
+    """Convert user-specified object names into slugified GroundingObjectSpec entries."""
+    names = normalize_custom_objects(custom_objects)
+    specs: list[GroundingObjectSpec] = []
+    used_ids: set[str] = set()
+    for idx, name in enumerate(names, start=1):
+        base_id = slugify_object_id(name, fallback_idx=idx)
+        oid = base_id
+        suffix = 2
+        while oid in used_ids:
+            oid = f"{base_id}_{suffix}"
+            suffix += 1
+        used_ids.add(oid)
+        specs.append(
+            GroundingObjectSpec(
+                id=oid,
+                name=name,
+                desc=f"User-specified target object: {name}",
+                tag_pos="bottom" if oid in STATIC_OBJECT_DEFAULTS else "top",
+                is_static=oid in STATIC_OBJECT_DEFAULTS,
+            )
+        )
+    return specs
+
+
+def _select_discovery_indices(n_frames: int, max_frames: int = 5) -> list[int]:
+    """Pick 4-6 (bounded by n_frames) evenly spaced frame indices for Pass-0 object discovery."""
+    if n_frames <= 0:
+        return []
+    target = min(n_frames, max(2, min(6, int(max_frames))))
+    raw = np.linspace(0, n_frames - 1, target)
+    seen: set[int] = set()
+    indices: list[int] = []
+    for v in raw:
+        idx = int(round(float(v)))
+        idx = max(0, min(n_frames - 1, idx))
+        if idx not in seen:
+            seen.add(idx)
+            indices.append(idx)
+    return indices
+
+
+def _parse_canonical_objects_response(
+    resp: Any,
+    *,
+    max_objects: int = 4,
+) -> list[GroundingObjectSpec]:
+    """Parse Pass-0 canonical object discovery JSON cleanly; return [] on legacy/mock payloads."""
+    if not isinstance(resp, dict):
+        return []
+
+    raw_list: Any = resp.get("canonical_objects")
+    if not isinstance(raw_list, list):
+        # Accept list-form "objects" only (NEVER dict-form legacy {"objects": {oid: {visible, bbox}}})
+        cand_objs = resp.get("objects")
+        if isinstance(cand_objs, list):
+            raw_list = cand_objs
+        else:
+            return []
+
+    specs: list[GroundingObjectSpec] = []
+    used_ids: set[str] = set()
+    cap = max(1, min(6, int(max_objects)))
+
+    for idx, item in enumerate(raw_list, start=1):
+        if len(specs) >= cap:
+            break
+        if isinstance(item, str):
+            name = item.strip()
+            if not name:
+                continue
+            oid = slugify_object_id(name, fallback_idx=idx)
+            desc = f"Discovered task-relevant object: {name}"
+            is_static = oid in STATIC_OBJECT_DEFAULTS
+            tag_pos = "bottom" if is_static else "top"
+        elif isinstance(item, dict):
+            # Guard against accidental frame-bbox dicts
+            if ("bbox" in item or "bbox_norm_1000" in item) and "name" not in item and "id" not in item:
+                continue
+            raw_id = str(item.get("id") or item.get("object_id") or "").strip()
+            raw_name = str(item.get("name") or item.get("label") or raw_id).strip()
+            if not raw_id and not raw_name:
+                continue
+            oid = slugify_object_id(raw_id or raw_name, fallback_idx=idx)
+            name = raw_name or oid.replace("_", " ").title()
+            desc = str(item.get("desc") or item.get("description") or "").strip() or name
+            raw_static = item.get("is_static")
+            if raw_static is None:
+                raw_static = item.get("is_static_container")
+            is_static = bool(raw_static) if isinstance(raw_static, bool) else (oid in STATIC_OBJECT_DEFAULTS)
+            raw_tp = str(item.get("tag_pos") or "").strip().lower()
+            tag_pos = raw_tp if raw_tp in ("top", "bottom") else ("bottom" if is_static else "top")
+        else:
+            continue
+
+        if oid in used_ids:
+            continue
+        used_ids.add(oid)
+        specs.append(
+            GroundingObjectSpec(
+                id=oid,
+                name=name,
+                desc=desc,
+                tag_pos=tag_pos,  # type: ignore[arg-type]
+                is_static=is_static,
+            )
+        )
+    return specs
 
 
 def _resolve_s1_cfg(cfg: ConfigManager | dict[str, Any] | None) -> dict[str, Any]:
@@ -381,6 +526,7 @@ def run_stage1_grounding(
     prompt_builder: PromptBuilder | None = None,
     budget: BudgetTracker | None = None,
     cancel_event: threading.Event | None = None,
+    custom_objects: Sequence[str] | None = None,
 ) -> GroundingResult:
     """Execute Stage 1 HD 2D grounding + optional BAFT local frame-level 2D tracking."""
     ev = view or episode_view
@@ -448,8 +594,80 @@ def run_stage1_grounding(
     jitter_tol_px = float(s1_cfg.get("static_jitter_tol_px_1280", 85.0)) * (ref_w / 1280.0)
 
     pb = prompt_builder or (PromptBuilder(cm) if cm is not None else None)
+
+    _check_cancelled()
+    raw_frames = ev.media.read_frames_batch(main_cam, times_s)
+    _check_cancelled()
+    resized_frames = [_resize_to_height(fr, ego_h) for fr in raw_frames]
+    img_h, img_w = resized_frames[0].shape[:2] if resized_frames else (ref_h, ref_w)
+    del raw_frames
+
+    # Lock canonical grounding object vocabulary:
+    # 1) explicit custom_objects override, else
+    # 2) preconfigured task.grounding_objects, else
+    # 3) Pass-0 lightweight canonical discovery on 4-6 evenly spaced overview frames
+    effective_task = t_spec
+    custom_specs = build_custom_grounding_objects(custom_objects)
+    if custom_specs:
+        effective_task = t_spec.model_copy(update={"grounding_objects": custom_specs})
+    elif (
+        not t_spec.grounding_objects
+        and len(resized_frames) > 1
+        and bool(s1_cfg.get("canonical_discovery_enabled", True))
+    ):
+        disc_indices = _select_discovery_indices(
+            len(resized_frames),
+            max_frames=int(s1_cfg.get("canonical_discovery_frames", 5)),
+        )
+        if disc_indices:
+            _check_cancelled()
+            if pb is not None:
+                disc_sys, disc_usr = pb.build_s1_discovery(
+                    task=t_spec, camera_roles=ev.camera_roles
+                )
+            else:
+                disc_sys = (
+                    "You are an embodied manipulation visual grounding expert (2D Grounding canonical vocabulary discovery). "
+                    "Inspect the overview keyframes and select 1 to 4 task-relevant physical objects prioritized by manipulator/hand interaction and target container/receptacle. "
+                    'Output strict JSON only: {"canonical_objects": [{"id": "snake_case_id", "name": str, "desc": str, "is_static": bool}]}.'
+                )
+                disc_usr = (
+                    f"Task: {t_spec.task_id}\n"
+                    "Identify 1 to 4 canonical physical objects actively manipulated by robot arms/grippers or human hands plus target receptacle."
+                )
+            disc_frames = [resized_frames[i] for i in disc_indices]
+            disc_times = [times_s[i] for i in disc_indices]
+            try:
+                disc_resp = cl.chat_json(
+                    stage="s1_grounding",
+                    system_prompt=disc_sys,
+                    user_prompt=disc_usr,
+                    images=disc_frames,
+                    timestamps_s=disc_times,
+                    labels=[f"overview_{i}" for i in range(len(disc_frames))],
+                    thinking=False,
+                    thinking_budget=0,
+                    max_tokens=min(800, max_tokens),
+                    jpeg_quality=jpeg_q,
+                    budget=budget,
+                )
+                _check_cancelled()
+                discovered_specs = _parse_canonical_objects_response(
+                    disc_resp,
+                    max_objects=int(s1_cfg.get("canonical_discovery_max_objects", 4)),
+                )
+                if discovered_specs:
+                    effective_task = t_spec.model_copy(
+                        update={"grounding_objects": discovered_specs}
+                    )
+            except (BudgetExceeded, VlmCancelledError):
+                raise
+            except Exception:
+                # Fall back seamlessly to open-vocab grounding if Pass-0 returns unexpected/failed response
+                _check_cancelled()
+
     if pb is not None:
-        sys_p, usr_p = pb.build_s1(task=t_spec, camera_roles=ev.camera_roles)
+        sys_p, usr_p = pb.build_s1(task=effective_task, camera_roles=ev.camera_roles)
     else:
         if batch_size > 1:
             sys_p = (
@@ -464,16 +682,9 @@ def run_stage1_grounding(
                 'Output strict JSON only: {"objects": {obj_id: {"visible": bool, "bbox": [x1,y1,x2,y2], "state": str, "status_kind": "neutral|warn|error|good"}}}.'
             )
         obj_lines = "\n".join(
-            f"- {g.id}: {g.name} ({g.desc})" for g in t_spec.grounding_objects
+            f"- {g.id}: {g.name} ({g.desc})" for g in effective_task.grounding_objects
         ) or "- target_object: Target Object (primary manipulated object)"
-        usr_p = f"Task: {t_spec.task_id}\nTarget objects to ground:\n{obj_lines}"
-
-    _check_cancelled()
-    raw_frames = ev.media.read_frames_batch(main_cam, times_s)
-    _check_cancelled()
-    resized_frames = [_resize_to_height(fr, ego_h) for fr in raw_frames]
-    img_h, img_w = resized_frames[0].shape[:2] if resized_frames else (ref_h, ref_w)
-    del raw_frames
+        usr_p = f"Task: {effective_task.task_id}\nTarget objects to ground:\n{obj_lines}"
 
     def _call_batch(
         batch: Sequence[tuple[int, float, np.ndarray]],
@@ -527,9 +738,9 @@ def run_stage1_grounding(
 
     _check_cancelled()
 
-    # Collect all seen object IDs + configured object metadata
-    spec_by_id = {g.id: g for g in t_spec.grounding_objects}
-    all_oids: list[str] = [g.id for g in t_spec.grounding_objects]
+    # Collect all seen object IDs + configured/discovered/custom object metadata
+    spec_by_id = {g.id: g for g in effective_task.grounding_objects}
+    all_oids: list[str] = [g.id for g in effective_task.grounding_objects]
     for idx in sorted(per_frame_objs):
         for oid in per_frame_objs[idx]:
             if isinstance(oid, str) and oid and oid not in all_oids:

@@ -97,6 +97,7 @@ export interface MacroStage {
   label: string;
   label_en: string;
   summary: string;
+  instruction?: string;
   color_rgb: [number, number, number];
 }
 
@@ -379,6 +380,7 @@ export interface FewShotItem extends FewShotCreateRequest {
 export type ExportFormat = "lerobot_v3" | "h5_clean" | "zero_copy_index" | "viz_mp4";
 export type ExportRecipeName = "bc_clean" | "recovery_plus" | "badcase_pairs";
 export type SmoothTailMode = "on_jump" | "always" | "never";
+export type StateSchemaMode = "auto" | "preserve_native" | "canonical_81d";
 
 export interface ExportRecipe {
   name: ExportRecipeName;
@@ -391,6 +393,8 @@ export interface ExportRecipe {
   context_window_s: number;
   dataset_filter: string | null;
   task_filter: string | null;
+  state_schema_mode?: StateSchemaMode;
+  split_by_subtask?: boolean;
 }
 
 export interface ExportRequest {
@@ -404,6 +408,9 @@ export interface ExportRequest {
   context_window_s?: number;
   dataset_filter?: string | null;
   task_filter?: string | null;
+  episode_ids?: string[] | null;
+  state_schema_mode?: StateSchemaMode;
+  split_by_subtask?: boolean;
 }
 
 export interface ExportEpisodeEntry {
@@ -490,10 +497,13 @@ export interface CreateJobRequest {
   fresh?: boolean;
   concurrency?: number;
   is_eval_sandbox?: boolean;
+  custom_objects?: string[] | null;
   export_params?: ExportRequest | Record<string, unknown>;
   eval_params?: EvalRunRequest | Record<string, unknown>;
   ingest_params?: IngestJobParams | Record<string, unknown>;
 }
+
+export type JobCreatePayload = CreateJobRequest;
 
 export type PromptStageKey =
   | "s1_grounding"
@@ -799,6 +809,72 @@ export interface CheckSpliceResponse {
 export interface WorkspaceSettings {
   min_watch_coverage: number;
   batch_vlm_concurrency: number;
+}
+
+export interface InferSubtasksRequest {
+  qc_segments: QcSegment[];
+  macro_stages?: MacroStage[];
+  custom_hint?: string | null;
+}
+
+export interface InferSubtasksResponse {
+  episode_id: string;
+  macro_stages: MacroStage[];
+  used_grounding: boolean;
+  used_segments_count: number;
+}
+
+export type VlmProvider = "openai_compat" | "gemini";
+export type VlmThinkingMode = "auto" | "dashscope" | "disabled";
+
+export interface VlmPresetItem {
+  id: string;
+  label?: string;
+  name?: string;
+  provider: VlmProvider;
+  base_url: string;
+  api_key_env: string;
+  thinking_mode: VlmThinkingMode;
+  default_model?: string;
+  stage_models: Record<string, string>;
+  description?: string;
+}
+
+export interface VlmSettingsResponse {
+  provider: VlmProvider;
+  base_url: string;
+  api_key_env: string;
+  api_key_configured: boolean;
+  api_key_masked: string;
+  thinking_mode: VlmThinkingMode;
+  stage_models: Record<string, string>;
+  presets: VlmPresetItem[];
+}
+
+export interface VlmSettingsUpdatePayload {
+  provider?: VlmProvider;
+  base_url?: string;
+  api_key_env?: string;
+  api_key?: string;
+  thinking_mode?: VlmThinkingMode;
+  default_model?: string;
+  stage_models?: Record<string, string>;
+}
+
+export interface VlmTestPayload {
+  provider?: VlmProvider;
+  base_url?: string;
+  api_key_env?: string;
+  api_key?: string;
+  model?: string;
+  thinking_mode?: VlmThinkingMode;
+}
+
+export interface VlmTestResponse {
+  ok: boolean;
+  latency_ms: number;
+  model: string;
+  detail: string;
 }
 
 export interface VlmRunSummary {

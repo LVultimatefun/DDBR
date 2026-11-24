@@ -21,6 +21,7 @@ import type {
   QcSegment,
 } from "../api/types";
 import { useAuth } from "../stores/authStore";
+import { useI18n } from "../stores/i18nStore";
 import {
   computeContainRect,
   computeLabelPlacement,
@@ -129,6 +130,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
   controllerRef,
 }) => {
   const { token } = useAuth();
+  const { t } = useI18n();
   const primaryCamera = useMemo(() => {
     const mainCam = cameras.find((c) => c.role === "main" || c.role === "front");
     return mainCam?.name ?? cameras[0]?.name ?? "main";
@@ -139,6 +141,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
   const [playing, setPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState<number>(1);
   const [showGrounding, setShowGrounding] = useState<boolean>(true);
+  const [hiddenObjectIds, setHiddenObjectIds] = useState<Record<string, boolean>>({});
   const [hdFrameMode, setHdFrameMode] = useState<boolean>(false);
   const [videoFailed, setVideoFailed] = useState<boolean>(false);
   const [failedSecondary, setFailedSecondary] = useState<Record<string, boolean>>({});
@@ -175,6 +178,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
   const hdFrameModeRef = useRef<boolean>(hdFrameMode);
   const videoFailedRef = useRef<boolean>(videoFailed);
   const showGroundingRef = useRef<boolean>(showGrounding);
+  const hiddenObjectIdsRef = useRef<Record<string, boolean>>(hiddenObjectIds);
   const groundingRef = useRef<GroundingResult>(grounding);
   const selectedCameraRef = useRef<string>(selectedCamera);
   const primaryCameraRef = useRef<string>(primaryCamera);
@@ -190,6 +194,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
   hdFrameModeRef.current = hdFrameMode;
   videoFailedRef.current = videoFailed;
   showGroundingRef.current = showGrounding;
+  hiddenObjectIdsRef.current = hiddenObjectIds;
   groundingRef.current = grounding;
   selectedCameraRef.current = selectedCamera;
   primaryCameraRef.current = primaryCamera;
@@ -205,6 +210,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     setPlaying(false);
     setVideoFailed(false);
     setFailedSecondary({});
+    setHiddenObjectIds((prev) => (Object.keys(prev).length === 0 ? prev : {}));
     restoringTimeRef.current = null;
     shouldResumeAfterLoadRef.current = false;
     if (videoRef.current && !videoRef.current.paused) {
@@ -276,17 +282,20 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     [episodeId, selectedCamera, currentTime, token],
   );
 
-  const triggerCutSkipFlash = useCallback((seg: QcSegment) => {
-    const span = Math.max(0.1, seg.t_end - seg.t_start).toFixed(1);
-    setCutSkipFlash(`✂ Skipped cut_clean (${span}s)`);
-    if (flashTimerRef.current !== null) {
-      clearTimeout(flashTimerRef.current);
-    }
-    flashTimerRef.current = setTimeout(() => {
-      setCutSkipFlash(null);
-      flashTimerRef.current = null;
-    }, 1500);
-  }, []);
+  const triggerCutSkipFlash = useCallback(
+    (seg: QcSegment) => {
+      const span = Math.max(0.1, seg.t_end - seg.t_start).toFixed(1);
+      setCutSkipFlash(t("player.cutSkipFlash", { span }));
+      if (flashTimerRef.current !== null) {
+        clearTimeout(flashTimerRef.current);
+      }
+      flashTimerRef.current = setTimeout(() => {
+        setCutSkipFlash(null);
+        flashTimerRef.current = null;
+      }, 1500);
+    },
+    [t],
+  );
 
   const syncSecondaryVideos = useCallback(
     (targetT: number, shouldPlay: boolean | null, rate: number) => {
@@ -620,12 +629,14 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
       canvas.dataset.contentRect = rectSig;
     }
 
-    const tracks = Object.values(g.object_tracks_2d);
+    const trackEntries = Object.entries(g.object_tracks_2d);
     const compactPane = contentRect.width < 360;
     const fontSize = compactPane ? 11 : 12;
     const pillH = compactPane ? 17 : 19;
 
-    for (const track of tracks) {
+    for (const [trackKey, track] of trackEntries) {
+      const objId = track.object_id || trackKey;
+      if (hiddenObjectIdsRef.current[objId]) continue;
       const sample = sampleTrackBoxAt(g, track, tS);
       if (!sample) continue;
 
@@ -685,6 +696,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     currentTime,
     grounding,
     showGrounding,
+    hiddenObjectIds,
     selectedCamera,
     primaryCamera,
     primaryCameraSpec,
@@ -873,7 +885,20 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
     );
   };
 
-  const trackCount = Object.keys(grounding?.object_tracks_2d ?? {}).length;
+  const groundingTracks = useMemo(
+    () =>
+      Object.entries(grounding?.object_tracks_2d ?? {}).map(([key, track]) => ({
+        id: track.object_id || key,
+        name: track.name || track.object_id || key,
+        track,
+      })),
+    [grounding],
+  );
+  const trackCount = groundingTracks.length;
+  const hasHiddenObjects = useMemo(
+    () => groundingTracks.some((item) => Boolean(hiddenObjectIds[item.id])),
+    [groundingTracks, hiddenObjectIds],
+  );
   const groundedCamera = useMemo(
     () => resolveGroundedCameraName(grounding, primaryCamera),
     [grounding, primaryCamera],
@@ -889,7 +914,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
   return (
     <div className="studio-player-card" data-testid="studio-player">
       <div className="player-topbar">
-        <div className="camera-tabs" role="tablist" aria-label="Camera views">
+        <div className="camera-tabs" role="tablist" aria-label={t("player.cameraViewsAria")}>
           {cameras.map((cam) => (
             <button
               key={cam.name}
@@ -908,15 +933,20 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
 
         <div className="player-toggles">
           {/* View Mode Switcher: Single / PiP / 2x2 Grid */}
-          <div className="view-mode-switcher" role="group" aria-label="Multi-camera view mode" data-testid="view-mode-switcher">
+          <div
+            className="view-mode-switcher"
+            role="group"
+            aria-label={t("player.viewModeAria")}
+            data-testid="view-mode-switcher"
+          >
             <button
               type="button"
               className={`view-mode-btn ${viewMode === "single" ? "active" : ""}`}
               onClick={() => setViewMode("single")}
               data-testid="view-mode-single"
-              title="Single camera full view"
+              title={t("player.singleTitle")}
             >
-              <Maximize2 size={12} /> Single
+              <Maximize2 size={12} /> {t("player.single")}
             </button>
             <button
               type="button"
@@ -924,9 +954,9 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
               disabled={!hasMultiCam}
               onClick={() => setViewMode("pip")}
               data-testid="view-mode-pip"
-              title={hasMultiCam ? "Primary + secondary Picture-in-Picture (PiP)" : "Requires at least 2 cameras"}
+              title={hasMultiCam ? t("player.pipTitle") : t("player.requires2Cams")}
             >
-              <PictureInPicture2 size={12} /> PiP
+              <PictureInPicture2 size={12} /> {t("player.pip")}
             </button>
             <button
               type="button"
@@ -934,9 +964,9 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
               disabled={!hasMultiCam}
               onClick={() => setViewMode("grid")}
               data-testid="view-mode-grid"
-              title={hasMultiCam ? "Multi-camera grid (2x2)" : "Requires at least 2 cameras"}
+              title={hasMultiCam ? t("player.gridTitle") : t("player.requires2Cams")}
             >
-              <LayoutGrid size={12} /> 2×2
+              <LayoutGrid size={12} /> {t("player.grid")}
             </button>
           </div>
 
@@ -944,11 +974,11 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
             type="button"
             className={`pill-btn ${cutSkip ? "active" : ""}`}
             onClick={() => setCutSkip(!cutSkip)}
-            title="Cut-Skip Preview (K): automatically skips cut_clean segments and highlights mask_loss intervals"
+            title={t("player.cutSkipTitle")}
             data-testid="toggle-cut-skip"
           >
             <Scissors size={13} />
-            <span>Cut-Skip (K)</span>
+            <span>{t("player.cutSkip")}</span>
           </button>
 
           <button
@@ -957,28 +987,31 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
             onClick={() => setShowGrounding((v) => !v)}
             title={
               !isGroundedCamera && trackCount > 0
-                ? `No 2D boxes on camera ${selectedCamera} (available on ${groundedCamera} only)`
+                ? t("player.boxesTitleMismatch", {
+                    selected: selectedCamera,
+                    grounded: groundedCamera,
+                  })
                 : trackCount === 0
-                  ? "No 2D grounding annotations on this episode"
+                  ? t("player.boxesTitleEmpty")
                   : hasDenseTracking
-                    ? "v2 frame-level 2D grounding tracking overlay (read-only; ◆ marks VLM anchor)"
-                    : 'v1 sparse 2D grounding fallback overlay (read-only; use "Rerun S1 Only" to upgrade to v2 frame-level)'
+                    ? t("player.boxesTitleDense")
+                    : t("player.boxesTitleSparse")
             }
             data-testid="toggle-grounding"
           >
             {showGrounding ? <Eye size={13} /> : <EyeOff size={13} />}
-            <span>2D Boxes ({trackCount})</span>
+            <span>{t("player.boxes2d", { count: trackCount })}</span>
             {trackCount > 0 && (
               <span
                 className={`grounding-version-chip ${hasDenseTracking ? "dense" : "sparse"}`}
                 data-testid="grounding-version-badge"
               >
-                {hasDenseTracking ? "v2 Dense" : "v1 Sparse"}
+                {hasDenseTracking ? t("player.v2Dense") : t("player.v1Sparse")}
               </span>
             )}
             {!isGroundedCamera && trackCount > 0 && (
               <span className="grounding-cam-mismatch-hint" data-testid="grounding-cam-mismatch">
-                {groundedCamera} only
+                {t("player.camOnly", { cam: groundedCamera })}
               </span>
             )}
           </button>
@@ -996,10 +1029,61 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
               setHdFrameMode((v) => !v);
             }}
           >
-            HD Frame
+            {t("player.hdFrame")}
           </button>
         </div>
       </div>
+
+      {groundingTracks.length > 0 && (
+        <div
+          className={`grounding-object-bar ${!showGrounding ? "dimmed" : ""}`}
+          data-testid="grounding-object-bar"
+        >
+          <span className="grounding-object-bar-label">{t("player.objectsLabel")}</span>
+          <div
+            className="grounding-object-chips"
+            role="group"
+            aria-label={t("player.objectsGroupAria")}
+          >
+            {groundingTracks.map((item) => {
+              const visible = !hiddenObjectIds[item.id];
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`object-toggle-chip ${visible ? "active" : "muted-off"}`}
+                  aria-pressed={visible}
+                  data-testid={`toggle-object-${item.id}`}
+                  title={
+                    visible
+                      ? t("player.hideObjectTitle", { name: item.name })
+                      : t("player.showObjectTitle", { name: item.name })
+                  }
+                  onClick={() =>
+                    setHiddenObjectIds((prev) => ({
+                      ...prev,
+                      [item.id]: !prev[item.id],
+                    }))
+                  }
+                >
+                  <span className="object-chip-check">{visible ? "✓" : "✕"}</span>
+                  <span>{item.name}</span>
+                </button>
+              );
+            })}
+            {hasHiddenObjects && (
+              <button
+                type="button"
+                className="object-show-all-btn"
+                data-testid="show-all-objects-btn"
+                onClick={() => setHiddenObjectIds({})}
+              >
+                {t("player.showAll")}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       <div
         className={`player-viewport ${isGridMode ? "grid-mode" : ""} ${isGridMode && gridSecondaryCameras.length >= 2 ? "grid-2x2" : ""} ${isPipMode ? "pip-mode" : ""}`}
@@ -1081,12 +1165,15 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
             data-testid="grounding-canvas"
             data-grounded-camera={groundedCamera}
             data-camera-matched={String(isGroundedCamera)}
-            aria-label="2D Grounding read-only overlay"
+            aria-label={t("player.groundingCanvasAria")}
           />
 
           {isGridMode && primaryCameraSpec && (
             <span className="cam-overlay-label">
-              {primaryCameraSpec.name} ({primaryCameraSpec.role} · primary)
+              {t("player.primaryBadge", {
+                name: primaryCameraSpec.name,
+                role: primaryCameraSpec.role,
+              })}
             </span>
           )}
         </div>
@@ -1099,7 +1186,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
               className="grid-cam-pane"
               data-testid={`grid-cam-${cam.name}`}
               onClick={() => setSelectedCamera(cam.name)}
-              title={`Click to set ${cam.name} as primary view`}
+              title={t("player.clickPrimaryTitle", { name: cam.name })}
             >
               {renderSecondaryMedia(cam, true)}
             </div>
@@ -1110,7 +1197,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
           <div
             className="pip-overlay"
             data-testid={`pip-cam-${pipCamera.name}`}
-            title={`Click to switch ${pipCamera.name} to primary view`}
+            title={t("player.clickSwitchPrimaryTitle", { name: pipCamera.name })}
             onClick={() => setSelectedCamera(pipCamera.name)}
           >
             <span className="pip-cam-badge">{pipCamera.name}</span>
@@ -1122,8 +1209,10 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
         {activeMaskSegment && (
           <div className="mask-loss-banner" data-testid="mask-loss-banner">
             <span>
-              MASK · {activeMaskSegment.name || activeMaskSegment.label_id} (
-              {activeMaskSegment.mask_side ?? "both"})
+              {t("player.maskBanner", {
+                name: activeMaskSegment.name || activeMaskSegment.label_id,
+                side: activeMaskSegment.mask_side ?? "both",
+              })}
             </span>
           </div>
         )}
@@ -1138,14 +1227,19 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
 
       <div className="player-controls">
         <div className="transport-buttons">
-          <button type="button" className="icon-btn" onClick={() => stepTime(-0.5)} title="-0.5s (J)">
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => stepTime(-0.5)}
+            title={t("player.stepBackHalfTitle")}
+          >
             -0.5s
           </button>
           <button
             type="button"
             className="icon-btn"
             onClick={() => stepTime(-1 / Math.max(1, fps))}
-            title="Previous frame (←)"
+            title={t("player.prevFrameTitle")}
           >
             <SkipBack size={14} />
           </button>
@@ -1156,17 +1250,22 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
             data-testid="play-pause-btn"
           >
             {playing ? <Pause size={15} /> : <Play size={15} />}
-            <span>{playing ? "Pause" : "Play"}</span>
+            <span>{playing ? t("player.pause") : t("player.play")}</span>
           </button>
           <button
             type="button"
             className="icon-btn"
             onClick={() => stepTime(1 / Math.max(1, fps))}
-            title="Next frame (→)"
+            title={t("player.nextFrameTitle")}
           >
             <SkipForward size={14} />
           </button>
-          <button type="button" className="icon-btn" onClick={() => stepTime(0.5)} title="+0.5s (L)">
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => stepTime(0.5)}
+            title={t("player.stepFwdHalfTitle")}
+          >
             +0.5s
           </button>
           <button
@@ -1174,11 +1273,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
             className={`pill-btn ${loopSegment ? "active" : ""}`}
             disabled={!selectedSegment && !loopSegment}
             data-testid="toggle-segment-loop"
-            title={
-              selectedSegment
-                ? "Loop selected segment (±0.5s padding) (R)"
-                : "Select a QC segment first to enable looping (R)"
-            }
+            title={selectedSegment ? t("player.loopTitle") : t("player.loopDisabledTitle")}
             onClick={() => {
               const next = !loopSegment;
               setLoopSegment(next);
@@ -1189,7 +1284,7 @@ export const StudioPlayer: React.FC<StudioPlayerProps> = ({
               }
             }}
           >
-            <Repeat size={13} /> Loop (R)
+            <Repeat size={13} /> {t("player.loop")}
           </button>
           {loopSegment && loopBounds && (
             <span className="loop-range-pill" data-testid="loop-range-pill">

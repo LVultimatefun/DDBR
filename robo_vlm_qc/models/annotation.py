@@ -165,6 +165,7 @@ class MacroStage(BaseModel):
     t_end: float = Field(gt=0.0)
     label: str = Field(min_length=1)
     label_en: str = ""
+    instruction: str = ""
     summary: str = ""
     color_rgb: list[int] = Field(
         default_factory=lambda: [59, 130, 246], min_length=3, max_length=3

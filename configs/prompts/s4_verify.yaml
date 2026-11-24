@@ -2,13 +2,13 @@ stage: "s4_verify"
 version: "1.0.0"
 description: "Stage 4A global merge + Stage 4B 0.5s dense start-vs-end comparison verification"
 system_template: |
-  You are an embodied QC segment verification expert (Stage 4B dense start-vs-end boundary refinement).
+  You are an embodied QC segment verification expert (Stage 4B dense start-vs-end boundary refinement, supporting both robot arms/grippers and human hands).
   Explicitly compare t_start versus t_end across four visual factors:
-  (1) Both arm and hand poses; (2) Target object position and orientation; (3) Grasp and contact state; (4) Surrounding tabletop objects.
+  (1) Both manipulator (robot arm/gripper or human hand) poses; (2) Target object position and orientation; (3) Grasp and contact state; (4) Surrounding tabletop/workspace objects.
   Assign splice_policy strictly:
   - keep_positive: false-positive rejection, or positive precision fine-adjustment / bimanual assist hold (note: recovery spans with a brief failure prefix should use mask_loss);
-  - mask_loss: genuine anomaly, retry, slip recovery, or collision where start and end states differ and cannot be cleanly spliced (mask action loss on affected arm);
-  - cut_clean: ONLY for leading/trailing pure idle, or a mid-episode freeze where all arm poses, grasp states, and scene objects are virtually identical between t_start and t_end.
+  - mask_loss: genuine anomaly, retry, slip recovery, or collision where start and end states differ and cannot be cleanly spliced (mask action loss on affected manipulator/hand side);
+  - cut_clean: ONLY for leading/trailing pure idle, or a mid-episode freeze where all manipulator (robot arm/gripper or human hand) poses, grasp states, and scene objects are virtually identical between t_start and t_end.
   Always provide structured three-part visual_evidence (initial_state, process_change, end_state).
 user_template: |
   Task: {{ task_id }} | Candidate {{ seg_id }}: [{{ t_start }}s, {{ t_end }}s], initial label={{ label_id }}
@@ -22,7 +22,7 @@ user_template: |
   {"keep_segment": bool, "t_start": float, "t_end": float, "label_id": str, "affected_arm": "left|right|both", "splice_policy": "keep_positive|mask_loss|cut_clean", "visual_evidence": {"initial_state": str, "process_change": str, "end_state": str}, "confidence": float, "reject_reason": str}.
 extra_templates:
   merge_system: |
-    You are an embodied QC global segment consolidation expert (Stage 4A).
+    You are an embodied QC global segment consolidation expert (Stage 4A, supporting both robot arms/grippers and human hands).
     Merge overlapping or adjacent duplicate detections of the same event produced across sliding windows, but NEVER merge two separate retries or distinct anomalies into one segment.
     Output strict JSON only: {"merged_segments": [{"t_start": float, "t_end": float, "label_id": str, "affected_arm": "left|right|both", "splice_policy": "keep_positive|mask_loss|cut_clean", "visual_evidence": {"initial_state": str, "process_change": str, "end_state": str}, "confidence": float, "unknown_note": str}]}.
   merge_user: |

@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { I18nProvider } from "../stores/i18nStore";
 import { makeQcSegment, makeReviewArtifact } from "../test/fixtures";
 import { DiffOverlay } from "./DiffOverlay";
 
@@ -72,5 +73,35 @@ describe("DiffOverlay", () => {
 
     fireEvent.click(screen.getByTestId("restore-rev-rev_42"));
     expect(onRestore).toHaveBeenCalledWith(rev);
+  });
+
+  it("renders Chinese (locale='zh') headings and labels while keeping metric codes", () => {
+    const rawSeg = makeQcSegment({ seg_id: "raw_1", splice_policy: "cut_clean", mask_side: null });
+    const rev = makeReviewArtifact({ rev_id: "rev_42" });
+
+    render(
+      <I18nProvider initialLocale="zh">
+        <DiffOverlay
+          isLead={true}
+          diffEnabled={true}
+          onToggleDiff={vi.fn()}
+          reviewDiff={null}
+          rawVlmSegments={[rawSeg]}
+          currentSegments={[]}
+          rawVlmSuccess={null}
+          currentSuccess={rev.success}
+          rawVlmMacroStages={[]}
+          currentMacroStages={[]}
+          reviews={[rev]}
+          onRestoreSnapshot={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    const panel = screen.getByTestId("diff-overlay");
+    expect(panel).toHaveTextContent("VLM 原始预测 vs 人工修订（组长视图）");
+    expect(panel).toHaveTextContent("删除误报 (fp_deleted)");
+    expect(panel).toHaveTextContent("不可变审核快照历史 (1)");
+    expect(screen.getByTestId("restore-rev-rev_42")).toHaveTextContent("恢复快照到当前编辑栈");
   });
 });

@@ -1,10 +1,11 @@
-"""Transactional LeRobot v3.0 exporter (81D Parquet, CFR H.264 MP4s, meta/*)."""
+"""Transactional LeRobot v3.0 exporter (native / 81D / video-only Parquet, CFR H.264 MP4s, meta/*)."""
 
 from __future__ import annotations
 
 import json
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -14,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..io.base import EpisodeView
-from ..models.export import ExportManifest, ExportRecipe, KeepPiece
+from ..models.export import ExportManifest, ExportRecipe, KeepPiece, StateSchemaMode
 from ..models.review import ResolvedEpisode
 from .base import (
     OutputExporter,
@@ -27,8 +28,233 @@ from .slicer import (
     CANONICAL_81D_NAMES,
     build_badcases_and_pairs,
     extract_piece_kinematics_81d,
+    extract_piece_kinematics_native,
     piece_source_rows,
 )
+
+
+@dataclass(frozen=True)
+class ResolvedStateSchema:
+    """Resolved LeRobot v3 state/action/tactile schema for a batch of views."""
+
+    mode_used: str  # "canonical_81d" | "native" | "video_only"
+    include_state: bool
+    state_dim: int
+    state_names: list[str]
+    include_action: bool
+    action_dim: int
+    action_names: list[str]
+    has_tactile: bool
+    tactile_dim: int
+
+
+def _view_native_dims(
+    view: EpisodeView,
+) -> tuple[int | None, list[str] | None, int | None, list[str] | None, int | None]:
+    kin = view.kinematics
+    if kin is None:
+        return None, None, None, None, None
+
+    raw_st = getattr(kin, "raw_state", None)
+    d_s: int | None = None
+    if raw_st is not None:
+        st_arr = np.asarray(raw_st)
+        if st_arr.ndim == 2 and st_arr.shape[1] > 0:
+            d_s = int(st_arr.shape[1])
+        elif st_arr.ndim == 1 and len(st_arr) > 0:
+            d_s = 1
+
+    raw_act = getattr(kin, "raw_action", None)
+    d_a: int | None = None
+    if raw_act is not None:
+        act_arr = np.asarray(raw_act)
+        if act_arr.ndim == 2 and act_arr.shape[1] > 0:
+            d_a = int(act_arr.shape[1])
+        elif act_arr.ndim == 1 and len(act_arr) > 0:
+            d_a = 1
+
+    raw_tac = getattr(kin, "tactile", None)
+    d_tac: int | None = None
+    if raw_tac is not None:
+        tac_arr = np.asarray(raw_tac)
+        if tac_arr.ndim == 2 and tac_arr.shape[1] > 0:
+            d_tac = int(tac_arr.shape[1])
+
+    s_names = getattr(kin, "state_names", None)
+    a_names = getattr(kin, "action_names", None)
+    return (
+        d_s,
+        list(s_names) if isinstance(s_names, list) and s_names else None,
+        d_a,
+        list(a_names) if isinstance(a_names, list) and a_names else None,
+        d_tac,
+    )
+
+
+def resolve_lerobot_state_schema(
+    included_pairs: list[tuple[ResolvedEpisode, list[KeepPiece]]],
+    views: dict[str, EpisodeView],
+    state_schema_mode: StateSchemaMode = "auto",
+) -> ResolvedStateSchema:
+    """Resolve LeRobot v3 Parquet/stats/info schema for the included episode views."""
+    included_views: list[EpisodeView] = []
+    for res, _ in included_pairs:
+        view = views.get(res.episode_id)
+        if view is None:
+            raise KeyError(f"Missing EpisodeView for {res.episode_id!r}")
+        included_views.append(view)
+
+    has_tactile = any(
+        v.kinematics is not None and getattr(v.kinematics, "tactile", None) is not None
+        for v in included_views
+    )
+
+    def _canonical() -> ResolvedStateSchema:
+        return ResolvedStateSchema(
+            mode_used="canonical_81d",
+            include_state=True,
+            state_dim=81,
+            state_names=list(CANONICAL_81D_NAMES),
+            include_action=True,
+            action_dim=81,
+            action_names=list(CANONICAL_81D_NAMES),
+            has_tactile=has_tactile,
+            tactile_dim=30 if has_tactile else 0,
+        )
+
+    if state_schema_mode == "canonical_81d":
+        return _canonical()
+
+    if not included_views:
+        return _canonical()
+
+    all_no_kin = all(v.kinematics is None for v in included_views)
+    any_no_kin = any(v.kinematics is None for v in included_views)
+    all_lerobot = all(v.meta.adapter_type == "lerobot" for v in included_views)
+    all_h5 = all(v.meta.adapter_type == "h5_raw_v3" for v in included_views)
+    any_h5 = any(v.meta.adapter_type == "h5_raw_v3" for v in included_views)
+
+    if all_no_kin:
+        return ResolvedStateSchema(
+            mode_used="video_only",
+            include_state=False,
+            state_dim=0,
+            state_names=[],
+            include_action=False,
+            action_dim=0,
+            action_names=[],
+            has_tactile=False,
+            tactile_dim=0,
+        )
+
+    if state_schema_mode == "auto":
+        if all_lerobot and not any_no_kin:
+            dims_info = [_view_native_dims(v) for v in included_views]
+            s_dims = {d[0] for d in dims_info}
+            a_dims = {d[2] for d in dims_info}
+            tac_dims = {d[4] for d in dims_info if d[4] is not None}
+            if len(s_dims) == 1 and len(a_dims) == 1:
+                d_s = next(iter(s_dims))
+                d_a = next(iter(a_dims))
+                if d_s is not None or d_a is not None:
+                    s_names: list[str] = []
+                    if d_s is not None:
+                        s_cand = next(
+                            (d[1] for d in dims_info if d[1] is not None and len(d[1]) == d_s),
+                            None,
+                        )
+                        s_names = list(s_cand) if s_cand else [f"state_{i}" for i in range(d_s)]
+                    a_names: list[str] = []
+                    if d_a is not None:
+                        a_cand = next(
+                            (d[3] for d in dims_info if d[3] is not None and len(d[3]) == d_a),
+                            None,
+                        )
+                        a_names = list(a_cand) if a_cand else [f"action_{i}" for i in range(d_a)]
+                    if has_tactile and len(tac_dims) != 1:
+                        return _canonical()
+                    eff_tac_dim = next(iter(tac_dims)) if (has_tactile and tac_dims) else 0
+                    return ResolvedStateSchema(
+                        mode_used="native",
+                        include_state=d_s is not None,
+                        state_dim=d_s or 0,
+                        state_names=s_names,
+                        include_action=d_a is not None,
+                        action_dim=d_a or 0,
+                        action_names=a_names,
+                        has_tactile=has_tactile,
+                        tactile_dim=eff_tac_dim,
+                    )
+        return _canonical()
+
+    # state_schema_mode == "preserve_native"
+    if any_no_kin:
+        raise ValueError(
+            "Cannot preserve native state/action schema when mixing kinematics "
+            "episodes with pure-video episodes; use state_schema_mode='auto' or 'canonical_81d'."
+        )
+    if all_h5:
+        return _canonical()
+    if any_h5:
+        # h5_raw_v3 canonical representation is 81D; only compatible with 81D lerobot views
+        non_h5 = [v for v in included_views if v.meta.adapter_type != "h5_raw_v3"]
+        for v in non_h5:
+            d_s, _, d_a, _, _ = _view_native_dims(v)
+            if d_s != 81 or (d_a is not None and d_a != 81):
+                raise ValueError(
+                    f"Heterogeneous native dimensions in preserve_native mode: "
+                    f"h5_raw_v3 (81D) cannot be combined with {v.meta.episode_id!r} "
+                    f"(state_dim={d_s}, action_dim={d_a}). Use state_schema_mode='auto' or 'canonical_81d'."
+                )
+        return _canonical()
+
+    dims_info = [_view_native_dims(v) for v in included_views]
+    s_dims = {d[0] for d in dims_info}
+    a_dims = {d[2] for d in dims_info}
+    tac_dims = {d[4] for d in dims_info if d[4] is not None}
+    if len(s_dims) != 1 or len(a_dims) != 1:
+        raise ValueError(
+            f"Heterogeneous native state/action dimensions cannot be preserved in "
+            f"preserve_native mode (state_dims={sorted(str(x) for x in s_dims)}, "
+            f"action_dims={sorted(str(x) for x in a_dims)}). Use state_schema_mode='auto' or 'canonical_81d'."
+        )
+    if has_tactile and len(tac_dims) != 1:
+        raise ValueError(
+            f"Heterogeneous tactile dimensions cannot be preserved in preserve_native mode "
+            f"(tactile_dims={sorted(tac_dims)})."
+        )
+    d_s = next(iter(s_dims))
+    d_a = next(iter(a_dims))
+    if d_s is None and d_a is None:
+        raise ValueError(
+            "Selected episodes have kinematics metadata but neither raw_state nor raw_action arrays."
+        )
+    s_names = []
+    if d_s is not None:
+        s_cand = next(
+            (d[1] for d in dims_info if d[1] is not None and len(d[1]) == d_s),
+            None,
+        )
+        s_names = list(s_cand) if s_cand else [f"state_{i}" for i in range(d_s)]
+    a_names = []
+    if d_a is not None:
+        a_cand = next(
+            (d[3] for d in dims_info if d[3] is not None and len(d[3]) == d_a),
+            None,
+        )
+        a_names = list(a_cand) if a_cand else [f"action_{i}" for i in range(d_a)]
+    eff_tac_dim = next(iter(tac_dims)) if (has_tactile and tac_dims) else 0
+    return ResolvedStateSchema(
+        mode_used="native",
+        include_state=d_s is not None,
+        state_dim=d_s or 0,
+        state_names=s_names,
+        include_action=d_a is not None,
+        action_dim=d_a or 0,
+        action_names=a_names,
+        has_tactile=has_tactile,
+        tactile_dim=eff_tac_dim,
+    )
 
 
 def _resolve_export_cfg(cfg: Any) -> dict[str, Any]:
@@ -337,6 +563,19 @@ class LeRobotV3Exporter(OutputExporter):
                 "subtask": pa.array(
                     [str(s["subtask"]) for s in global_subtasks], type=pa.string()
                 ),
+                "instruction": pa.array(
+                    [
+                        str(
+                            s.get("instruction")
+                            or s.get("label_en")
+                            or s.get("label")
+                            or s.get("subtask")
+                            or ""
+                        )
+                        for s in global_subtasks
+                    ],
+                    type=pa.string(),
+                ),
                 "stage_id": pa.array(
                     [str(s["stage_id"]) for s in global_subtasks], type=pa.string()
                 ),
@@ -367,20 +606,27 @@ class LeRobotV3Exporter(OutputExporter):
         robot_type: str = "bimanual_robot",
     ) -> int:
         export_fps = float(kept_pieces_all[0].fps or 30.0)
+        schema_spec = resolve_lerobot_state_schema(
+            included_pairs, views, recipe.state_schema_mode
+        )
 
         # Collect unified camera specs (union across included views for mixed-adapter support)
         cam_specs: list[tuple[str, str, int, int]] = []
         seen_vk: set[str] = set()
-        has_tactile = False
         task_to_idx: dict[str, int] = {}
 
-        for res, _ in included_pairs:
-            task_str = res.meta.task_id or "_default"
-            if task_str not in task_to_idx:
-                task_to_idx[task_str] = len(task_to_idx)
+        for res, ep_pieces in included_pairs:
             view = views.get(res.episode_id)
             if view is None:
                 raise KeyError(f"Missing EpisodeView for {res.episode_id!r}")
+            for piece in ep_pieces:
+                ep_task = (
+                    (piece.task_override or "").strip()
+                    or res.meta.task_id
+                    or "_default"
+                )
+                if ep_task not in task_to_idx:
+                    task_to_idx[ep_task] = len(task_to_idx)
             # Touch view.media early so broken media fails fast inside staging
             cams = list(view.media.cameras)
             for c in cams:
@@ -394,16 +640,26 @@ class LeRobotV3Exporter(OutputExporter):
                     w_even = max(2, int(c.width) - (int(c.width) % 2))
                     h_even = max(2, int(c.height) - (int(c.height) % 2))
                     cam_specs.append((c.name, vk, w_even, h_even))
-            if view.kinematics is not None and getattr(view.kinematics, "tactile", None) is not None:
-                has_tactile = True
 
         # Build PyArrow schema
-        fields: list[pa.Field] = [
-            pa.field("observation.state", pa.list_(pa.float32(), 81)),
-            pa.field("action", pa.list_(pa.float32(), 81)),
-        ]
-        if has_tactile:
-            fields.append(pa.field("observation.tactile_force", pa.list_(pa.float32(), 30)))
+        fields: list[pa.Field] = []
+        if schema_spec.include_state:
+            fields.append(
+                pa.field(
+                    "observation.state", pa.list_(pa.float32(), schema_spec.state_dim)
+                )
+            )
+        if schema_spec.include_action:
+            fields.append(
+                pa.field("action", pa.list_(pa.float32(), schema_spec.action_dim))
+            )
+        if schema_spec.has_tactile:
+            fields.append(
+                pa.field(
+                    "observation.tactile_force",
+                    pa.list_(pa.float32(), schema_spec.tactile_dim),
+                )
+            )
         fields.extend(
             [
                 pa.field("action_loss_mask", pa.list_(pa.float32(), 2)),
@@ -418,11 +674,18 @@ class LeRobotV3Exporter(OutputExporter):
         )
         data_schema = pa.schema(fields)
 
-        state_stats = _OnlineStats(81)
-        action_stats = _OnlineStats(81)
-        tac_stats = _OnlineStats(30) if has_tactile else None
+        state_stats = (
+            _OnlineStats(schema_spec.state_dim) if schema_spec.include_state else None
+        )
+        action_stats = (
+            _OnlineStats(schema_spec.action_dim) if schema_spec.include_action else None
+        )
+        tac_stats = (
+            _OnlineStats(schema_spec.tactile_dim) if schema_spec.has_tactile else None
+        )
         mask_stats = _OnlineStats(2)
         ts_stats = _OnlineStats(1)
+        per_row_bytes = max(64, (schema_spec.state_dim + schema_spec.action_dim) * 4)
 
         ep_rows: list[dict[str, Any]] = []
         chunk_idx = 0
@@ -469,8 +732,6 @@ class LeRobotV3Exporter(OutputExporter):
 
             for res, ep_pieces in included_pairs:
                 view = views[res.episode_id]
-                task_str = res.meta.task_id or "_default"
-                t_idx = task_to_idx[task_str]
                 ep_cam_names = {c.name for c in view.media.cameras}
                 fallback_cam = view.camera_roles.get("main") or view.media.cameras[0].name
                 T_view = (
@@ -484,11 +745,40 @@ class LeRobotV3Exporter(OutputExporter):
                     assert pq_writer is not None
                     n_rows = piece.total_rows
                     piece_fps = float(piece.fps or export_fps)
-                    state_81, action_81, tac_30 = extract_piece_kinematics_81d(
-                        piece, view
+                    ep_task = (
+                        (piece.task_override or "").strip()
+                        or res.meta.task_id
+                        or "_default"
                     )
-                    if has_tactile and tac_30 is None:
-                        tac_30 = np.zeros((n_rows, 30), dtype=np.float32)
+                    t_idx = task_to_idx[ep_task]
+
+                    state_arr: np.ndarray | None = None
+                    action_arr: np.ndarray | None = None
+                    tac_arr: np.ndarray | None = None
+                    if schema_spec.mode_used == "canonical_81d":
+                        state_arr, action_arr, tac_arr = extract_piece_kinematics_81d(
+                            piece, view
+                        )
+                    elif schema_spec.mode_used == "native":
+                        state_arr, action_arr, tac_arr = extract_piece_kinematics_native(
+                            piece,
+                            view,
+                            state_dim=(
+                                schema_spec.state_dim
+                                if schema_spec.include_state
+                                else None
+                            ),
+                            action_dim=(
+                                schema_spec.action_dim
+                                if schema_spec.include_action
+                                else None
+                            ),
+                        )
+
+                    if schema_spec.has_tactile and tac_arr is None:
+                        tac_arr = np.zeros(
+                            (n_rows, schema_spec.tactile_dim), dtype=np.float32
+                        )
 
                     mask_arr = np.asarray(piece.action_loss_mask, dtype=np.float32)
                     if mask_arr.shape != (n_rows, 2):
@@ -523,10 +813,12 @@ class LeRobotV3Exporter(OutputExporter):
                             0,
                             n_rows - 1,
                         )
-                        state_81 = state_81[idx_map]
-                        action_81 = action_81[idx_map]
-                        if tac_30 is not None:
-                            tac_30 = tac_30[idx_map]
+                        if state_arr is not None:
+                            state_arr = state_arr[idx_map]
+                        if action_arr is not None:
+                            action_arr = action_arr[idx_map]
+                        if tac_arr is not None:
+                            tac_arr = tac_arr[idx_map]
                         mask_arr = mask_arr[idx_map]
                         is_tail_arr = is_tail_arr[idx_map]
                         sub_arr = sub_arr[idx_map]
@@ -542,14 +834,21 @@ class LeRobotV3Exporter(OutputExporter):
                     )
                     task_indices = np.full(n_rows, t_idx, dtype=np.int64)
 
-                    cols: dict[str, pa.Array] = {
-                        "observation.state": _fixed_list_col(state_81, 81, pa.float32()),
-                        "action": _fixed_list_col(action_81, 81, pa.float32()),
-                    }
-                    if has_tactile:
-                        assert tac_30 is not None
+                    cols: dict[str, pa.Array] = {}
+                    if schema_spec.include_state:
+                        assert state_arr is not None
+                        cols["observation.state"] = _fixed_list_col(
+                            state_arr, schema_spec.state_dim, pa.float32()
+                        )
+                    if schema_spec.include_action:
+                        assert action_arr is not None
+                        cols["action"] = _fixed_list_col(
+                            action_arr, schema_spec.action_dim, pa.float32()
+                        )
+                    if schema_spec.has_tactile:
+                        assert tac_arr is not None
                         cols["observation.tactile_force"] = _fixed_list_col(
-                            tac_30, 30, pa.float32()
+                            tac_arr, schema_spec.tactile_dim, pa.float32()
                         )
                     cols.update(
                         {
@@ -569,10 +868,12 @@ class LeRobotV3Exporter(OutputExporter):
                     pq_writer.write_table(ep_tbl)
 
                     # Update stats
-                    state_stats.update(state_81)
-                    action_stats.update(action_81)
-                    if tac_stats is not None and tac_30 is not None:
-                        tac_stats.update(tac_30)
+                    if state_stats is not None and state_arr is not None:
+                        state_stats.update(state_arr)
+                    if action_stats is not None and action_arr is not None:
+                        action_stats.update(action_arr)
+                    if tac_stats is not None and tac_arr is not None:
+                        tac_stats.update(tac_arr)
                     mask_stats.update(mask_arr)
                     ts_stats.update(timestamps)
 
@@ -597,7 +898,7 @@ class LeRobotV3Exporter(OutputExporter):
 
                     ep_rec: dict[str, Any] = {
                         "episode_index": ep_idx,
-                        "tasks": [task_str],
+                        "tasks": [ep_task],
                         "task_index": t_idx,
                         "length": n_rows,
                         "data/chunk_index": chunk_idx,
@@ -622,7 +923,7 @@ class LeRobotV3Exporter(OutputExporter):
                         if current_data_path.is_file()
                         else 0
                     )
-                    est_bytes = max(cur_bytes, rows_in_file * 81 * 4 * 2)
+                    est_bytes = max(cur_bytes, rows_in_file * per_row_bytes)
                     if est_bytes >= max_file_bytes:
                         _close_chunk_file()
                         file_idx += 1
@@ -660,47 +961,53 @@ class LeRobotV3Exporter(OutputExporter):
             ep_meta_dir / "file-000.parquet",
         )
 
-        stats: dict[str, Any] = {
-            "observation.state": state_stats.to_dict(),
-            "action": action_stats.to_dict(),
-            "action_loss_mask": mask_stats.to_dict(),
-            "timestamp": ts_stats.to_dict(),
-        }
+        stats: dict[str, Any] = {}
+        if state_stats is not None:
+            stats["observation.state"] = state_stats.to_dict()
+        if action_stats is not None:
+            stats["action"] = action_stats.to_dict()
         if tac_stats is not None:
             stats["observation.tactile_force"] = tac_stats.to_dict()
+        stats["action_loss_mask"] = mask_stats.to_dict()
+        stats["timestamp"] = ts_stats.to_dict()
         (meta_dir / "stats.json").write_text(
             json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        features_meta: dict[str, Any] = {
-            "observation.state": {
+        features_meta: dict[str, Any] = {}
+        if schema_spec.include_state:
+            features_meta["observation.state"] = {
                 "dtype": "float32",
-                "shape": [81],
-                "names": CANONICAL_81D_NAMES,
-            },
-            "action": {
+                "shape": [schema_spec.state_dim],
+                "names": list(schema_spec.state_names),
+            }
+        if schema_spec.include_action:
+            features_meta["action"] = {
                 "dtype": "float32",
-                "shape": [81],
-                "names": CANONICAL_81D_NAMES,
-            },
-            "action_loss_mask": {
-                "dtype": "float32",
-                "shape": [2],
-                "names": ["left_mask", "right_mask"],
-            },
-            "is_tail": {"dtype": "bool", "shape": [1]},
-            "subtask_index": {"dtype": "int64", "shape": [1]},
-            "timestamp": {"dtype": "float32", "shape": [1]},
-            "frame_index": {"dtype": "int64", "shape": [1]},
-            "episode_index": {"dtype": "int64", "shape": [1]},
-            "index": {"dtype": "int64", "shape": [1]},
-            "task_index": {"dtype": "int64", "shape": [1]},
-        }
-        if has_tactile:
+                "shape": [schema_spec.action_dim],
+                "names": list(schema_spec.action_names),
+            }
+        features_meta.update(
+            {
+                "action_loss_mask": {
+                    "dtype": "float32",
+                    "shape": [2],
+                    "names": ["left_mask", "right_mask"],
+                },
+                "is_tail": {"dtype": "bool", "shape": [1]},
+                "subtask_index": {"dtype": "int64", "shape": [1]},
+                "timestamp": {"dtype": "float32", "shape": [1]},
+                "frame_index": {"dtype": "int64", "shape": [1]},
+                "episode_index": {"dtype": "int64", "shape": [1]},
+                "index": {"dtype": "int64", "shape": [1]},
+                "task_index": {"dtype": "int64", "shape": [1]},
+            }
+        )
+        if schema_spec.has_tactile:
             features_meta["observation.tactile_force"] = {
                 "dtype": "float32",
-                "shape": [30],
-                "names": [f"tactile_{i}" for i in range(30)],
+                "shape": [schema_spec.tactile_dim],
+                "names": [f"tactile_{i}" for i in range(schema_spec.tactile_dim)],
             }
         for _, vk, w_e, h_e in cam_specs:
             features_meta[vk] = {

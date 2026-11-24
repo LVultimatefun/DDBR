@@ -1220,3 +1220,151 @@ def test_track_interval_bidirectional_disjoint_prefers_supported_over_below_thre
     assert flags[2] == FLAG_TRACKED
     assert box_iou(fused[2], box_end_px) > 0.7
     assert 0.0 < confs[2] < 0.20
+
+
+def test_baft_suppresses_moderate_and_multiframe_anchor_jitter_via_flow_and_ncc(
+    tmp_path: Path,
+) -> None:
+    """Moderate (<250 norm) and 2-frame consecutive VLM anchor jitter must be suppressed
+    using optical-flow prediction residual + NCC confidence instead of rubber-banding."""
+    w, h, fps, dur_s = 640, 360, 15.0, 4.0
+    n_frames = int(round(dur_s * fps))
+    bg = _make_textured_bg(951, h, w)
+    cup_patch = _make_textured_patch(952, 70, 60, (55, 165, 235))
+
+    def _gt_cup_px(t_s: float) -> tuple[int, int, int, int]:
+        u = max(0.0, min(1.0, t_s / dur_s))
+        x1 = int(round(100 + 260 * u))
+        y1 = int(round(145 + 15 * math.sin(math.pi * u)))
+        return x1, y1, x1 + 60, y1 + 70
+
+    frames: list[np.ndarray] = []
+    for i in range(n_frames):
+        fr = bg.copy()
+        x1, y1, x2, y2 = _gt_cup_px(i / fps)
+        fr[y1:y2, x1:x2] = cup_patch
+        frames.append(fr)
+
+    ds_dir = tmp_path / "jitter_ds" / "ep_jitter"
+    _write_mp4(ds_dir / "main.mp4", frames, fps=fps)
+    handle = auto_detect(tmp_path / "jitter_ds", adapter_name="video_dir")[0]
+
+    # 5 anchors at t=0.0, 1.0, 2.0, 3.0, 4.0s.
+    # Inject a 2-frame moderate jitter burst at t=1.0s (+85 norm X, -50 norm Y) and t=2.0s (-80 norm X, +55 norm Y)
+    # -- BOTH are well below the legacy 250-norm outlier_jump_norm threshold!
+    def _jitter_vlm(kw: dict[str, Any]) -> dict[str, Any]:
+        ts = [float(t) for t in kw["timestamps_s"]]
+        entries: list[dict[str, Any]] = []
+        for idx, t_val in enumerate(ts):
+            gt = _px_to_norm_box(*_gt_cup_px(t_val), w, h)
+            if abs(t_val - 1.0) < 0.15:
+                box = [gt[0] + 85, max(0, gt[1] - 50), gt[2] + 85, max(10, gt[3] - 50)]
+            elif abs(t_val - 2.0) < 0.15:
+                box = [max(0, gt[0] - 80), gt[1] + 55, max(10, gt[2] - 80), gt[3] + 55]
+            else:
+                box = gt
+            entries.append(
+                {
+                    "frame_index": idx,
+                    "time_s": t_val,
+                    "objects": {
+                        "cup": {
+                            "visible": True,
+                            "bbox": box,
+                            "state": "moving",
+                            "status_kind": "neutral",
+                        }
+                    },
+                }
+            )
+        return {"frames": entries}
+
+    cfg = ConfigManager()
+    cfg.settings["vlm"]["s1_grounding"]["interval_s"] = 1.0
+    cfg.settings["vlm"]["s1_grounding"]["max_keyframes"] = 5
+
+    client = _DeterministicVlmClient(_jitter_vlm)
+    with get_adapter("video_dir").open(handle) as view:
+        res = run_stage1_grounding(
+            view=view,
+            task=TaskSpec(
+                task_id="cup_jitter",
+                grounding_objects=[
+                    GroundingObjectSpec(id="cup", name="Cup", desc="Moving cup", is_static=False)
+                ],
+            ),
+            client=client,  # type: ignore[arg-type]
+            cfg=cfg,
+        )
+
+    cup = res.object_tracks_2d["cup"]
+    # Evaluate accuracy right around the two jittered anchor timestamps (1.0s and 2.0s)
+    for target_t in (1.0, 2.0):
+        idx = min(range(len(res.dense_times_s)), key=lambda i: abs(res.dense_times_s[i] - target_t))
+        gt_b = _px_to_norm_box(*_gt_cup_px(res.dense_times_s[idx]), w, h)
+        pred_b = cup.dense_boxes_norm_1000[idx]
+        err = box_center_dist(pred_b, gt_b)
+        assert err < 35.0, (
+            f"Jitter burst at t={target_t}s was not suppressed (err={err:.1f}, pred={pred_b}, gt={gt_b})"
+        )
+        assert box_iou(pred_b, gt_b) > 0.60
+
+
+def test_smooth_dense_track_adaptive_anchor_weighting_prevents_rubber_banding() -> None:
+    """_smooth_dense_track must adaptively down-weight noisy VLM anchors when local optical
+    flow is smooth & consistent, while firmly preserving anchors that agree with flow."""
+    from robo_vlm_qc.vlm.tracker import _smooth_dense_track
+
+    w, h = 320, 180
+    n = 15
+    # Smooth linear trajectory moving +2px/frame in x, constant 40x40 box
+    gt_boxes = np.array(
+        [[40.0 + 2.0 * i, 60.0, 80.0 + 2.0 * i, 100.0] for i in range(n)],
+        dtype=np.float64,
+    )
+    flags = np.full(n, FLAG_TRACKED, dtype=np.int32)
+    flags[0] = FLAG_VLM_ANCHOR
+    flags[7] = FLAG_VLM_ANCHOR
+    flags[n - 1] = FLAG_VLM_ANCHOR
+    confs = np.full(n, 0.92, dtype=np.float64)
+
+    # Case 1: Noisy interior anchor at i=7 jumps +18px in x and +14px in width/height
+    # (still overlapping IoU > 0.20 so it stays inside the same contiguous run)
+    noisy_boxes = gt_boxes.copy()
+    noisy_boxes[7] = np.array(
+        [gt_boxes[7, 0] + 18.0, gt_boxes[7, 1] - 7.0, gt_boxes[7, 2] + 32.0, gt_boxes[7, 3] + 7.0],
+        dtype=np.float64,
+    )
+    flow_info = {7: (box_iou(noisy_boxes[7], gt_boxes[7]), 0.92, 0.90, gt_boxes[7].copy())}
+
+    sm_noisy = _smooth_dense_track(
+        noisy_boxes,
+        flags,
+        smooth_window=5,
+        w=w,
+        h=h,
+        confs=confs,
+        anchor_flow_info=flow_info,
+    )
+    # Old hardcoded 0.8*anchor + 0.2*sm would keep ~80% of the +25px center shift (>18px error)!
+    # Adaptive flow-agreement weighting must suppress the jump strongly (< 8px error).
+    err_noisy = box_center_dist(sm_noisy[7], gt_boxes[7])
+    assert err_noisy < 8.5, f"Adaptive weighting failed to suppress anchor jump: err={err_noisy:.2f}px"
+    # Scale jump (+14px width) is also suppressed well below old 0.8*54 + 0.2*40 = 51.2px
+    sm_w = float(sm_noisy[7, 2] - sm_noisy[7, 0])
+    assert sm_w < 46.0, f"Adaptive weighting failed to suppress scale breathing: w={sm_w:.2f}px"
+
+    # Case 2: Clean interior anchor agreeing closely with optical flow stays firmly pinned
+    clean_boxes = gt_boxes.copy()
+    clean_boxes[7] = gt_boxes[7] + np.array([1.0, 0.0, 1.0, 0.0])
+    flow_info_clean = {7: (box_iou(clean_boxes[7], gt_boxes[7]), 0.95, 0.95, gt_boxes[7].copy())}
+    sm_clean = _smooth_dense_track(
+        clean_boxes,
+        flags,
+        smooth_window=5,
+        w=w,
+        h=h,
+        confs=confs,
+        anchor_flow_info=flow_info_clean,
+    )
+    assert box_center_dist(sm_clean[7], clean_boxes[7]) < 1.0

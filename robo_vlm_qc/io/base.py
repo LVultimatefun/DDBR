@@ -78,6 +78,8 @@ class KinematicsData:
     is_hil: np.ndarray | None = None
     t0_unix: float | None = None
     sub_valid: dict[str, np.ndarray] = field(default_factory=dict)
+    state_names: list[str] | None = None
+    action_names: list[str] | None = None
 
 
 @dataclass(frozen=True)

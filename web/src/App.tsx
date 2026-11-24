@@ -1,12 +1,25 @@
 import React, { useEffect, useState } from "react";
 import { BrowserRouter, Link, Route, Routes, useLocation } from "react-router-dom";
-import { Activity, KeyRound, Layers, ListChecks, Moon, PackageCheck, Sun } from "lucide-react";
+import {
+  Activity,
+  Cpu,
+  KeyRound,
+  Languages,
+  Layers,
+  ListChecks,
+  Lock,
+  Moon,
+  PackageCheck,
+  Sun,
+} from "lucide-react";
 import { JobCenterDrawer } from "./components/JobCenterDrawer";
+import { VlmSettingsModal } from "./components/VlmSettingsModal";
 import { ExportPage } from "./pages/ExportPage";
 import { QueuePage } from "./pages/QueuePage";
 import { ReviewStudioPage } from "./pages/ReviewStudioPage";
 import { VlmLabPage } from "./pages/VlmLabPage";
 import { AuthProvider, useAuth } from "./stores/authStore";
+import { I18nProvider, useI18n } from "./stores/i18nStore";
 import { JobProvider, useJobs } from "./stores/jobStore";
 import { ThemeProvider, useTheme } from "./stores/themeStore";
 import { GlobalToastContainer, ToastProvider } from "./stores/toastStore";
@@ -14,6 +27,7 @@ import type { ReviewRole } from "./api/types";
 
 const AuthModal: React.FC = () => {
   const { authPromptOpen, setAuthPromptOpen, token, username, role, setCredentials } = useAuth();
+  const { t } = useI18n();
   const [nextToken, setNextToken] = useState(token);
   const [nextUser, setNextUser] = useState(username);
   const [nextRole, setNextRole] = useState<ReviewRole>(role);
@@ -60,18 +74,18 @@ const AuthModal: React.FC = () => {
       }}
     >
       <form className="modal-card" onSubmit={(e) => void handleSave(e)}>
-        <h3>Credentials & Role</h3>
+        <h3>{t("auth.title")}</h3>
         <label className="field-group">
-          <span>API Token (X-Auth-Token)</span>
+          <span>{t("auth.apiToken")}</span>
           <input
             type="password"
             value={nextToken}
             onChange={(e) => setNextToken(e.target.value)}
-            placeholder="e.g. rev-token or lead-token"
+            placeholder={t("auth.apiTokenPlaceholder")}
           />
         </label>
         <label className="field-group">
-          <span>Username (X-User)</span>
+          <span>{t("auth.username")}</span>
           <input
             type="text"
             value={nextUser}
@@ -80,10 +94,10 @@ const AuthModal: React.FC = () => {
           />
         </label>
         <label className="field-group">
-          <span>View Role</span>
+          <span>{t("auth.viewRole")}</span>
           <select value={nextRole} onChange={(e) => setNextRole(e.target.value as ReviewRole)}>
-            <option value="reviewer">Reviewer (Annotator)</option>
-            <option value="lead">Lead (Engineer)</option>
+            <option value="reviewer">{t("auth.roleReviewerOption")}</option>
+            <option value="lead">{t("auth.roleLeadOption")}</option>
           </select>
         </label>
         <div className="modal-actions">
@@ -92,10 +106,10 @@ const AuthModal: React.FC = () => {
             className="secondary-btn compact"
             onClick={() => setAuthPromptOpen(false)}
           >
-            Cancel
+            {t("common.cancel")}
           </button>
           <button type="submit" className="primary-btn compact">
-            Apply Credentials
+            {t("auth.apply")}
           </button>
         </div>
       </form>
@@ -106,117 +120,162 @@ const AuthModal: React.FC = () => {
 const TopNav: React.FC = () => {
   const { isLead, username, role, setAuthPromptOpen } = useAuth();
   const { theme, toggleTheme } = useTheme();
+  const { locale, toggleLocale, t } = useI18n();
   const { jobs, activeJobs, drawerOpen, setDrawerOpen } = useJobs();
   const loc = useLocation();
+  const [vlmSettingsOpen, setVlmSettingsOpen] = useState(false);
 
   const activeDone = activeJobs.reduce((sum, j) => sum + Math.max(0, j.progress_done ?? 0), 0);
   const activeTotal = activeJobs.reduce((sum, j) => sum + Math.max(0, j.progress_total ?? 0), 0);
   const activePct = activeTotal > 0 ? Math.min(100, Math.round((activeDone / activeTotal) * 100)) : 0;
 
   return (
-    <header className="top-navbar">
-      <div className="nav-left">
-        <Link className="brand" to="/">
-          robo_vlm_qc <span className="brand-tag">Studio</span>
-        </Link>
-        <nav className="nav-links" aria-label="Primary navigation">
-          <Link className={`nav-link ${loc.pathname === "/" ? "active" : ""}`} to="/">
-            <ListChecks size={15} /> Work Queue
+    <>
+      <header className="top-navbar">
+        <div className="nav-left">
+          <Link className="brand" to="/">
+            robo_vlm_qc <span className="brand-tag">Studio</span>
           </Link>
-          {isLead && (
-            <>
-              <Link
-                className={`nav-link ${loc.pathname === "/export" ? "active" : ""}`}
-                to="/export"
-                data-testid="nav-export"
-              >
-                <PackageCheck size={15} /> Export Studio
-              </Link>
-              <Link
-                className={`nav-link ${loc.pathname === "/lab" ? "active" : ""}`}
-                to="/lab"
-                data-testid="nav-lab"
-              >
-                <Layers size={15} /> VLM Lab
-              </Link>
-            </>
-          )}
-        </nav>
-      </div>
-
-      <div className="nav-right">
-        {isLead && (
-          <button
-            type="button"
-            className={`job-pill ${activeJobs.length > 0 ? "active" : ""}`}
-            onClick={() => setDrawerOpen(!drawerOpen)}
-            data-testid="live-job-pill"
-            aria-label="Open async job center"
-          >
-            {activeJobs.length > 0 ? (
+          <nav className="nav-links" aria-label={t("nav.primaryLabel")}>
+            <Link className={`nav-link ${loc.pathname === "/" ? "active" : ""}`} to="/">
+              <ListChecks size={15} /> {t("nav.workQueue")}
+            </Link>
+            {isLead ? (
               <>
-                <span className="job-pill-dot pulsing" />
-                <span>
-                  Running {activeDone}/{activeTotal} ({activePct}%)
-                </span>
+                <Link
+                  className={`nav-link ${loc.pathname === "/export" ? "active" : ""}`}
+                  to="/export"
+                  data-testid="nav-export"
+                >
+                  <PackageCheck size={15} /> {t("nav.exportStudio")}
+                </Link>
+                <Link
+                  className={`nav-link ${loc.pathname === "/lab" ? "active" : ""}`}
+                  to="/lab"
+                  data-testid="nav-lab"
+                >
+                  <Layers size={15} /> {t("nav.vlmLab")}
+                </Link>
               </>
             ) : (
-              <>
-                <Activity size={13} />
-                <span>Jobs ({jobs.length})</span>
-              </>
+              <button
+                type="button"
+                className="nav-link nav-link-locked"
+                data-testid="nav-export-locked"
+                title={t("nav.exportLockedTitle")}
+                onClick={() => setAuthPromptOpen(true)}
+              >
+                <PackageCheck size={15} /> {t("nav.exportStudio")} <Lock size={12} />
+              </button>
             )}
+          </nav>
+        </div>
+
+        <div className="nav-right">
+          {isLead && (
+            <>
+              <button
+                type="button"
+                className="mini-btn"
+                onClick={() => setVlmSettingsOpen(true)}
+                data-testid="open-vlm-settings-btn"
+                title={t("nav.modelApiTitle")}
+              >
+                <Cpu size={13} /> {t("nav.modelApi")}
+              </button>
+              <button
+                type="button"
+                className={`job-pill ${activeJobs.length > 0 ? "active" : ""}`}
+                onClick={() => setDrawerOpen(!drawerOpen)}
+                data-testid="live-job-pill"
+                aria-label={t("nav.openJobCenter")}
+              >
+                {activeJobs.length > 0 ? (
+                  <>
+                    <span className="job-pill-dot pulsing" />
+                    <span>
+                      {t("nav.jobsRunning", {
+                        done: activeDone,
+                        total: activeTotal,
+                        pct: activePct,
+                      })}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Activity size={13} />
+                    <span>{t("nav.jobsCount", { count: jobs.length })}</span>
+                  </>
+                )}
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            className="locale-toggle-btn"
+            onClick={toggleLocale}
+            data-testid="locale-toggle-btn"
+            aria-label={locale === "en" ? t("nav.switchToZh") : t("nav.switchToEn")}
+            title={locale === "en" ? t("nav.switchToZh") : t("nav.switchToEn")}
+          >
+            <Languages size={14} />
+            <span>{locale === "en" ? "中文" : "EN"}</span>
           </button>
-        )}
-        <button
-          type="button"
-          className="theme-toggle-btn"
-          onClick={toggleTheme}
-          data-testid="theme-toggle-btn"
-          aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-          title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-        >
-          {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
-        </button>
-        <span className={`role-badge ${role}`} data-testid="current-role-badge">
-          {role === "lead" ? "Lead" : "Reviewer"}: {username}
-        </span>
-        <button
-          type="button"
-          className="mini-btn"
-          onClick={() => setAuthPromptOpen(true)}
-          data-testid="open-auth-modal"
-        >
-          <KeyRound size={13} /> Switch Token / Role
-        </button>
-      </div>
-    </header>
+          <button
+            type="button"
+            className="theme-toggle-btn"
+            onClick={toggleTheme}
+            data-testid="theme-toggle-btn"
+            aria-label={theme === "dark" ? t("nav.switchToLight") : t("nav.switchToDark")}
+            title={theme === "dark" ? t("nav.switchToLight") : t("nav.switchToDark")}
+          >
+            {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
+          </button>
+          <span className={`role-badge ${role}`} data-testid="current-role-badge">
+            {role === "lead" ? t("nav.roleLead") : t("nav.roleReviewer")}: {username}
+          </span>
+          <button
+            type="button"
+            className="mini-btn"
+            onClick={() => setAuthPromptOpen(true)}
+            data-testid="open-auth-modal"
+          >
+            <KeyRound size={13} /> {t("nav.switchTokenRole")}
+          </button>
+        </div>
+      </header>
+      {isLead && (
+        <VlmSettingsModal open={vlmSettingsOpen} onClose={() => setVlmSettingsOpen(false)} />
+      )}
+    </>
   );
 };
 
 export const AppRoutes: React.FC = () => (
-  <ThemeProvider>
-    <ToastProvider>
-      <JobProvider>
-        <div className="app-shell">
-          <TopNav />
-          <AuthModal />
-          <main className="app-main">
-            <Routes>
-              <Route path="/" element={<QueuePage />} />
-              <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
-              <Route path="/review/*" element={<ReviewStudioPage />} />
-              <Route path="/export" element={<ExportPage />} />
-              <Route path="/lab" element={<VlmLabPage />} />
-              <Route path="*" element={<QueuePage />} />
-            </Routes>
-          </main>
-          <JobCenterDrawer />
-          <GlobalToastContainer />
-        </div>
-      </JobProvider>
-    </ToastProvider>
-  </ThemeProvider>
+  <I18nProvider>
+    <ThemeProvider>
+      <ToastProvider>
+        <JobProvider>
+          <div className="app-shell">
+            <TopNav />
+            <AuthModal />
+            <main className="app-main">
+              <Routes>
+                <Route path="/" element={<QueuePage />} />
+                <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+                <Route path="/review/*" element={<ReviewStudioPage />} />
+                <Route path="/export" element={<ExportPage />} />
+                <Route path="/lab" element={<VlmLabPage />} />
+                <Route path="*" element={<QueuePage />} />
+              </Routes>
+            </main>
+            <JobCenterDrawer />
+            <GlobalToastContainer />
+          </div>
+        </JobProvider>
+      </ToastProvider>
+    </ThemeProvider>
+  </I18nProvider>
 );
 
 export const App: React.FC = () => (

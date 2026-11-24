@@ -61,27 +61,28 @@ import { useEventStream } from "../api/useEventStream";
 import { LabHistoryDrawer } from "../components/LabHistoryDrawer";
 import { DEFAULT_VISUAL_LABELS } from "../constants/labels";
 import { useAuth } from "../stores/authStore";
+import { type TranslateFn, useI18n } from "../stores/i18nStore";
 import { useJobs } from "../stores/jobStore";
 import { useToast } from "../stores/toastStore";
 
 type LabTab = "diagnosis" | "few_shots" | "taxonomy" | "eval";
 type TaxonomySubTab = "labels" | "prompts" | "tasks";
 
-const DIAGNOSIS_BUCKETS: Array<{ key: DiagnosisErrorType; label: string }> = [
-  { key: "fp_overflag", label: "FP Overflag" },
-  { key: "fn_missed", label: "FN Missed" },
-  { key: "policy_flip", label: "Policy / Overcut Flip" },
-  { key: "boundary", label: "Boundary Drift" },
-  { key: "success_flip", label: "Success Flip" },
-  { key: "stage", label: "Macro Stage Mismatch" },
+const DIAGNOSIS_BUCKETS: Array<{ key: DiagnosisErrorType; labelKey: string }> = [
+  { key: "fp_overflag", labelKey: "lab.bucket.fp_overflag" },
+  { key: "fn_missed", labelKey: "lab.bucket.fn_missed" },
+  { key: "policy_flip", labelKey: "lab.bucket.policy_flip" },
+  { key: "boundary", labelKey: "lab.bucket.boundary" },
+  { key: "success_flip", labelKey: "lab.bucket.success_flip" },
+  { key: "stage", labelKey: "lab.bucket.stage" },
 ];
 
-const PROMPT_STAGES: Array<{ key: PromptStageKey; label: string }> = [
-  { key: "s1_grounding", label: "S1 · 2D Grounding" },
-  { key: "s2_macro", label: "S2 · Macro Backbone" },
-  { key: "s3_discover", label: "S3 · Sliding-Window QC Discovery" },
-  { key: "s4_verify", label: "S4 · Start/End Frame Verification" },
-  { key: "s5_success", label: "S5 · Tail Success Evaluation" },
+const PROMPT_STAGES: Array<{ key: PromptStageKey; labelKey: string }> = [
+  { key: "s1_grounding", labelKey: "lab.stage.s1_grounding" },
+  { key: "s2_macro", labelKey: "lab.stage.s2_macro" },
+  { key: "s3_discover", labelKey: "lab.stage.s3_discover" },
+  { key: "s4_verify", labelKey: "lab.stage.s4_verify" },
+  { key: "s5_success", labelKey: "lab.stage.s5_success" },
 ];
 
 const LABEL_CATEGORIES: LabelCategory[] = [
@@ -103,14 +104,14 @@ function safeJsonStringify(val: unknown): string {
   }
 }
 
-function parseJsonObject(text: string): Record<string, unknown> {
+function parseJsonObject(text: string, invalidObjMessage: string): Record<string, unknown> {
   const trimmed = text.trim();
   if (!trimmed) return {};
   const parsed = JSON.parse(trimmed);
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
     return parsed as Record<string, unknown>;
   }
-  throw new Error("JSON must be an object");
+  throw new Error(invalidObjMessage);
 }
 
 function fmtPct(v: number | undefined | null): string {
@@ -152,7 +153,7 @@ function toJsonDict(val: unknown, fallback: Record<string, unknown>): Record<str
   return fallback;
 }
 
-function fmtCompactDiagValue(val: unknown): string {
+function fmtCompactDiagValue(val: unknown, t: TranslateFn): string {
   if (val === null || val === undefined) return "null";
   if (typeof val === "string") return val;
   if (typeof val === "number" || typeof val === "boolean") return String(val);
@@ -169,7 +170,13 @@ function fmtCompactDiagValue(val: unknown): string {
     if (typeof rec.verdict === "string" || typeof rec.passed === "boolean") {
       const verdict = typeof rec.verdict === "string" ? rec.verdict : "";
       const passedTxt =
-        rec.passed === true ? "pass" : rec.passed === false ? "fail" : rec.passed === null ? "unsure" : "";
+        rec.passed === true
+          ? t("lab.diag.verdictPass")
+          : rec.passed === false
+            ? t("lab.diag.verdictFail")
+            : rec.passed === null
+              ? t("lab.diag.verdictUnsure")
+              : "";
       if (verdict && passedTxt) return `${verdict} (${passedTxt})`;
       return verdict || passedTxt || "—";
     }
@@ -190,11 +197,11 @@ interface StageLike {
   label_en?: string;
 }
 
-function summarizeStageDiff(vlmVal: unknown, gtVal: unknown): string[] {
+function summarizeStageDiff(vlmVal: unknown, gtVal: unknown, t: TranslateFn): string[] {
   const vlmArr: StageLike[] = Array.isArray(vlmVal) ? (vlmVal as StageLike[]) : [];
   const gtArr: StageLike[] = Array.isArray(gtVal) ? (gtVal as StageLike[]) : [];
   if (vlmArr.length === 0 && gtArr.length === 0) {
-    return ["Macro stage structure differs"];
+    return [t("lab.diag.stageStructDiffers")];
   }
 
   const lines: string[] = [];
@@ -222,13 +229,24 @@ function summarizeStageDiff(vlmVal: unknown, gtVal: unknown): string[] {
         const parts: string[] = [];
         if (boundaryChanged && vStart !== null && vEnd !== null && gStart !== null && gEnd !== null) {
           parts.push(
-            `${id} boundary shift: ${vStart.toFixed(1)}–${vEnd.toFixed(1)}s → ${gStart.toFixed(1)}–${gEnd.toFixed(1)}s`,
+            t("lab.diag.stageBoundaryShift", {
+              id,
+              vStart: vStart.toFixed(1),
+              vEnd: vEnd.toFixed(1),
+              gStart: gStart.toFixed(1),
+              gEnd: gEnd.toFixed(1),
+            }),
           );
         } else {
           parts.push(`${id}`);
         }
         if (nameChanged) {
-          parts.push(`renamed (${vName || "—"} → ${gName || "—"})`);
+          parts.push(
+            t("lab.diag.stageRenamed", {
+              vName: vName || "—",
+              gName: gName || "—",
+            }),
+          );
         }
         lines.push(parts.join(" · "));
       }
@@ -238,18 +256,20 @@ function summarizeStageDiff(vlmVal: unknown, gtVal: unknown): string[] {
         typeof v.t_start === "number" && typeof v.t_end === "number"
           ? ` (${v.t_start.toFixed(1)}–${v.t_end.toFixed(1)}s)`
           : "";
-      lines.push(`Extra VLM stage ${id}${span}`);
+      lines.push(t("lab.diag.stageExtraVlm", { id, span }));
     } else if (!v && g) {
       const id = g.stage_id || `S${i + 1}`;
       const span =
         typeof g.t_start === "number" && typeof g.t_end === "number"
           ? ` (${g.t_start.toFixed(1)}–${g.t_end.toFixed(1)}s)`
           : "";
-      lines.push(`Added GT stage ${id}${span}`);
+      lines.push(t("lab.diag.stageAddedGt", { id, span }));
     }
   }
 
-  return lines.length > 0 ? lines : [`VLM ${vlmArr.length} stages → GT ${gtArr.length} stages`];
+  return lines.length > 0
+    ? lines
+    : [t("lab.diag.stageCountDiff", { vlmCount: vlmArr.length, gtCount: gtArr.length })];
 }
 
 function buildDiagnosisReviewLink(err: DiagnosisErrorItem): string {
@@ -325,6 +345,9 @@ interface TriageDraft {
 
 export const VlmLabPage: React.FC = () => {
   const { isLead, token, authProbing, setAuthPromptOpen } = useAuth();
+  const { t } = useI18n();
+  const tRef = useRef(t);
+  tRef.current = t;
   const jobStore = useJobs();
   const toast = useToast();
   const [activeTab, setActiveTab] = useState<LabTab>("diagnosis");
@@ -469,7 +492,7 @@ export const VlmLabPage: React.FC = () => {
       setDiagnosis(rep);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) setAuthPromptOpen(true);
-      setErrorMsg(err instanceof Error ? err.message : "Failed to load diagnosis report");
+      setErrorMsg(err instanceof Error ? err.message : tRef.current("lab.err.loadDiagnosis"));
     } finally {
       setDiagLoading(false);
     }
@@ -484,7 +507,7 @@ export const VlmLabPage: React.FC = () => {
       setUnkTotal(res.total);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) setAuthPromptOpen(true);
-      setErrorMsg(err instanceof Error ? err.message : "Failed to load unknown anomaly pool");
+      setErrorMsg(err instanceof Error ? err.message : tRef.current("lab.err.loadUnknowns"));
     }
   }, [unkDatasetFilter, setAuthPromptOpen]);
 
@@ -500,7 +523,7 @@ export const VlmLabPage: React.FC = () => {
       setFewShots(res.items);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) setAuthPromptOpen(true);
-      setErrorMsg(err instanceof Error ? err.message : "Failed to load Few-Shot Mistake Book");
+      setErrorMsg(err instanceof Error ? err.message : tRef.current("lab.err.loadFewShots"));
     } finally {
       setFsLoading(false);
     }
@@ -520,7 +543,7 @@ export const VlmLabPage: React.FC = () => {
           setCandidateId(res.evals[0].eval_id);
         }
       } catch (err) {
-        setErrorMsg(err instanceof Error ? err.message : "Failed to load evaluation comparison");
+        setErrorMsg(err instanceof Error ? err.message : tRef.current("lab.err.loadEvalCompare"));
       }
     },
     [],
@@ -568,12 +591,12 @@ export const VlmLabPage: React.FC = () => {
       setEvalRunning(false);
 
       if (job.status === "failed") {
-        const errText = job.summary?.errors?.[0]?.error || "GT regression evaluation failed";
+        const errText = job.summary?.errors?.[0]?.error || tRef.current("lab.err.evalFailed");
         setErrorMsg(errText);
         return;
       }
       if (job.status === "cancelled") {
-        showLabInfo(`Evaluation job ${job.job_id} cancelled`, "warning");
+        showLabInfo(tRef.current("lab.toast.evalCancelled", { jobId: job.job_id }), "warning");
         return;
       }
 
@@ -601,7 +624,7 @@ export const VlmLabPage: React.FC = () => {
           resolvedReport = candFromCmp;
         }
       } catch (err) {
-        setErrorMsg(err instanceof Error ? err.message : "Failed to load evaluation comparison");
+        setErrorMsg(err instanceof Error ? err.message : tRef.current("lab.err.loadEvalCompare"));
       }
 
       if (resolvedReport) {
@@ -610,12 +633,19 @@ export const VlmLabPage: React.FC = () => {
         const epCount =
           resolvedReport.metrics?.episodes_evaluated ?? resolvedReport.per_episode.length;
         showLabInfo(
-          `Evaluation completed: ${resolvedReport.eval_id} (${epCount} GT episodes, S1/S2/S5 cache hit rate ${fmtPct(resolvedReport.metrics.cache_hit_rate)})`,
+          tRef.current("lab.toast.evalCompleted", {
+            evalId: resolvedReport.eval_id,
+            epCount,
+            rate: fmtPct(resolvedReport.metrics.cache_hit_rate),
+          }),
           "success",
         );
       } else {
         if (evalRunId) setCandidateId(evalRunId);
-        showLabInfo(`Evaluation job completed: ${evalRunId ?? job.job_id}`, "success");
+        showLabInfo(
+          tRef.current("lab.toast.evalJobCompleted", { id: evalRunId ?? job.job_id }),
+          "success",
+        );
       }
     },
     [baselineId, showLabInfo],
@@ -689,7 +719,7 @@ export const VlmLabPage: React.FC = () => {
   }, [activeEvalJobId, activeEvalJobStatus, finalizeEvalJob, jobStoreProvided, trackJobInStore]);
 
   if (authProbing) {
-    return <div className="page-container">Verifying permissions...</div>;
+    return <div className="page-container">{t("lab.auth.verifying")}</div>;
   }
 
   if (!isLead) {
@@ -697,8 +727,8 @@ export const VlmLabPage: React.FC = () => {
       <div className="page-container" data-testid="lab-forbidden">
         <div className="forbidden-card">
           <ShieldOff size={32} />
-          <h2>403 — Forbidden</h2>
-          <p>VLM Lab is restricted to Lead users. Reviewers should return to the Work Queue.</p>
+          <h2>{t("lab.auth.forbiddenTitle")}</h2>
+          <p>{t("lab.auth.forbiddenDesc")}</p>
         </div>
       </div>
     );
@@ -712,7 +742,7 @@ export const VlmLabPage: React.FC = () => {
         mode: "merge",
         targetLabelId:
           labelsList.find((l) => l.id !== "unknown_anomaly")?.id ?? "hesitation_oscillation",
-        rationale: item.unknown_note || "Merge into existing visual label",
+        rationale: item.unknown_note || t("lab.unknowns.defaultRationale"),
         newId: "",
         newName: "",
         newCategory: "failure",
@@ -744,15 +774,22 @@ export const VlmLabPage: React.FC = () => {
           seg_id: item.seg_id,
           action: "merge",
           target_label_id: draft.targetLabelId,
-          rationale: draft.rationale.trim() || item.unknown_note || "Merge unknown anomaly",
+          rationale:
+            draft.rationale.trim() ||
+            item.unknown_note ||
+            t("lab.unknowns.fallbackMergeRationale"),
         });
         showLabInfo(
-          `Merged ${item.seg_id} into ${draft.targetLabelId} and recorded Few-Shot (${res.few_shot_id ?? "ok"})`,
+          t("lab.toast.unknownMerged", {
+            segId: item.seg_id,
+            targetLabelId: draft.targetLabelId,
+            fewShotId: res.few_shot_id ?? "ok",
+          }),
           "success",
         );
       } else {
         if (!draft.newId.trim() || !draft.newName.trim()) {
-          throw new Error("Promoting a new label requires both a label ID and a display name");
+          throw new Error(t("lab.err.promoteRequireIdName"));
         }
         const newLabel: VisualLabelDef = {
           id: draft.newId.trim(),
@@ -780,13 +817,16 @@ export const VlmLabPage: React.FC = () => {
           new_label: newLabel,
         });
         showLabInfo(
-          `Promoted unknown anomaly to new label ${newLabel.id} (registry v${res.label_version ?? "updated"}, archived to .history/)`,
+          t("lab.toast.unknownPromoted", {
+            labelId: newLabel.id,
+            version: res.label_version ?? "updated",
+          }),
           "success",
         );
       }
       await Promise.all([loadUnknowns(), loadLabels()]);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to triage unknown anomaly");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.triageUnknown"));
     } finally {
       setTriageBusyKey(null);
     }
@@ -797,14 +837,18 @@ export const VlmLabPage: React.FC = () => {
     setQuickFsError(err);
     setQuickFsScope(err.task_id ? `task:${err.task_id}` : "global");
     setQuickFsRationale(
-      err.summary || `Visual criterion correction for ${err.error_type} (${err.label_id ?? "task"})`,
+      err.summary ||
+        t("lab.fewShots.defaultQuickRationale", {
+          errorType: err.error_type,
+          target: err.label_id ?? "task",
+        }),
     );
   };
 
   const submitQuickFewShot = async () => {
     if (!quickFsError) return;
     if (!quickFsRationale.trim()) {
-      setErrorMsg("Please provide a Few-Shot rationale");
+      setErrorMsg(t("lab.err.quickFsRationaleRequired"));
       return;
     }
     setQuickFsSaving(true);
@@ -835,11 +879,11 @@ export const VlmLabPage: React.FC = () => {
         rationale: quickFsRationale.trim(),
         capture_tile: true,
       });
-      showLabInfo(`Added to Few-Shot Mistake Book: ${created.example_id}`, "success");
+      showLabInfo(t("lab.toast.quickFsAdded", { id: created.example_id }), "success");
       setQuickFsError(null);
       setQuickFsRationale("");
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to add Few-Shot example");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.addFewShot"));
     } finally {
       setQuickFsSaving(false);
     }
@@ -853,13 +897,13 @@ export const VlmLabPage: React.FC = () => {
     try {
       const tStart = Number(manualFsStart);
       const tEnd = Number(manualFsEnd);
-      if (!manualFsEpisode.trim()) throw new Error("Please enter episode_id");
+      if (!manualFsEpisode.trim()) throw new Error(t("lab.err.episodeIdRequired"));
       if (!Number.isFinite(tStart) || !Number.isFinite(tEnd) || tEnd <= tStart) {
-        throw new Error("Invalid time span: t_end must be greater than t_start");
+        throw new Error(t("lab.err.invalidTimeSpan"));
       }
-      if (!manualFsRationale.trim()) throw new Error("Please enter a rationale");
-      const vlmWrong = parseJsonObject(manualFsWrong);
-      const humanRight = parseJsonObject(manualFsRight);
+      if (!manualFsRationale.trim()) throw new Error(t("lab.err.rationaleRequired"));
+      const vlmWrong = parseJsonObject(manualFsWrong, t("lab.err.jsonMustBeObject"));
+      const humanRight = parseJsonObject(manualFsRight, t("lab.err.jsonMustBeObject"));
       const created = await createFewShot({
         scope: manualFsScope.trim() || "global",
         task_id: manualFsTask.trim() || null,
@@ -873,11 +917,11 @@ export const VlmLabPage: React.FC = () => {
         rationale: manualFsRationale.trim(),
         capture_tile: manualFsCaptureTile,
       });
-      showLabInfo(`Created Few-Shot example: ${created.example_id}`, "success");
+      showLabInfo(t("lab.toast.manualFsCreated", { id: created.example_id }), "success");
       setManualFsOpen(false);
       await loadFewShots();
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to create Few-Shot example");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.createFewShot"));
     }
   };
 
@@ -889,7 +933,7 @@ export const VlmLabPage: React.FC = () => {
         prev.map((x) => (x.example_id === item.example_id ? updated : x)),
       );
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to toggle Few-Shot status");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.toggleFewShot"));
     }
   };
 
@@ -914,7 +958,7 @@ export const VlmLabPage: React.FC = () => {
 
   const handleAddNewLabel = () => {
     if (!newLabelDraft.id.trim() || !newLabelDraft.name.trim()) {
-      setErrorMsg("New label requires both an ID and a display name");
+      setErrorMsg(t("lab.err.newLabelRequireIdName"));
       return;
     }
     const baseReg: LabelRegistry = registry ?? {
@@ -924,7 +968,7 @@ export const VlmLabPage: React.FC = () => {
       labels: DEFAULT_VISUAL_LABELS,
     };
     if (baseReg.labels.some((l) => l.id === newLabelDraft.id.trim())) {
-      setErrorMsg(`Label ID "${newLabelDraft.id.trim()}" already exists`);
+      setErrorMsg(t("lab.err.labelIdExists", { id: newLabelDraft.id.trim() }));
       return;
     }
     const added: VisualLabelDef = {
@@ -939,7 +983,7 @@ export const VlmLabPage: React.FC = () => {
     });
     setSelectedLabelId(added.id);
     setNewLabelOpen(false);
-    showLabInfo(`Added label draft ${added.id} (click "Save Label Registry" to persist)`);
+    showLabInfo(t("lab.toast.labelDraftAdded", { id: added.id }));
   };
 
   const handleSaveLabels = async () => {
@@ -963,9 +1007,9 @@ export const VlmLabPage: React.FC = () => {
       };
       const saved = await putLabLabels(sanitized);
       setRegistry(saved);
-      showLabInfo(`Label registry saved (v${saved.version}); previous version archived to .history/`, "success");
+      showLabInfo(t("lab.toast.labelsSaved", { version: saved.version }), "success");
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to save label registry");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.saveLabels"));
     } finally {
       setSavingConfig(false);
     }
@@ -993,11 +1037,14 @@ export const VlmLabPage: React.FC = () => {
       const saved = await putLabPrompts(prompts);
       setPrompts(saved);
       showLabInfo(
-        `Prompt bundle saved (${selectedStage} v${saved[selectedStage].version}); previous version archived to .history/`,
+        t("lab.toast.promptsSaved", {
+          stage: selectedStage,
+          version: saved[selectedStage].version,
+        }),
         "success",
       );
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to save prompt bundle");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.savePrompts"));
     } finally {
       setSavingConfig(false);
     }
@@ -1014,7 +1061,7 @@ export const VlmLabPage: React.FC = () => {
       });
       setAssistPreview(res);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to generate prompt revision suggestions");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.promptAssist"));
     } finally {
       setAssistLoading(false);
     }
@@ -1035,7 +1082,7 @@ export const VlmLabPage: React.FC = () => {
       patch.user_template = `${activePromptTpl.user_template}\n\n# Suggested revision reference:\n${assistPreview.suggested_prompt_diff}`;
     }
     updateActivePrompt(patch);
-    showLabInfo("Applied AI suggestion to local draft (not saved yet; click Save when ready)");
+    showLabInfo(t("lab.toast.assistApplied"));
   };
 
   const activeTaskSpec = tasksMap[selectedTaskId] ?? null;
@@ -1062,11 +1109,14 @@ export const VlmLabPage: React.FC = () => {
       const res = await putLabTasks(sanitizedTask);
       setTasksMap(res.tasks);
       showLabInfo(
-        `TaskSpec "${sanitizedTask.task_id}" (v${sanitizedTask.version}) saved and backed up to .history/`,
+        t("lab.toast.taskSaved", {
+          taskId: sanitizedTask.task_id,
+          version: sanitizedTask.version,
+        }),
         "success",
       );
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to save TaskSpec");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.saveTask"));
     } finally {
       setSavingConfig(false);
     }
@@ -1098,10 +1148,10 @@ export const VlmLabPage: React.FC = () => {
       if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
         await finalizeEvalJob(job);
       } else {
-        showLabInfo(`Submitted GT regression evaluation job ${job.job_id}`);
+        showLabInfo(t("lab.toast.evalSubmitted", { jobId: job.job_id }));
       }
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to submit GT regression eval job");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.submitEval"));
       setEvalRunning(false);
     }
   };
@@ -1132,12 +1182,14 @@ export const VlmLabPage: React.FC = () => {
         reason: promoteReason.trim() || "lab_promote",
       });
       showLabInfo(
-        `Promoted config to active workspace (${res.promoted_files.join(", ") || "configs_override"}); frozen GT and historical benchmarks remain untouched.`,
+        t("lab.toast.promoted", {
+          files: res.promoted_files.join(", ") || "configs_override",
+        }),
         "success",
       );
       await Promise.all([loadLabels(), loadPrompts(), loadTasks()]);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to promote config");
+      setErrorMsg(err instanceof Error ? err.message : t("lab.err.promote"));
     } finally {
       setPromoting(false);
     }
@@ -1152,12 +1204,8 @@ export const VlmLabPage: React.FC = () => {
     <div className="page-container" data-testid="vlm-lab-page">
       <div className="page-header">
         <div>
-          <h1>VLM Lab Closed-Loop Iteration Workbench (Lead)</h1>
-          <p className="subtitle">
-            Pure In-Context Closed-Loop Evolution: Error Diagnosis &amp; Unknown Triage → 2×2 Visual
-            Few-Shot Mistake Book → Versioned Labels / Prompts / TaskSpecs → GT Regression Eval
-            Sandbox &amp; One-Click Promote
-          </p>
+          <h1>{t("lab.title")}</h1>
+          <p className="subtitle">{t("lab.subtitle")}</p>
         </div>
       </div>
 
@@ -1165,7 +1213,7 @@ export const VlmLabPage: React.FC = () => {
         <div className="error-banner" data-testid="lab-error-banner">
           <span>{errorMsg}</span>
           <button type="button" className="mini-btn" onClick={() => setErrorMsg(null)}>
-            Dismiss
+            {t("lab.common.dismiss")}
           </button>
         </div>
       )}
@@ -1177,7 +1225,7 @@ export const VlmLabPage: React.FC = () => {
           className={`tab-btn ${activeTab === "diagnosis" ? "active" : ""}`}
           onClick={() => setActiveTab("diagnosis")}
         >
-          <Sparkles size={14} /> Diagnosis &amp; Unknown Triage
+          <Sparkles size={14} /> {t("lab.tab.diagnosis")}
         </button>
         <button
           type="button"
@@ -1185,7 +1233,7 @@ export const VlmLabPage: React.FC = () => {
           className={`tab-btn ${activeTab === "few_shots" ? "active" : ""}`}
           onClick={() => setActiveTab("few_shots")}
         >
-          <Bookmark size={14} /> Few-Shot Mistake Book
+          <Bookmark size={14} /> {t("lab.tab.fewShots")}
         </button>
         <button
           type="button"
@@ -1193,7 +1241,7 @@ export const VlmLabPage: React.FC = () => {
           className={`tab-btn ${activeTab === "taxonomy" ? "active" : ""}`}
           onClick={() => setActiveTab("taxonomy")}
         >
-          <Layers size={14} /> Labels / Prompts / TaskSpecs
+          <Layers size={14} /> {t("lab.tab.taxonomy")}
         </button>
         <button
           type="button"
@@ -1201,7 +1249,7 @@ export const VlmLabPage: React.FC = () => {
           className={`tab-btn ${activeTab === "eval" ? "active" : ""}`}
           onClick={() => setActiveTab("eval")}
         >
-          <FlaskConical size={14} /> GT Eval Sandbox
+          <FlaskConical size={14} /> {t("lab.tab.eval")}
         </button>
       </div>
 
@@ -1210,18 +1258,18 @@ export const VlmLabPage: React.FC = () => {
         <div className="page-container" data-testid="lab-panel-diagnosis">
           <div className="panel-card">
             <div className="section-header-row">
-              <h3>VLM Raw vs Human GT Fine-Grained Error Diagnosis</h3>
+              <h3>{t("lab.diag.title")}</h3>
               <div className="filter-toolbar">
                 <input
                   type="text"
-                  aria-label="Filter episode_ids"
-                  placeholder="episode_ids (comma-separated, optional)"
+                  aria-label={t("lab.diag.filterEpAria")}
+                  placeholder={t("lab.diag.filterEpPlaceholder")}
                   value={diagEpFilter}
                   onChange={(e) => setDiagEpFilter(e.target.value)}
                 />
                 <input
                   type="number"
-                  aria-label="Top-N"
+                  aria-label={t("lab.diag.topNAria")}
                   min={1}
                   max={200}
                   style={{ width: 84 }}
@@ -1235,7 +1283,8 @@ export const VlmLabPage: React.FC = () => {
                   disabled={diagLoading}
                   onClick={() => void loadDiagnosis()}
                 >
-                  <RefreshCw size={13} /> {diagLoading ? "Diagnosing..." : "Refresh Diagnosis"}
+                  <RefreshCw size={13} />{" "}
+                  {diagLoading ? t("lab.diag.diagnosing") : t("lab.diag.refreshBtn")}
                 </button>
               </div>
             </div>
@@ -1243,17 +1292,17 @@ export const VlmLabPage: React.FC = () => {
             <div className="lab-kpi-strip" data-testid="diagnosis-kpi-strip">
               <div className="lab-kpi-card">
                 <span className="lab-kpi-val">{diagnosis?.episodes_evaluated ?? 0}</span>
-                <span className="lab-kpi-lbl">Evaluated GT Episodes</span>
+                <span className="lab-kpi-lbl">{t("lab.diag.kpiEvaluated")}</span>
               </div>
               <div className="lab-kpi-card">
                 <span className="lab-kpi-val">{diagnosis?.total_errors ?? 0}</span>
-                <span className="lab-kpi-lbl">Total Errors</span>
+                <span className="lab-kpi-lbl">{t("lab.diag.kpiTotalErrors")}</span>
               </div>
               {DIAGNOSIS_BUCKETS.map((b) => (
                 <div key={b.key} className="lab-kpi-card" data-testid={`kpi-bucket-${b.key}`}>
                   <span className="lab-kpi-val">{diagnosis?.counts_by_type?.[b.key] ?? 0}</span>
                   <span className="lab-kpi-lbl">
-                    {b.label} ({b.key})
+                    {t(b.labelKey)} ({b.key})
                   </span>
                 </div>
               ))}
@@ -1263,35 +1312,38 @@ export const VlmLabPage: React.FC = () => {
               <div className="lab-card" data-testid="quick-fewshot-form">
                 <div className="section-header-row">
                   <strong>
-                    Quick Add Few-Shot Example: {quickFsError.episode_id} ({quickFsError.error_type})
+                    {t("lab.diag.quickFsTitle", {
+                      episodeId: quickFsError.episode_id,
+                      errorType: quickFsError.error_type,
+                    })}
                   </strong>
                   <button
                     type="button"
                     className="mini-btn"
                     onClick={() => setQuickFsError(null)}
                   >
-                    Cancel
+                    {t("lab.common.cancel")}
                   </button>
                 </div>
                 <div className="two-col">
                   <label className="field-group">
-                    <span>Scope (scope)</span>
+                    <span>{t("lab.diag.quickFsScope")}</span>
                     <select value={quickFsScope} onChange={(e) => setQuickFsScope(e.target.value)}>
-                      <option value="global">Global (global)</option>
+                      <option value="global">{t("lab.diag.scopeGlobal")}</option>
                       {quickFsError.task_id && (
                         <option value={`task:${quickFsError.task_id}`}>
-                          Task (task:{quickFsError.task_id})
+                          {t("lab.diag.scopeTask", { taskId: quickFsError.task_id })}
                         </option>
                       )}
                       {quickFsError.label_id && (
                         <option value={`label:${quickFsError.label_id}`}>
-                          Label (label:{quickFsError.label_id})
+                          {t("lab.diag.scopeLabel", { labelId: quickFsError.label_id })}
                         </option>
                       )}
                     </select>
                   </label>
                   <label className="field-group">
-                    <span>Time Span</span>
+                    <span>{t("lab.diag.timeSpan")}</span>
                     <input
                       type="text"
                       readOnly
@@ -1300,12 +1352,12 @@ export const VlmLabPage: React.FC = () => {
                   </label>
                 </div>
                 <label className="field-group">
-                  <span>Rationale (rationale)</span>
+                  <span>{t("lab.fewShots.rationaleLabel")}</span>
                   <textarea
                     rows={2}
                     value={quickFsRationale}
                     onChange={(e) => setQuickFsRationale(e.target.value)}
-                    placeholder="Explain the visual criterion and pitfall..."
+                    placeholder={t("lab.diag.quickFsRationalePlaceholder")}
                   />
                 </label>
                 <div>
@@ -1316,7 +1368,7 @@ export const VlmLabPage: React.FC = () => {
                     disabled={quickFsSaving}
                     onClick={() => void submitQuickFewShot()}
                   >
-                    {quickFsSaving ? "Capturing & Saving..." : "Confirm & Save (with 2×2 Tile)"}
+                    {quickFsSaving ? t("lab.diag.quickFsSaving") : t("lab.diag.quickFsSubmit")}
                   </button>
                 </div>
               </div>
@@ -1326,19 +1378,19 @@ export const VlmLabPage: React.FC = () => {
               <table className="data-table" data-testid="diagnosis-errors-table">
                 <thead>
                   <tr>
-                    <th>Episode</th>
-                    <th>Error Type</th>
-                    <th>Label / Segment</th>
-                    <th>Time Span</th>
-                    <th>VLM vs GT Details</th>
-                    <th>Action</th>
+                    <th>{t("lab.diag.colEpisode")}</th>
+                    <th>{t("lab.diag.colErrorType")}</th>
+                    <th>{t("lab.diag.colLabelSegment")}</th>
+                    <th>{t("lab.diag.colTimeSpan")}</th>
+                    <th>{t("lab.diag.colDetails")}</th>
+                    <th>{t("lab.diag.colAction")}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {errorItems.length === 0 ? (
                     <tr>
                       <td colSpan={6} className="empty-cell">
-                        No diagnosis errors yet (ensure episodes have human reviews or frozen GT).
+                        {t("lab.diag.emptyTable")}
                       </td>
                     </tr>
                   ) : (
@@ -1372,14 +1424,14 @@ export const VlmLabPage: React.FC = () => {
                         <td className="mono small">
                           {err.t_start !== null && err.t_start !== undefined && err.t_end !== null && err.t_end !== undefined
                             ? `${err.t_start.toFixed(2)}s–${err.t_end.toFixed(2)}s`
-                            : "Global"}
+                            : t("lab.diag.spanGlobal")}
                         </td>
                         <td className="small">
-                          <div>{err.summary || "VLM prediction diverges from Human GT"}</div>
+                          <div>{err.summary || t("lab.diag.defaultSummary")}</div>
                           {(err.vlm_value !== undefined || err.gt_value !== undefined) && (
                             err.error_type === "stage" ? (
                               <div className="diag-stage-diff">
-                                {summarizeStageDiff(err.vlm_value, err.gt_value).map((line, lineIdx) => (
+                                {summarizeStageDiff(err.vlm_value, err.gt_value, t).map((line, lineIdx) => (
                                   <div key={lineIdx} className="diag-stage-item">
                                     {line}
                                   </div>
@@ -1387,13 +1439,13 @@ export const VlmLabPage: React.FC = () => {
                               </div>
                             ) : (
                               <div className="muted mono">
-                                VLM: {fmtCompactDiagValue(err.vlm_value)} → GT: {fmtCompactDiagValue(err.gt_value)}
+                                VLM: {fmtCompactDiagValue(err.vlm_value, t)} → GT: {fmtCompactDiagValue(err.gt_value, t)}
                               </div>
                             )
                           )}
                           {(err.vlm_value !== undefined || err.gt_value !== undefined) && (
                             <details className="diag-raw-json">
-                              <summary>View raw JSON</summary>
+                              <summary>{t("lab.diag.viewRawJson")}</summary>
                               <pre className="json-box">
                                 {safeJsonStringify({
                                   vlm: err.vlm_value ?? null,
@@ -1410,7 +1462,7 @@ export const VlmLabPage: React.FC = () => {
                             data-testid={`quick-fewshot-btn-${idx}`}
                             onClick={() => openQuickFewShot(err)}
                           >
-                            <Plus size={12} /> Add Few-Shot
+                            <Plus size={12} /> {t("lab.diag.addFewShotBtn")}
                           </button>
                         </td>
                       </tr>
@@ -1423,12 +1475,12 @@ export const VlmLabPage: React.FC = () => {
 
           <div className="panel-card" data-testid="unknown-triage-panel">
             <div className="section-header-row">
-              <h3>Unknown Anomaly Triage Pool (`unknown_anomaly` · {unkTotal} pending)</h3>
+              <h3>{t("lab.unknowns.title", { count: unkTotal })}</h3>
               <div className="filter-toolbar">
                 <input
                   type="text"
-                  aria-label="Filter unknown anomaly dataset"
-                  placeholder="Filter dataset (optional)"
+                  aria-label={t("lab.unknowns.filterDatasetAria")}
+                  placeholder={t("lab.unknowns.filterDatasetPlaceholder")}
                   value={unkDatasetFilter}
                   onChange={(e) => setUnkDatasetFilter(e.target.value)}
                 />
@@ -1438,13 +1490,13 @@ export const VlmLabPage: React.FC = () => {
                   data-testid="refresh-unknowns-btn"
                   onClick={() => void loadUnknowns()}
                 >
-                  <RefreshCw size={13} /> Refresh Pool
+                  <RefreshCw size={13} /> {t("lab.unknowns.refreshBtn")}
                 </button>
               </div>
             </div>
 
             {unknowns.length === 0 ? (
-              <div className="muted">No pending unknown_anomaly segments to triage.</div>
+              <div className="muted">{t("lab.unknowns.empty")}</div>
             ) : (
               <div className="lab-card-grid">
                 {unknowns.map((item) => {
@@ -1465,8 +1517,8 @@ export const VlmLabPage: React.FC = () => {
                         </span>
                       </div>
                       <div className="small">
-                        <strong>Observation: </strong>
-                        {item.unknown_note || "(No description provided)"}
+                        <strong>{t("lab.unknowns.observationLabel")}</strong>
+                        {item.unknown_note || t("lab.unknowns.noDescription")}
                       </div>
 
                       <div className="tab-group">
@@ -1476,7 +1528,7 @@ export const VlmLabPage: React.FC = () => {
                           data-testid={`triage-mode-merge-${item.seg_id}`}
                           onClick={() => patchTriageDraft(item, { mode: "merge" })}
                         >
-                          Merge into Existing Label
+                          {t("lab.unknowns.modeMerge")}
                         </button>
                         <button
                           type="button"
@@ -1484,16 +1536,16 @@ export const VlmLabPage: React.FC = () => {
                           data-testid={`triage-mode-promote-${item.seg_id}`}
                           onClick={() => patchTriageDraft(item, { mode: "promote" })}
                         >
-                          Promote to New Label
+                          {t("lab.unknowns.modePromote")}
                         </button>
                       </div>
 
                       {draft.mode === "merge" ? (
                         <div className="field-group">
                           <label className="field-group">
-                            <span>Target Label</span>
+                            <span>{t("lab.unknowns.targetLabel")}</span>
                             <select
-                              aria-label={`Target label-${item.seg_id}`}
+                              aria-label={t("lab.unknowns.targetLabelAria", { segId: item.seg_id })}
                               value={draft.targetLabelId}
                               onChange={(e) =>
                                 patchTriageDraft(item, { targetLabelId: e.target.value })
@@ -1509,7 +1561,7 @@ export const VlmLabPage: React.FC = () => {
                             </select>
                           </label>
                           <label className="field-group">
-                            <span>Merge Rationale (creates Few-Shot counter-example)</span>
+                            <span>{t("lab.unknowns.mergeRationale")}</span>
                             <input
                               type="text"
                               value={draft.rationale}
@@ -1525,28 +1577,28 @@ export const VlmLabPage: React.FC = () => {
                             disabled={busy}
                             onClick={() => void handleTriageSubmit(item)}
                           >
-                            {busy ? "Processing..." : "Confirm Merge & Save Few-Shot"}
+                            {busy ? t("lab.unknowns.processing") : t("lab.unknowns.confirmMergeBtn")}
                           </button>
                         </div>
                       ) : (
                         <div className="field-group">
                           <div className="two-col">
                             <label className="field-group">
-                              <span>New Label ID</span>
+                              <span>{t("lab.unknowns.newIdLabel")}</span>
                               <input
                                 type="text"
-                                placeholder="e.g. cable_snag"
-                                aria-label={`New label ID-${item.seg_id}`}
+                                placeholder={t("lab.unknowns.newIdPlaceholder")}
+                                aria-label={t("lab.unknowns.newIdAria", { segId: item.seg_id })}
                                 value={draft.newId}
                                 onChange={(e) => patchTriageDraft(item, { newId: e.target.value })}
                               />
                             </label>
                             <label className="field-group">
-                              <span>Display Name</span>
+                              <span>{t("lab.unknowns.newNameLabel")}</span>
                               <input
                                 type="text"
-                                placeholder="e.g. Cable Snag"
-                                aria-label={`New label name-${item.seg_id}`}
+                                placeholder={t("lab.unknowns.newNamePlaceholder")}
+                                aria-label={t("lab.unknowns.newNameAria", { segId: item.seg_id })}
                                 value={draft.newName}
                                 onChange={(e) =>
                                   patchTriageDraft(item, { newName: e.target.value })
@@ -1556,7 +1608,7 @@ export const VlmLabPage: React.FC = () => {
                           </div>
                           <div className="three-col">
                             <label className="field-group">
-                              <span>Category</span>
+                              <span>{t("lab.taxonomy.category")}</span>
                               <select
                                 value={draft.newCategory}
                                 onChange={(e) =>
@@ -1567,13 +1619,13 @@ export const VlmLabPage: React.FC = () => {
                               >
                                 {LABEL_CATEGORIES.map((c) => (
                                   <option key={c} value={c}>
-                                    {c}
+                                    {t(`lab.category.${c}`)}
                                   </option>
                                 ))}
                               </select>
                             </label>
                             <label className="field-group">
-                              <span>Training Role</span>
+                              <span>{t("lab.unknowns.trainingRole")}</span>
                               <select
                                 value={draft.newRole}
                                 onChange={(e) =>
@@ -1582,14 +1634,14 @@ export const VlmLabPage: React.FC = () => {
                                   })
                                 }
                               >
-                                <option value="badcase">badcase</option>
-                                <option value="recovery">recovery</option>
-                                <option value="necessary">necessary</option>
-                                <option value="terminal_fail">terminal_fail</option>
+                                <option value="badcase">{t("lab.role.badcase")}</option>
+                                <option value="recovery">{t("lab.role.recovery")}</option>
+                                <option value="necessary">{t("lab.role.necessary")}</option>
+                                <option value="terminal_fail">{t("lab.role.terminal_fail")}</option>
                               </select>
                             </label>
                             <label className="field-group">
-                              <span>Splice Policy</span>
+                              <span>{t("lab.unknowns.splicePolicy")}</span>
                               <select
                                 value={draft.newPolicy}
                                 onChange={(e) =>
@@ -1598,18 +1650,18 @@ export const VlmLabPage: React.FC = () => {
                                   })
                                 }
                               >
-                                <option value="mask_loss">mask_loss</option>
-                                <option value="keep_positive">keep_positive</option>
-                                <option value="cut_clean">cut_clean</option>
+                                <option value="mask_loss">{t("lab.policy.mask_loss")}</option>
+                                <option value="keep_positive">{t("lab.policy.keep_positive")}</option>
+                                <option value="cut_clean">{t("lab.policy.cut_clean")}</option>
                               </select>
                             </label>
                           </div>
                           <div className="two-col">
                             <label className="field-group">
-                              <span>Reviewer UI Title</span>
+                              <span>{t("lab.unknowns.uiTitle")}</span>
                               <input
                                 type="text"
-                                placeholder="e.g. Cable or Gripper Snag"
+                                placeholder={t("lab.unknowns.uiTitlePlaceholder")}
                                 value={draft.newUiTitle}
                                 onChange={(e) =>
                                   patchTriageDraft(item, { newUiTitle: e.target.value })
@@ -1617,7 +1669,7 @@ export const VlmLabPage: React.FC = () => {
                               />
                             </label>
                             <label className="field-group">
-                              <span>VLM Semantic Definition</span>
+                              <span>{t("lab.unknowns.vlmDefinition")}</span>
                               <input
                                 type="text"
                                 value={draft.newDefinition}
@@ -1634,7 +1686,7 @@ export const VlmLabPage: React.FC = () => {
                             disabled={busy}
                             onClick={() => void handleTriageSubmit(item)}
                           >
-                            {busy ? "Promoting..." : "Promote to New Label (bumps version & archives .history/)"}
+                            {busy ? t("lab.unknowns.promoting") : t("lab.unknowns.confirmPromoteBtn")}
                           </button>
                         </div>
                       )}
@@ -1651,7 +1703,7 @@ export const VlmLabPage: React.FC = () => {
       {activeTab === "few_shots" && (
         <div className="panel-card" data-testid="lab-panel-few-shots">
           <div className="section-header-row">
-            <h3>Visual / Text Few-Shot Mistake Book (Auto-injected into S3 / S4)</h3>
+            <h3>{t("lab.fewShots.title")}</h3>
             <div className="filter-toolbar">
               <button
                 type="button"
@@ -1659,7 +1711,7 @@ export const VlmLabPage: React.FC = () => {
                 data-testid="open-manual-fewshot-btn"
                 onClick={() => setManualFsOpen((v) => !v)}
               >
-                <Plus size={13} /> Add Few-Shot Example
+                <Plus size={13} /> {t("lab.fewShots.addBtn")}
               </button>
               <button
                 type="button"
@@ -1667,18 +1719,18 @@ export const VlmLabPage: React.FC = () => {
                 data-testid="refresh-fewshots-btn"
                 onClick={() => void loadFewShots()}
               >
-                <RefreshCw size={13} /> Refresh
+                <RefreshCw size={13} /> {t("lab.common.refresh")}
               </button>
             </div>
           </div>
 
           <div className="filter-toolbar">
             <select
-              aria-label="Filter by scope"
+              aria-label={t("lab.fewShots.filterScopeAria")}
               value={fsScopeFilter}
               onChange={(e) => setFsScopeFilter(e.target.value)}
             >
-              <option value="">All Scopes</option>
+              <option value="">{t("lab.fewShots.allScopes")}</option>
               <option value="global">global</option>
               {Object.keys(tasksMap).map((tid) => (
                 <option key={tid} value={`task:${tid}`}>
@@ -1693,13 +1745,13 @@ export const VlmLabPage: React.FC = () => {
             </select>
             <input
               type="text"
-              placeholder="Filter by task_id"
+              placeholder={t("lab.fewShots.filterTaskPlaceholder")}
               value={fsTaskFilter}
               onChange={(e) => setFsTaskFilter(e.target.value)}
             />
             <input
               type="text"
-              placeholder="Filter by label_id"
+              placeholder={t("lab.fewShots.filterLabelPlaceholder")}
               value={fsLabelFilter}
               onChange={(e) => setFsLabelFilter(e.target.value)}
             />
@@ -1709,14 +1761,14 @@ export const VlmLabPage: React.FC = () => {
                 checked={fsEnabledOnly}
                 onChange={(e) => setFsEnabledOnly(e.target.checked)}
               />
-              <span>Enabled only</span>
+              <span>{t("lab.fewShots.enabledOnly")}</span>
             </label>
             <button
               type="button"
               className="primary-btn compact"
               onClick={() => void loadFewShots()}
             >
-              Apply Filters
+              {t("lab.fewShots.applyFiltersBtn")}
             </button>
           </div>
 
@@ -1726,10 +1778,10 @@ export const VlmLabPage: React.FC = () => {
               data-testid="manual-fewshot-form"
               onSubmit={(e) => void handleManualCreateFewShot(e)}
             >
-              <h4>Add Few-Shot Example (auto-captures 2×2 keyframe comparison tile)</h4>
+              <h4>{t("lab.fewShots.manualFormTitle")}</h4>
               <div className="three-col">
                 <label className="field-group">
-                  <span>episode_id</span>
+                  <span>{t("lab.fewShots.episodeIdLabel")}</span>
                   <input
                     type="text"
                     placeholder="demo_ds/ep_001"
@@ -1738,7 +1790,7 @@ export const VlmLabPage: React.FC = () => {
                   />
                 </label>
                 <label className="field-group">
-                  <span>t_start (s)</span>
+                  <span>{t("lab.fewShots.tStartLabel")}</span>
                   <input
                     type="number"
                     step={0.1}
@@ -1747,7 +1799,7 @@ export const VlmLabPage: React.FC = () => {
                   />
                 </label>
                 <label className="field-group">
-                  <span>t_end (s)</span>
+                  <span>{t("lab.fewShots.tEndLabel")}</span>
                   <input
                     type="number"
                     step={0.1}
@@ -1758,7 +1810,7 @@ export const VlmLabPage: React.FC = () => {
               </div>
               <div className="three-col">
                 <label className="field-group">
-                  <span>scope</span>
+                  <span>{t("lab.fewShots.scopeLabel")}</span>
                   <input
                     type="text"
                     value={manualFsScope}
@@ -1767,7 +1819,7 @@ export const VlmLabPage: React.FC = () => {
                   />
                 </label>
                 <label className="field-group">
-                  <span>task_id (optional)</span>
+                  <span>{t("lab.fewShots.taskIdOptional")}</span>
                   <input
                     type="text"
                     value={manualFsTask}
@@ -1775,7 +1827,7 @@ export const VlmLabPage: React.FC = () => {
                   />
                 </label>
                 <label className="field-group">
-                  <span>Error Type</span>
+                  <span>{t("lab.fewShots.errorTypeLabel")}</span>
                   <select
                     value={manualFsErrorType}
                     onChange={(e) =>
@@ -1784,7 +1836,7 @@ export const VlmLabPage: React.FC = () => {
                   >
                     {DIAGNOSIS_BUCKETS.map((b) => (
                       <option key={b.key} value={b.key}>
-                        {b.label} ({b.key})
+                        {t(b.labelKey)} ({b.key})
                       </option>
                     ))}
                   </select>
@@ -1792,7 +1844,7 @@ export const VlmLabPage: React.FC = () => {
               </div>
               <div className="two-col">
                 <label className="field-group">
-                  <span>label_id (optional)</span>
+                  <span>{t("lab.fewShots.labelIdOptional")}</span>
                   <input
                     type="text"
                     value={manualFsLabel}
@@ -1805,12 +1857,12 @@ export const VlmLabPage: React.FC = () => {
                     checked={manualFsCaptureTile}
                     onChange={(e) => setManualFsCaptureTile(e.target.checked)}
                   />
-                  <span>Auto-capture 2×2 keyframe comparison tile (capture_tile)</span>
+                  <span>{t("lab.fewShots.captureTileLabel")}</span>
                 </label>
               </div>
               <div className="two-col">
                 <label className="field-group">
-                  <span>vlm_wrong_json</span>
+                  <span>{t("lab.fewShots.vlmWrongJsonLabel")}</span>
                   <textarea
                     rows={3}
                     className="code-textarea"
@@ -1819,7 +1871,7 @@ export const VlmLabPage: React.FC = () => {
                   />
                 </label>
                 <label className="field-group">
-                  <span>human_right_json</span>
+                  <span>{t("lab.fewShots.humanRightJsonLabel")}</span>
                   <textarea
                     rows={3}
                     className="code-textarea"
@@ -1829,33 +1881,33 @@ export const VlmLabPage: React.FC = () => {
                 </label>
               </div>
               <label className="field-group">
-                <span>Rationale (rationale)</span>
+                <span>{t("lab.fewShots.rationaleLabel")}</span>
                 <textarea
                   rows={2}
                   value={manualFsRationale}
                   onChange={(e) => setManualFsRationale(e.target.value)}
-                  placeholder="Explain why the VLM prediction was wrong and the correct visual criterion..."
+                  placeholder={t("lab.fewShots.manualRationalePlaceholder")}
                 />
               </label>
               <div className="header-actions">
                 <button type="submit" className="primary-btn compact">
-                  Save Example
+                  {t("lab.fewShots.saveExampleBtn")}
                 </button>
                 <button
                   type="button"
                   className="secondary-btn compact"
                   onClick={() => setManualFsOpen(false)}
                 >
-                  Cancel
+                  {t("lab.common.cancel")}
                 </button>
               </div>
             </form>
           )}
 
           {fsLoading ? (
-            <div className="muted">Loading Few-Shot examples...</div>
+            <div className="muted">{t("lab.fewShots.loading")}</div>
           ) : fewShots.length === 0 ? (
-            <div className="muted">No Few-Shot examples recorded yet.</div>
+            <div className="muted">{t("lab.fewShots.empty")}</div>
           ) : (
             <div className="lab-card-grid" data-testid="few-shots-list">
               {fewShots.map((fs) => (
@@ -1871,7 +1923,7 @@ export const VlmLabPage: React.FC = () => {
                         checked={fs.enabled}
                         onChange={() => void handleToggleFewShot(fs)}
                       />
-                      <span>{fs.enabled ? "Enabled" : "Disabled"}</span>
+                      <span>{fs.enabled ? t("lab.fewShots.enabled") : t("lab.fewShots.disabled")}</span>
                     </label>
                   </div>
 
@@ -1888,26 +1940,26 @@ export const VlmLabPage: React.FC = () => {
                   {fs.tile_image_path ? (
                     <img
                       src={fewShotTileUrl(fs.example_id)}
-                      alt={`2x2 tile ${fs.example_id}`}
+                      alt={t("lab.fewShots.tileAlt", { id: fs.example_id })}
                       className="few-shot-tile-img"
                     />
                   ) : (
-                    <div className="few-shot-tile-placeholder">Text-only Few-Shot (no tile)</div>
+                    <div className="few-shot-tile-placeholder">{t("lab.fewShots.textOnly")}</div>
                   )}
 
                   <div className="two-col">
                     <div className="field-group">
-                      <span className="muted">VLM Wrong (vlm_wrong_json)</span>
+                      <span className="muted">{t("lab.fewShots.vlmWrongCardLabel")}</span>
                       <pre className="json-box">{safeJsonStringify(fs.vlm_wrong_json)}</pre>
                     </div>
                     <div className="field-group">
-                      <span className="muted">Human GT (human_right_json)</span>
+                      <span className="muted">{t("lab.fewShots.humanGtCardLabel")}</span>
                       <pre className="json-box">{safeJsonStringify(fs.human_right_json)}</pre>
                     </div>
                   </div>
 
                   <div className="small">
-                    <strong>Rationale: </strong>
+                    <strong>{t("lab.fewShots.cardRationale")}</strong>
                     {fs.rationale}
                   </div>
                 </div>
@@ -1928,7 +1980,7 @@ export const VlmLabPage: React.FC = () => {
                 className={`tab-btn ${taxSubTab === "labels" ? "active" : ""}`}
                 onClick={() => setTaxSubTab("labels")}
               >
-                Visual Labels (labels.yaml)
+                {t("lab.taxonomy.subtabLabels")}
               </button>
               <button
                 type="button"
@@ -1936,7 +1988,7 @@ export const VlmLabPage: React.FC = () => {
                 className={`tab-btn ${taxSubTab === "prompts" ? "active" : ""}`}
                 onClick={() => setTaxSubTab("prompts")}
               >
-                Stage Prompts (S1–S5)
+                {t("lab.taxonomy.subtabPrompts")}
               </button>
               <button
                 type="button"
@@ -1944,18 +1996,18 @@ export const VlmLabPage: React.FC = () => {
                 className={`tab-btn ${taxSubTab === "tasks" ? "active" : ""}`}
                 onClick={() => setTaxSubTab("tasks")}
               >
-                Task Specs (TaskSpec)
+                {t("lab.taxonomy.subtabTasks")}
               </button>
             </div>
             <div className="header-actions">
-              <span className="badge-pill ok">Auto-archives snapshot to .history/ before write</span>
+              <span className="badge-pill ok">{t("lab.taxonomy.autoArchiveBadge")}</span>
               <button
                 type="button"
                 className="secondary-btn compact"
                 data-testid="open-history-drawer-btn"
                 onClick={() => setHistoryOpen(true)}
               >
-                <History size={13} /> History &amp; Rollback
+                <History size={13} /> {t("lab.taxonomy.historyBtn")}
               </button>
             </div>
           </div>
@@ -1965,8 +2017,10 @@ export const VlmLabPage: React.FC = () => {
               <div className="section-header-row">
                 <div>
                   <strong>
-                    Active Label Registry: v{registry?.version ?? 1} · {labelsList.length} visual
-                    labels
+                    {t("lab.taxonomy.labelsSummary", {
+                      version: registry?.version ?? 1,
+                      count: labelsList.length,
+                    })}
                   </strong>
                 </div>
                 <div className="header-actions">
@@ -1978,7 +2032,7 @@ export const VlmLabPage: React.FC = () => {
                       setRegistry({ ...registry, version: registry.version + 1 })
                     }
                   >
-                    Bump Version (+1)
+                    {t("lab.taxonomy.bumpVersionBtn")}
                   </button>
                   <button
                     type="button"
@@ -1986,7 +2040,7 @@ export const VlmLabPage: React.FC = () => {
                     data-testid="add-label-btn"
                     onClick={() => setNewLabelOpen((v) => !v)}
                   >
-                    <Plus size={13} /> Add Label
+                    <Plus size={13} /> {t("lab.taxonomy.addLabelBtn")}
                   </button>
                   <button
                     type="button"
@@ -1995,7 +2049,7 @@ export const VlmLabPage: React.FC = () => {
                     disabled={savingConfig || !registry}
                     onClick={() => void handleSaveLabels()}
                   >
-                    {savingConfig ? "Saving..." : "Save Label Registry"}
+                    {savingConfig ? t("lab.common.saving") : t("lab.taxonomy.saveLabelsBtn")}
                   </button>
                 </div>
               </div>
@@ -2004,7 +2058,7 @@ export const VlmLabPage: React.FC = () => {
                 <div className="lab-card" data-testid="new-label-form">
                   <div className="three-col">
                     <label className="field-group">
-                      <span>Label ID</span>
+                      <span>{t("lab.taxonomy.labelId")}</span>
                       <input
                         type="text"
                         placeholder="new_visual_label"
@@ -2015,7 +2069,7 @@ export const VlmLabPage: React.FC = () => {
                       />
                     </label>
                     <label className="field-group">
-                      <span>Display Name</span>
+                      <span>{t("lab.taxonomy.displayName")}</span>
                       <input
                         type="text"
                         value={newLabelDraft.name}
@@ -2025,7 +2079,7 @@ export const VlmLabPage: React.FC = () => {
                       />
                     </label>
                     <label className="field-group">
-                      <span>Category</span>
+                      <span>{t("lab.taxonomy.category")}</span>
                       <select
                         value={newLabelDraft.category}
                         onChange={(e) =>
@@ -2037,7 +2091,7 @@ export const VlmLabPage: React.FC = () => {
                       >
                         {LABEL_CATEGORIES.map((c) => (
                           <option key={c} value={c}>
-                            {c}
+                            {t(`lab.category.${c}`)}
                           </option>
                         ))}
                       </select>
@@ -2049,14 +2103,14 @@ export const VlmLabPage: React.FC = () => {
                       className="primary-btn compact"
                       onClick={handleAddNewLabel}
                     >
-                      Add to List
+                      {t("lab.taxonomy.addToListBtn")}
                     </button>
                     <button
                       type="button"
                       className="secondary-btn compact"
                       onClick={() => setNewLabelOpen(false)}
                     >
-                      Cancel
+                      {t("lab.common.cancel")}
                     </button>
                   </div>
                 </div>
@@ -2083,11 +2137,12 @@ export const VlmLabPage: React.FC = () => {
                 {selectedLabel && (
                   <div className="lab-card" data-testid="selected-label-editor">
                     <h4>
-                      Edit Label: <span className="mono">{selectedLabel.id}</span>
+                      {t("lab.taxonomy.editLabelPrefix")}
+                      <span className="mono">{selectedLabel.id}</span>
                     </h4>
                     <div className="two-col">
                       <label className="field-group">
-                        <span>Display Name (name)</span>
+                        <span>{t("lab.taxonomy.displayNameField")}</span>
                         <input
                           type="text"
                           value={selectedLabel.name}
@@ -2097,22 +2152,22 @@ export const VlmLabPage: React.FC = () => {
                         />
                       </label>
                       <label className="field-group">
-                        <span>Status (status)</span>
+                        <span>{t("lab.taxonomy.statusField")}</span>
                         <select
                           value={selectedLabel.status}
                           onChange={(e) =>
                             updateSelectedLabel({ status: e.target.value as LabelStatus })
                           }
                         >
-                          <option value="active">active</option>
-                          <option value="proposed">proposed</option>
-                          <option value="retired">retired</option>
+                          <option value="active">{t("lab.labelStatus.active")}</option>
+                          <option value="proposed">{t("lab.labelStatus.proposed")}</option>
+                          <option value="retired">{t("lab.labelStatus.retired")}</option>
                         </select>
                       </label>
                     </div>
                     <div className="three-col">
                       <label className="field-group">
-                        <span>Category</span>
+                        <span>{t("lab.taxonomy.category")}</span>
                         <select
                           value={selectedLabel.category}
                           onChange={(e) =>
@@ -2123,13 +2178,13 @@ export const VlmLabPage: React.FC = () => {
                         >
                           {LABEL_CATEGORIES.map((c) => (
                             <option key={c} value={c}>
-                              {c}
+                              {t(`lab.category.${c}`)}
                             </option>
                           ))}
                         </select>
                       </label>
                       <label className="field-group">
-                        <span>Default Training Role</span>
+                        <span>{t("lab.taxonomy.defaultTrainingRole")}</span>
                         <select
                           value={selectedLabel.default_training_role}
                           onChange={(e) =>
@@ -2138,14 +2193,14 @@ export const VlmLabPage: React.FC = () => {
                             })
                           }
                         >
-                          <option value="necessary">necessary</option>
-                          <option value="recovery">recovery</option>
-                          <option value="badcase">badcase</option>
-                          <option value="terminal_fail">terminal_fail</option>
+                          <option value="necessary">{t("lab.role.necessary")}</option>
+                          <option value="recovery">{t("lab.role.recovery")}</option>
+                          <option value="badcase">{t("lab.role.badcase")}</option>
+                          <option value="terminal_fail">{t("lab.role.terminal_fail")}</option>
                         </select>
                       </label>
                       <label className="field-group">
-                        <span>Default Splice Policy</span>
+                        <span>{t("lab.taxonomy.defaultSplicePolicy")}</span>
                         <select
                           value={selectedLabel.default_splice_policy}
                           onChange={(e) =>
@@ -2154,14 +2209,14 @@ export const VlmLabPage: React.FC = () => {
                             })
                           }
                         >
-                          <option value="keep_positive">keep_positive</option>
-                          <option value="mask_loss">mask_loss</option>
-                          <option value="cut_clean">cut_clean</option>
+                          <option value="keep_positive">{t("lab.policy.keep_positive")}</option>
+                          <option value="mask_loss">{t("lab.policy.mask_loss")}</option>
+                          <option value="cut_clean">{t("lab.policy.cut_clean")}</option>
                         </select>
                       </label>
                     </div>
                     <label className="field-group">
-                      <span>Reviewer UI Title (collector_ui.title)</span>
+                      <span>{t("lab.taxonomy.uiTitleField")}</span>
                       <input
                         type="text"
                         value={selectedLabel.collector_ui.title}
@@ -2176,7 +2231,7 @@ export const VlmLabPage: React.FC = () => {
                       />
                     </label>
                     <label className="field-group">
-                      <span>Reviewer UI Hint (collector_ui.hint)</span>
+                      <span>{t("lab.taxonomy.uiHintField")}</span>
                       <input
                         type="text"
                         value={selectedLabel.collector_ui.hint}
@@ -2191,7 +2246,7 @@ export const VlmLabPage: React.FC = () => {
                       />
                     </label>
                     <label className="field-group">
-                      <span>VLM Semantic Definition (vlm_semantics.definition)</span>
+                      <span>{t("lab.taxonomy.vlmDefField")}</span>
                       <textarea
                         rows={3}
                         value={selectedLabel.vlm_semantics.definition}
@@ -2206,10 +2261,10 @@ export const VlmLabPage: React.FC = () => {
                       />
                     </label>
                     <label className="field-group">
-                      <span>Counter-Examples (one per line, counter_examples)</span>
+                      <span>{t("lab.taxonomy.counterExamplesField")}</span>
                       <textarea
                         rows={2}
-                        aria-label="Counter-examples"
+                        aria-label={t("lab.taxonomy.counterExamplesAria")}
                         value={selectedLabel.vlm_semantics.counter_examples.join("\n")}
                         onChange={(e) =>
                           updateSelectedLabel({
@@ -2238,7 +2293,7 @@ export const VlmLabPage: React.FC = () => {
                       className={`tab-btn ${selectedStage === st.key ? "active" : ""}`}
                       onClick={() => setSelectedStage(st.key)}
                     >
-                      {st.label}
+                      {t(st.labelKey)}
                     </button>
                   ))}
                 </div>
@@ -2250,7 +2305,8 @@ export const VlmLabPage: React.FC = () => {
                     disabled={assistLoading}
                     onClick={() => void handleRequestPromptAssist()}
                   >
-                    <Wand2 size={13} /> {assistLoading ? "Generating..." : "AI Prompt Assist"}
+                    <Wand2 size={13} />{" "}
+                    {assistLoading ? t("lab.prompts.generating") : t("lab.prompts.assistBtn")}
                   </button>
                   <button
                     type="button"
@@ -2259,23 +2315,23 @@ export const VlmLabPage: React.FC = () => {
                     disabled={savingConfig || !prompts}
                     onClick={() => void handleSavePrompts()}
                   >
-                    {savingConfig ? "Saving..." : "Save Prompt Bundle"}
+                    {savingConfig ? t("lab.common.saving") : t("lab.prompts.saveBtn")}
                   </button>
                 </div>
               </div>
 
               <div className="filter-toolbar">
                 <label className="field-group">
-                  <span>Target Task (optional)</span>
+                  <span>{t("lab.prompts.targetTask")}</span>
                   <input
                     type="text"
-                    placeholder="task_id (optional)"
+                    placeholder={t("lab.prompts.targetTaskPlaceholder")}
                     value={assistTaskId}
                     onChange={(e) => setAssistTaskId(e.target.value)}
                   />
                 </label>
                 <label className="field-group">
-                  <span>Top-N Frequent Errors</span>
+                  <span>{t("lab.prompts.topNErrors")}</span>
                   <input
                     type="number"
                     min={1}
@@ -2291,9 +2347,13 @@ export const VlmLabPage: React.FC = () => {
                 <div className="lab-card" data-testid="prompt-assist-preview">
                   <div className="section-header-row">
                     <strong>
-                      AI Revision Suggestion Preview (
-                      {assistPreview.advisory_only ? "Advisory only, never auto-saved" : "Draft"}) ·{" "}
-                      {assistPreview.stage} (base v{assistPreview.base_version})
+                      {t("lab.prompts.assistPreviewTitle", {
+                        mode: assistPreview.advisory_only
+                          ? t("lab.prompts.advisoryOnly")
+                          : t("lab.prompts.draft"),
+                        stage: assistPreview.stage,
+                        version: assistPreview.base_version,
+                      })}
                     </strong>
                     <div className="header-actions">
                       <button
@@ -2302,24 +2362,24 @@ export const VlmLabPage: React.FC = () => {
                         data-testid="apply-assist-draft-btn"
                         onClick={applyAssistDraftLocally}
                       >
-                        Apply to Draft Editor
+                        {t("lab.prompts.applyDraftBtn")}
                       </button>
                       <button
                         type="button"
                         className="mini-btn"
                         onClick={() => setAssistPreview(null)}
                       >
-                        Close Preview
+                        {t("lab.prompts.closePreviewBtn")}
                       </button>
                     </div>
                   </div>
                   <div className="small">
-                    <strong>Rationale: </strong>
+                    <strong>{t("lab.prompts.assistRationale")}</strong>
                     {assistPreview.rationale}
                   </div>
                   {assistPreview.task_spec_notes && (
                     <div className="small muted">
-                      <strong>TaskSpec Notes: </strong>
+                      <strong>{t("lab.prompts.taskSpecNotes")}</strong>
                       {typeof assistPreview.task_spec_notes === "string"
                         ? assistPreview.task_spec_notes
                         : JSON.stringify(assistPreview.task_spec_notes)}
@@ -2333,16 +2393,16 @@ export const VlmLabPage: React.FC = () => {
                 <div className="lab-card">
                   <div className="two-col">
                     <label className="field-group">
-                      <span>Stage Version (version)</span>
+                      <span>{t("lab.prompts.versionField")}</span>
                       <input
                         type="text"
-                        aria-label="Prompt version"
+                        aria-label={t("lab.prompts.versionAria")}
                         value={activePromptTpl.version}
                         onChange={(e) => updateActivePrompt({ version: e.target.value })}
                       />
                     </label>
                     <label className="field-group">
-                      <span>Description (description)</span>
+                      <span>{t("lab.prompts.descriptionField")}</span>
                       <input
                         type="text"
                         value={activePromptTpl.description ?? ""}
@@ -2351,7 +2411,7 @@ export const VlmLabPage: React.FC = () => {
                     </label>
                   </div>
                   <label className="field-group">
-                    <span>System Template (system_template)</span>
+                    <span>{t("lab.prompts.systemTemplateField")}</span>
                     <textarea
                       rows={6}
                       className="code-textarea"
@@ -2362,7 +2422,7 @@ export const VlmLabPage: React.FC = () => {
                     />
                   </label>
                   <label className="field-group">
-                    <span>User Template (user_template)</span>
+                    <span>{t("lab.prompts.userTemplateField")}</span>
                     <textarea
                       rows={8}
                       className="code-textarea"
@@ -2374,7 +2434,7 @@ export const VlmLabPage: React.FC = () => {
                   </label>
                 </div>
               ) : (
-                <div className="muted">Loading prompt templates...</div>
+                <div className="muted">{t("lab.prompts.loading")}</div>
               )}
             </div>
           )}
@@ -2384,15 +2444,15 @@ export const VlmLabPage: React.FC = () => {
               <div className="section-header-row">
                 <div className="filter-toolbar">
                   <label className="field-group">
-                    <span>Select TaskSpec</span>
+                    <span>{t("lab.tasks.selectLabel")}</span>
                     <select
-                      aria-label="Select TaskSpec"
+                      aria-label={t("lab.tasks.selectAria")}
                       value={selectedTaskId}
                       onChange={(e) => setSelectedTaskId(e.target.value)}
                     >
                       {Object.keys(tasksMap).map((tid) => (
                         <option key={tid} value={tid}>
-                          {tid} ({tasksMap[tid].title || "Untitled"})
+                          {tid} ({tasksMap[tid].title || t("lab.tasks.untitled")})
                         </option>
                       ))}
                     </select>
@@ -2405,7 +2465,7 @@ export const VlmLabPage: React.FC = () => {
                   disabled={savingConfig || !activeTaskSpec}
                   onClick={() => void handleSaveTaskSpec()}
                 >
-                  {savingConfig ? "Saving..." : "Save TaskSpec"}
+                  {savingConfig ? t("lab.common.saving") : t("lab.tasks.saveBtn")}
                 </button>
               </div>
 
@@ -2413,11 +2473,11 @@ export const VlmLabPage: React.FC = () => {
                 <div className="lab-card">
                   <div className="three-col">
                     <label className="field-group">
-                      <span>task_id</span>
+                      <span>{t("lab.tasks.taskIdField")}</span>
                       <input type="text" readOnly value={activeTaskSpec.task_id} />
                     </label>
                     <label className="field-group">
-                      <span>version</span>
+                      <span>{t("lab.tasks.versionField")}</span>
                       <input
                         type="text"
                         value={activeTaskSpec.version}
@@ -2425,7 +2485,7 @@ export const VlmLabPage: React.FC = () => {
                       />
                     </label>
                     <label className="field-group">
-                      <span>Title (title)</span>
+                      <span>{t("lab.tasks.titleField")}</span>
                       <input
                         type="text"
                         value={activeTaskSpec.title}
@@ -2434,7 +2494,7 @@ export const VlmLabPage: React.FC = () => {
                     </label>
                   </div>
                   <label className="field-group">
-                    <span>Goal (goal)</span>
+                    <span>{t("lab.tasks.goalField")}</span>
                     <input
                       type="text"
                       value={activeTaskSpec.goal}
@@ -2443,10 +2503,10 @@ export const VlmLabPage: React.FC = () => {
                   </label>
                   <div className="two-col">
                     <label className="field-group">
-                      <span>Completion Criteria (one per line, criteria)</span>
+                      <span>{t("lab.tasks.criteriaField")}</span>
                       <textarea
                         rows={4}
-                        aria-label="Completion criteria"
+                        aria-label={t("lab.tasks.criteriaAria")}
                         value={activeTaskSpec.criteria.join("\n")}
                         onChange={(e) =>
                           updateActiveTaskSpec({
@@ -2456,10 +2516,10 @@ export const VlmLabPage: React.FC = () => {
                       />
                     </label>
                     <label className="field-group">
-                      <span>Expected Steps (one per line, steps)</span>
+                      <span>{t("lab.tasks.stepsField")}</span>
                       <textarea
                         rows={4}
-                        aria-label="Expected steps"
+                        aria-label={t("lab.tasks.stepsAria")}
                         value={activeTaskSpec.steps.join("\n")}
                         onChange={(e) =>
                           updateActiveTaskSpec({
@@ -2470,7 +2530,7 @@ export const VlmLabPage: React.FC = () => {
                     </label>
                   </div>
                   <label className="field-group">
-                    <span>Task Context Prompt (task_prompt)</span>
+                    <span>{t("lab.tasks.taskPromptField")}</span>
                     <textarea
                       rows={4}
                       className="code-textarea"
@@ -2480,7 +2540,7 @@ export const VlmLabPage: React.FC = () => {
                   </label>
                 </div>
               ) : (
-                <div className="muted">No TaskSpec configurations available.</div>
+                <div className="muted">{t("lab.tasks.empty")}</div>
               )}
             </div>
           )}
@@ -2492,7 +2552,7 @@ export const VlmLabPage: React.FC = () => {
         <div className="page-container" data-testid="lab-panel-eval">
           <div className="panel-card" data-testid="eval-runner-controls">
             <div className="section-header-row">
-              <h3>GT Regression Eval Sandbox (`is_eval_sandbox=1` · reuses S1/S2/S5 caches)</h3>
+              <h3>{t("lab.eval.sandboxTitle")}</h3>
               <button
                 type="button"
                 className="primary-btn compact"
@@ -2500,31 +2560,32 @@ export const VlmLabPage: React.FC = () => {
                 disabled={evalRunning}
                 onClick={() => void handleRunEval()}
               >
-                <FlaskConical size={14} /> {evalRunning ? "Evaluating..." : "Run GT Regression Eval"}
+                <FlaskConical size={14} />{" "}
+                {evalRunning ? t("lab.eval.evaluating") : t("lab.eval.runBtn")}
               </button>
             </div>
 
             <div className="params-grid">
               <label className="field-group">
-                <span>Dataset Filter (optional)</span>
+                <span>{t("lab.eval.datasetFilter")}</span>
                 <input
                   type="text"
-                  placeholder="e.g. demo_lab"
+                  placeholder={t("lab.eval.datasetPlaceholder")}
                   value={evalDataset}
                   onChange={(e) => setEvalDataset(e.target.value)}
                 />
               </label>
               <label className="field-group">
-                <span>episode_ids Filter (comma-separated, optional)</span>
+                <span>{t("lab.eval.episodeFilter")}</span>
                 <input
                   type="text"
-                  placeholder="ep1, ep2"
+                  placeholder={t("lab.eval.episodePlaceholder")}
                   value={evalEpisodeIds}
                   onChange={(e) => setEvalEpisodeIds(e.target.value)}
                 />
               </label>
               <label className="field-group">
-                <span>Few-Shot Top-K</span>
+                <span>{t("lab.eval.topK")}</span>
                 <input
                   type="number"
                   min={0}
@@ -2534,7 +2595,7 @@ export const VlmLabPage: React.FC = () => {
                 />
               </label>
               <label className="field-group">
-                <span>Few-Shot Max Tokens</span>
+                <span>{t("lab.eval.maxTokens")}</span>
                 <input
                   type="number"
                   min={100}
@@ -2552,19 +2613,20 @@ export const VlmLabPage: React.FC = () => {
                 checked={evalFewShot}
                 onChange={(e) => setEvalFewShot(e.target.checked)}
               />
-              <span>Inject enabled Few-Shot Mistake Book (`few_shot=true`)</span>
+              <span>{t("lab.eval.injectFewShot")}</span>
             </label>
 
             {activeEvalJob &&
               (activeEvalJob.status === "queued" || activeEvalJob.status === "running") && (
                 <div className="job-progress-banner" data-testid="eval-job-progress-banner">
                   <div>
-                    <strong>Eval Job {activeEvalJob.job_id}</strong> — {activeEvalJob.status} (
+                    <strong>{t("lab.eval.jobProgressPrefix", { jobId: activeEvalJob.job_id })}</strong> —{" "}
+                    {t(`lab.eval.jobStatus.${activeEvalJob.status}`)} (
                     {activeEvalJob.progress_done}/{activeEvalJob.progress_total})
                     {activeEvalJob.summary?.cache_hit_stages &&
                       Object.keys(activeEvalJob.summary.cache_hit_stages).length > 0 && (
                         <span className="mono small" style={{ marginLeft: 8 }}>
-                          · Cache hits:{" "}
+                          {t("lab.eval.cacheHitsPrefix")}{" "}
                           {Object.entries(activeEvalJob.summary.cache_hit_stages)
                             .map(([st, cnt]) => `${st.replace(/_.*$/, "")}:${cnt}`)
                             .join(" ")}
@@ -2576,7 +2638,7 @@ export const VlmLabPage: React.FC = () => {
                     className="danger-btn compact"
                     onClick={() => void handleCancelEvalJob(activeEvalJob.job_id)}
                   >
-                    Cancel Eval
+                    {t("lab.eval.cancelBtn")}
                   </button>
                 </div>
               )}
@@ -2584,16 +2646,16 @@ export const VlmLabPage: React.FC = () => {
 
           <div className="panel-card" data-testid="eval-compare-panel">
             <div className="section-header-row">
-              <h3>Version Metric Comparison &amp; One-Click Promote</h3>
+              <h3>{t("lab.eval.compareTitle")}</h3>
               <div className="filter-toolbar">
                 <label className="field-group">
-                  <span>Baseline</span>
+                  <span>{t("lab.eval.baseline")}</span>
                   <select
-                    aria-label="Baseline eval"
+                    aria-label={t("lab.eval.baselineAria")}
                     value={baselineId}
                     onChange={(e) => setBaselineId(e.target.value)}
                   >
-                    <option value="">-- Select Baseline --</option>
+                    <option value="">{t("lab.eval.selectBaseline")}</option>
                     {(compareData?.evals ?? []).map((ev) => (
                       <option key={ev.eval_id} value={ev.eval_id}>
                         {ev.eval_id} (F1 {fmtNum(ev.metrics.f1)})
@@ -2602,13 +2664,13 @@ export const VlmLabPage: React.FC = () => {
                   </select>
                 </label>
                 <label className="field-group">
-                  <span>Candidate</span>
+                  <span>{t("lab.eval.candidate")}</span>
                   <select
-                    aria-label="Candidate eval"
+                    aria-label={t("lab.eval.candidateAria")}
                     value={candidateId}
                     onChange={(e) => setCandidateId(e.target.value)}
                   >
-                    <option value="">-- Select Candidate --</option>
+                    <option value="">{t("lab.eval.selectCandidate")}</option>
                     {(compareData?.evals ?? []).map((ev) => (
                       <option key={ev.eval_id} value={ev.eval_id}>
                         {ev.eval_id} (F1 {fmtNum(ev.metrics.f1)})
@@ -2622,7 +2684,7 @@ export const VlmLabPage: React.FC = () => {
                   data-testid="compare-evals-btn"
                   onClick={() => void handleCompareEvals()}
                 >
-                  <GitCompare size={13} /> Compare Metrics
+                  <GitCompare size={13} /> {t("lab.eval.compareBtn")}
                 </button>
               </div>
             </div>
@@ -2632,15 +2694,15 @@ export const VlmLabPage: React.FC = () => {
                 <table className="data-table" data-testid="eval-compare-table">
                   <thead>
                     <tr>
-                      <th>Metric</th>
-                      <th>Baseline ({baseEval?.eval_id ?? "—"})</th>
-                      <th>Candidate ({candEval?.eval_id ?? "—"})</th>
-                      <th>Delta (Candidate − Baseline)</th>
+                      <th>{t("lab.eval.colMetric")}</th>
+                      <th>{t("lab.eval.colBaseline", { id: baseEval?.eval_id ?? "—" })}</th>
+                      <th>{t("lab.eval.colCandidate", { id: candEval?.eval_id ?? "—" })}</th>
+                      <th>{t("lab.eval.colDelta")}</th>
                     </tr>
                   </thead>
                   <tbody>
                     <tr>
-                      <td>F1 Score</td>
+                      <td>{t("lab.eval.metricF1")}</td>
                       <td className="mono">{fmtNum(baseEval?.metrics.f1)}</td>
                       <td className="mono">{fmtNum(candEval?.metrics.f1)}</td>
                       <td className={`mono ${fmtDelta(deltas?.delta_f1).cls}`}>
@@ -2648,7 +2710,7 @@ export const VlmLabPage: React.FC = () => {
                       </td>
                     </tr>
                     <tr>
-                      <td>Precision / Recall</td>
+                      <td>{t("lab.eval.metricPrecRec")}</td>
                       <td className="mono">
                         {fmtNum(baseEval?.metrics.precision)} / {fmtNum(baseEval?.metrics.recall)}
                       </td>
@@ -2660,7 +2722,7 @@ export const VlmLabPage: React.FC = () => {
                       </td>
                     </tr>
                     <tr>
-                      <td>Mean IoU</td>
+                      <td>{t("lab.eval.metricMeanIou")}</td>
                       <td className="mono">{fmtNum(baseEval?.metrics.mean_iou)}</td>
                       <td className="mono">{fmtNum(candEval?.metrics.mean_iou)}</td>
                       <td className={`mono ${fmtDelta(deltas?.delta_mean_iou).cls}`}>
@@ -2668,7 +2730,7 @@ export const VlmLabPage: React.FC = () => {
                       </td>
                     </tr>
                     <tr>
-                      <td>Overcut Rate (overcut_rate, lower is better)</td>
+                      <td>{t("lab.eval.metricOvercut")}</td>
                       <td className="mono">{fmtPct(baseEval?.metrics.overcut_rate)}</td>
                       <td className="mono">{fmtPct(candEval?.metrics.overcut_rate)}</td>
                       <td
@@ -2680,7 +2742,7 @@ export const VlmLabPage: React.FC = () => {
                       </td>
                     </tr>
                     <tr>
-                      <td>Guardrail Downgrade Rate (guardrail_downgrade_rate)</td>
+                      <td>{t("lab.eval.metricGuardrail")}</td>
                       <td className="mono">{fmtPct(baseEval?.metrics.guardrail_downgrade_rate)}</td>
                       <td className="mono">{fmtPct(candEval?.metrics.guardrail_downgrade_rate)}</td>
                       <td
@@ -2700,7 +2762,7 @@ export const VlmLabPage: React.FC = () => {
                       </td>
                     </tr>
                     <tr>
-                      <td>Success Accuracy (success_accuracy)</td>
+                      <td>{t("lab.eval.metricSuccessAcc")}</td>
                       <td className="mono">{fmtPct(baseEval?.metrics.success_accuracy)}</td>
                       <td className="mono">{fmtPct(candEval?.metrics.success_accuracy)}</td>
                       <td
@@ -2712,7 +2774,7 @@ export const VlmLabPage: React.FC = () => {
                       </td>
                     </tr>
                     <tr>
-                      <td>Total Tokens (total_tokens)</td>
+                      <td>{t("lab.eval.metricTokens")}</td>
                       <td className="mono">{baseEval?.metrics.total_tokens ?? "—"}</td>
                       <td className="mono">{candEval?.metrics.total_tokens ?? "—"}</td>
                       <td
@@ -2724,7 +2786,7 @@ export const VlmLabPage: React.FC = () => {
                       </td>
                     </tr>
                     <tr>
-                      <td>Cache Hit Stages (cache_hit_stages / rate)</td>
+                      <td>{t("lab.eval.metricCacheHit")}</td>
                       <td className="mono">
                         {baseEval
                           ? fmtCacheHits(
@@ -2750,7 +2812,7 @@ export const VlmLabPage: React.FC = () => {
                       >
                         {deltas
                           ? fmtDelta(deltas.delta_cache_hit_rate, { pct: true }).text
-                          : "S1/S2/S5 cache reuse"}
+                          : t("lab.eval.cacheReuseFallback")}
                       </td>
                     </tr>
                   </tbody>
@@ -2762,8 +2824,8 @@ export const VlmLabPage: React.FC = () => {
               <div className="filter-toolbar">
                 <input
                   type="text"
-                  aria-label="Promote reason"
-                  placeholder="Promote reason"
+                  aria-label={t("lab.eval.promoteReasonAria")}
+                  placeholder={t("lab.eval.promoteReasonPlaceholder")}
                   value={promoteReason}
                   onChange={(e) => setPromoteReason(e.target.value)}
                 />
@@ -2775,25 +2837,26 @@ export const VlmLabPage: React.FC = () => {
                 disabled={promoting}
                 onClick={() => void handlePromote()}
               >
-                <Rocket size={14} /> {promoting ? "Promoting..." : "Promote as Active Config"}
+                <Rocket size={14} />{" "}
+                {promoting ? t("lab.eval.promoting") : t("lab.eval.promoteBtn")}
               </button>
             </div>
 
             {candEval && candEval.per_episode.length > 0 && (
               <details>
                 <summary className="small muted">
-                  View Per-Episode Candidate Details ({candEval.per_episode.length} GT episodes)
+                  {t("lab.eval.perEpSummary", { count: candEval.per_episode.length })}
                 </summary>
                 <div className="table-wrap" style={{ marginTop: 8 }}>
                   <table className="data-table">
                     <thead>
                       <tr>
-                        <th>episode_id</th>
-                        <th>F1</th>
-                        <th>Mean IoU</th>
-                        <th>Overcut</th>
-                        <th>Success Match</th>
-                        <th>Tokens</th>
+                        <th>{t("lab.eval.epColId")}</th>
+                        <th>{t("lab.eval.epColF1")}</th>
+                        <th>{t("lab.eval.epColIou")}</th>
+                        <th>{t("lab.eval.epColOvercut")}</th>
+                        <th>{t("lab.eval.epColSuccess")}</th>
+                        <th>{t("lab.eval.epColTokens")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2806,10 +2869,10 @@ export const VlmLabPage: React.FC = () => {
                           <td className="small">
                             {ep.success_correct ? (
                               <span className="badge-pill ok">
-                                <CheckCircle2 size={11} /> Match
+                                <CheckCircle2 size={11} /> {t("lab.eval.match")}
                               </span>
                             ) : (
-                              <span className="badge-pill warn">Mismatch</span>
+                              <span className="badge-pill warn">{t("lab.eval.mismatch")}</span>
                             )}
                           </td>
                           <td className="mono small">{ep.tokens_total ?? "—"}</td>
@@ -2831,7 +2894,10 @@ export const VlmLabPage: React.FC = () => {
         onRolledBack={async (res) => {
           await Promise.all([loadLabels(), loadPrompts(), loadTasks()]);
           showLabInfo(
-            `Safely rolled back ${res.relative_path} (sha256: ${res.config_sha256.slice(0, 8)})`,
+            t("lab.toast.rolledBack", {
+              path: res.relative_path,
+              hash: res.config_sha256.slice(0, 8),
+            }),
             "success",
           );
         }}

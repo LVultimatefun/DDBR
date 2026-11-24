@@ -922,5 +922,73 @@ describe("StudioPlayer frame-level 2D grounding integration", () => {
 
     expect(screen.getByTestId("toggle-grounding")).toHaveTextContent("2D Boxes (0)");
     expect(screen.queryByTestId("grounding-version-badge")).toBeNull();
+    expect(screen.queryByTestId("grounding-object-bar")).toBeNull();
+  });
+
+  it("renders per-object grounding toggle chips and hides/restores individual tracks on canvas without mutating grounding data", () => {
+    const spy = installCanvasSpy();
+    const ep = makeResolvedEpisode({
+      grounding: makeDenseGrounding(),
+    });
+    const originalKeys = Object.keys(ep.grounding.object_tracks_2d);
+
+    const { rerender } = render(
+      <AuthProvider initialAuth={{ token: "tok", username: "rev1", role: "reviewer" }}>
+        <StudioPlayer
+          episodeId={ep.episode_id}
+          cameras={ep.meta.cameras}
+          durationS={10.0}
+          fps={30}
+          grounding={ep.grounding}
+          currentTime={0.0}
+          onTimeUpdate={vi.fn()}
+        />
+      </AuthProvider>,
+    );
+
+    // Object filter chips appear for both tracks and start active
+    expect(screen.getByTestId("grounding-object-bar")).toBeInTheDocument();
+    const blockChip = screen.getByTestId("toggle-object-block");
+    const binChip = screen.getByTestId("toggle-object-target_bin");
+    expect(blockChip).toHaveTextContent("Target Block");
+    expect(blockChip).toHaveAttribute("aria-pressed", "true");
+    expect(binChip).toHaveTextContent("Target Bin");
+    expect(binChip).toHaveAttribute("aria-pressed", "true");
+    expect(spy.strokeRect).toHaveBeenCalledTimes(2);
+
+    // Toggle Target Block off -> only Target Bin is drawn (1 strokeRect)
+    spy.strokeRect.mockClear();
+    fireEvent.click(blockChip);
+    expect(blockChip).toHaveAttribute("aria-pressed", "false");
+    expect(spy.strokeRect).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("show-all-objects-btn")).toBeInTheDocument();
+
+    // Backend grounding object map was not mutated
+    expect(Object.keys(ep.grounding.object_tracks_2d)).toEqual(originalKeys);
+
+    // Click Show All -> both tracks drawn again
+    spy.strokeRect.mockClear();
+    fireEvent.click(screen.getByTestId("show-all-objects-btn"));
+    expect(blockChip).toHaveAttribute("aria-pressed", "true");
+    expect(spy.strokeRect).toHaveBeenCalledTimes(2);
+    expect(screen.queryByTestId("show-all-objects-btn")).toBeNull();
+
+    // Hide block again, then switch episodeId -> filter resets cleanly
+    fireEvent.click(blockChip);
+    expect(blockChip).toHaveAttribute("aria-pressed", "false");
+    rerender(
+      <AuthProvider initialAuth={{ token: "tok", username: "rev1", role: "reviewer" }}>
+        <StudioPlayer
+          episodeId="demo_ds/ep_002"
+          cameras={ep.meta.cameras}
+          durationS={10.0}
+          fps={30}
+          grounding={ep.grounding}
+          currentTime={0.0}
+          onTimeUpdate={vi.fn()}
+        />
+      </AuthProvider>,
+    );
+    expect(screen.getByTestId("toggle-object-block")).toHaveAttribute("aria-pressed", "true");
   });
 });

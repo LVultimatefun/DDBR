@@ -23,17 +23,26 @@ export const ALL_EPISODE_STATUSES: EpisodeStatus[] = [
   "gt_frozen",
 ];
 
-export const EPISODE_STATUS_META: Record<EpisodeStatus, { label: string; color: string }> = {
-  ingested: { label: "Ingested", color: "#64748b" },
-  vlm_queued: { label: "VLM Queued", color: "#0284c7" },
-  vlm_running: { label: "VLM Running", color: "#2563eb" },
-  vlm_ready: { label: "Ready for Review", color: "#0891b2" },
-  claimed: { label: "Claimed", color: "#7c3aed" },
-  reviewed: { label: "Reviewed", color: "#d97706" },
-  flagged: { label: "Flagged", color: "#dc2626" },
-  approved: { label: "Approved", color: "#16a34a" },
-  gt_frozen: { label: "GT Frozen", color: "#0f766e" },
+export const EPISODE_STATUS_META: Record<
+  EpisodeStatus,
+  { label: string; labelZh: string; color: string }
+> = {
+  ingested: { label: "Ingested", labelZh: "已导入", color: "#64748b" },
+  vlm_queued: { label: "VLM Queued", labelZh: "VLM 排队中", color: "#0284c7" },
+  vlm_running: { label: "VLM Running", labelZh: "VLM 运行中", color: "#2563eb" },
+  vlm_ready: { label: "Ready for Review", labelZh: "待审核", color: "#0891b2" },
+  claimed: { label: "Claimed", labelZh: "已认领", color: "#7c3aed" },
+  reviewed: { label: "Reviewed", labelZh: "已审核", color: "#d97706" },
+  flagged: { label: "Flagged", labelZh: "已标疑", color: "#dc2626" },
+  approved: { label: "Approved", labelZh: "已批准", color: "#16a34a" },
+  gt_frozen: { label: "GT Frozen", labelZh: "GT 基准冻结", color: "#0f766e" },
 };
+
+export function getEpisodeStatusLabel(status: EpisodeStatus, locale: "en" | "zh" = "en"): string {
+  const meta = EPISODE_STATUS_META[status];
+  if (!meta) return status;
+  return locale === "zh" ? meta.labelZh : meta.label;
+}
 
 export const DEFAULT_VISUAL_LABELS: VisualLabelDef[] = [
   {

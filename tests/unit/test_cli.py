@@ -224,3 +224,110 @@ def test_cli_export_json_dry_run_and_missing_source(tmp_path: Path) -> None:
     )
     assert r_err.exit_code != 0
     assert "Traceback" not in r_err.output
+
+
+def test_cli_config_vlm_preset_secret_env_and_probe(tmp_path: Path) -> None:
+    import yaml
+    from tests.e2e.conftest import MockVlmServer
+
+    ws = tmp_path / "ws_vlm_cli"
+    runner = CliRunner()
+    secret = "sk-cli-secret-token-4321wxyz"
+
+    # Apply DashScope preset + secret API key
+    r_cfg = runner.invoke(
+        main,
+        [
+            "-w",
+            str(ws),
+            "config-vlm",
+            "--preset",
+            "dashscope",
+            "--api-key",
+            secret,
+            "--model",
+            "qwen-vl-max",
+            "--json",
+        ],
+    )
+    assert r_cfg.exit_code == 0, r_cfg.output
+    assert secret not in r_cfg.output
+    data = json.loads(r_cfg.output)
+    assert data["ok"] is True
+    assert data["provider"] == "openai_compat"
+    assert "dashscope" in data["base_url"]
+    assert data["api_key_env"] == "DASHSCOPE_API_KEY"
+    assert data["api_key_configured"] is True
+    assert data["api_key_masked"] == "sk-***wxyz"
+    assert data["thinking_mode"] == "dashscope"
+    assert all(v == "qwen-vl-max" for v in data["stage_models"].values())
+
+    # YAML never contains api_key / secret; .env has 0600 permissions
+    ov_path = ws / "configs_override" / "default.yaml"
+    assert ov_path.is_file()
+    ov_text = ov_path.read_text(encoding="utf-8")
+    assert secret not in ov_text
+    assert "api_key" not in yaml.safe_load(ov_text).get("vlm", {})
+
+    env_path = ws / ".env"
+    assert env_path.is_file()
+    assert (env_path.stat().st_mode & 0o777) == 0o600
+    assert f"DASHSCOPE_API_KEY={secret}" in env_path.read_text(encoding="utf-8")
+
+    # Invalid --base-url exits 2 cleanly without traceback
+    r_bad = runner.invoke(
+        main,
+        ["-w", str(ws), "config-vlm", "--base-url", "not-a-valid-url", "--json"],
+    )
+    assert r_bad.exit_code == 2
+    assert "Traceback" not in r_bad.output
+
+    # Live connectivity probe against MockVlmServer
+    srv = MockVlmServer()
+    try:
+        r_probe = runner.invoke(
+            main,
+            [
+                "-w",
+                str(ws),
+                "config-vlm",
+                "--provider",
+                "openai_compat",
+                "--base-url",
+                srv.base_url,
+                "--api-key-env",
+                "MOCK_CLI_KEY",
+                "--api-key",
+                "sk-mock-probe-9999abcd",
+                "--model",
+                "gpt-4o",
+                "--thinking-mode",
+                "disabled",
+                "--test",
+                "--json",
+            ],
+        )
+        assert r_probe.exit_code == 0, r_probe.output
+        assert "sk-mock-probe-9999abcd" not in r_probe.output
+        probe_data = json.loads(r_probe.output)
+        assert probe_data["ok"] is True
+        assert probe_data["test"]["ok"] is True
+        assert probe_data["test"]["model"] == "gpt-4o"
+    finally:
+        srv.stop()
+
+    # Probe against unreachable server exits non-zero cleanly
+    r_fail = runner.invoke(
+        main,
+        [
+            "-w",
+            str(ws),
+            "config-vlm",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--test",
+            "--json",
+        ],
+    )
+    assert r_fail.exit_code == 1
+    assert json.loads(r_fail.output)["test"]["ok"] is False

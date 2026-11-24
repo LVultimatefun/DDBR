@@ -22,6 +22,7 @@ import type {
   VisualLabelDef,
 } from "../api/types";
 import { DEFAULT_VISUAL_LABELS, normalizeSegmentTriplet } from "../constants/labels";
+import { useI18n } from "../stores/i18nStore";
 
 export interface SegmentInspectorProps {
   episodeId: string;
@@ -62,6 +63,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
   onUpdateStage,
   onDeleteStage,
 }) => {
+  const { t } = useI18n();
   const [fewShotOpen, setFewShotOpen] = useState(false);
   const [fsScope, setFsScope] = useState<string>("global");
   const [fsErrorType, setFsErrorType] = useState<DiagnosisErrorType>("fp_overflag");
@@ -222,8 +224,11 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
   if (!selectedSegment && !selectedStage) {
     return (
       <div className="inspector-empty" data-testid="segment-inspector-empty">
-        Click any <strong>QC Segment</strong> or <strong>Macro Stage</strong> on the four-track
-        timeline to edit its properties.
+        {t("inspector.emptyPrefix")}
+        <strong>{t("inspector.emptyQcSegment")}</strong>
+        {t("inspector.emptyMiddle")}
+        <strong>{t("inspector.emptyMacroStage")}</strong>
+        {t("inspector.emptySuffix")}
       </div>
     );
   }
@@ -232,20 +237,20 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
     return (
       <div className="inspector-panel" data-testid="macro-stage-inspector">
         <div className="inspector-header">
-          <h4>Macro Subtask Stage ({selectedStage.stage_id})</h4>
+          <h4>{t("inspector.stageTitle", { id: selectedStage.stage_id })}</h4>
           {!readOnly && (
             <button
               type="button"
               className="danger-btn compact"
               onClick={() => onDeleteStage(selectedStage.stage_id)}
             >
-              <Trash2 size={13} /> Delete Stage
+              <Trash2 size={13} /> {t("inspector.deleteStage")}
             </button>
           )}
         </div>
 
         <label className="field-group">
-          <span>Stage Label (label)</span>
+          <span>{t("inspector.stageLabel")}</span>
           <input
             type="text"
             disabled={readOnly}
@@ -253,14 +258,14 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
             onChange={(e) => onUpdateStage({ ...selectedStage, label: e.target.value })}
             onBlur={() => {
               if (!selectedStage.label.trim()) {
-                onUpdateStage({ ...selectedStage, label: "Untitled Stage" });
+                onUpdateStage({ ...selectedStage, label: t("inspector.untitledStage") });
               }
             }}
           />
         </label>
 
         <label className="field-group">
-          <span>English Slug (label_en)</span>
+          <span>{t("inspector.stageLabelEn")}</span>
           <input
             type="text"
             disabled={readOnly}
@@ -271,10 +276,10 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
 
         <div className="two-col">
           <label className="field-group">
-            <span>Start (s)</span>
+            <span>{t("inspector.startS")}</span>
             <input
               type="number"
-              aria-label="Stage start"
+              aria-label={t("inspector.stageStartAria")}
               step={0.05}
               min={0}
               max={durationS}
@@ -293,10 +298,10 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
             />
           </label>
           <label className="field-group">
-            <span>End (s)</span>
+            <span>{t("inspector.endS")}</span>
             <input
               type="number"
-              aria-label="Stage end"
+              aria-label={t("inspector.stageEndAria")}
               step={0.05}
               min={0.05}
               max={durationS}
@@ -317,7 +322,20 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
         </div>
 
         <label className="field-group">
-          <span>Stage Summary (summary)</span>
+          <span>{t("inspector.stageInstructionLabel")}</span>
+          <textarea
+            rows={2}
+            aria-label={t("inspector.stageInstructionAria")}
+            data-testid="stage-instruction-input"
+            disabled={readOnly}
+            value={selectedStage.instruction ?? ""}
+            onChange={(e) => onUpdateStage({ ...selectedStage, instruction: e.target.value })}
+            placeholder={t("inspector.stageInstructionPlaceholder")}
+          />
+        </label>
+
+        <label className="field-group">
+          <span>{t("inspector.stageSummaryLabel")}</span>
           <textarea
             rows={3}
             disabled={readOnly}
@@ -371,7 +389,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
 
   const handleSaveFewShot = async () => {
     if (!fsRationale.trim()) {
-      setFsStatusMsg("Please provide a brief rationale explaining the visual criterion.");
+      setFsStatusMsg(t("inspector.fsNeedRationale"));
       return;
     }
     setFsSaving(true);
@@ -399,11 +417,11 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
         rationale: fsRationale.trim(),
         capture_tile: true,
       });
-      setFsStatusMsg("Saved to Few-Shot Mistake Book");
+      setFsStatusMsg(t("inspector.fsSavedMsg"));
       setFewShotOpen(false);
       setFsRationale("");
     } catch (err) {
-      setFsStatusMsg(err instanceof Error ? err.message : "Failed to save Few-Shot example");
+      setFsStatusMsg(err instanceof Error ? err.message : t("inspector.fsSaveFailed"));
     } finally {
       setFsSaving(false);
     }
@@ -421,7 +439,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
     <div className="inspector-panel" data-testid="segment-inspector">
       <div className="inspector-header">
         <h4>
-          QC Segment ({seg.seg_id}){" "}
+          {t("inspector.qcSegmentTitle", { id: seg.seg_id })}{" "}
           <span className="muted small mono">Δ{(seg.t_end - seg.t_start).toFixed(2)}s</span>
         </h4>
         {!readOnly && (
@@ -431,7 +449,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
             onClick={() => onDeleteSegment(seg.seg_id)}
             data-testid="delete-segment-btn"
           >
-            <Trash2 size={13} /> Delete
+            <Trash2 size={13} /> {t("inspector.deleteBtn")}
           </button>
         )}
       </div>
@@ -443,7 +461,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
           data-testid="segment-start-thumb"
           role="button"
           tabIndex={0}
-          title={`Click to seek to start frame ${seg.t_start.toFixed(2)}s`}
+          title={t("inspector.startThumbTitle", { t: seg.t_start.toFixed(2) })}
           onClick={() => onSeek?.(seg.t_start)}
           onKeyDown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
@@ -455,15 +473,17 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
           <img
             className="frame-thumb-img"
             src={startThumbUrl}
-            alt={`Start frame ${seg.t_start.toFixed(2)}s`}
+            alt={t("inspector.startFrameAlt", { t: seg.t_start.toFixed(2) })}
           />
-          <span className="frame-thumb-badge">Start {seg.t_start.toFixed(2)}s</span>
+          <span className="frame-thumb-badge">
+            {t("inspector.startBadge", { t: seg.t_start.toFixed(2) })}
+          </span>
           <button
             type="button"
             className="frame-thumb-zoom"
             data-testid="open-frame-lightbox"
-            aria-label="Enlarge start/end frame comparison"
-            title="Enlarge side-by-side start/end frame comparison"
+            aria-label={t("inspector.enlargeCompareAria")}
+            title={t("inspector.enlargeCompareTitle")}
             onClick={(e) => {
               e.stopPropagation();
               setFrameLightboxOpen(true);
@@ -478,7 +498,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
           data-testid="segment-end-thumb"
           role="button"
           tabIndex={0}
-          title={`Click to seek to end frame ${seg.t_end.toFixed(2)}s`}
+          title={t("inspector.endThumbTitle", { t: seg.t_end.toFixed(2) })}
           onClick={() => onSeek?.(seg.t_end)}
           onKeyDown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
@@ -490,9 +510,11 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
           <img
             className="frame-thumb-img"
             src={endThumbUrl}
-            alt={`End frame ${seg.t_end.toFixed(2)}s`}
+            alt={t("inspector.endFrameAlt", { t: seg.t_end.toFixed(2) })}
           />
-          <span className="frame-thumb-badge">End {seg.t_end.toFixed(2)}s</span>
+          <span className="frame-thumb-badge">
+            {t("inspector.endBadge", { t: seg.t_end.toFixed(2) })}
+          </span>
         </div>
       </div>
 
@@ -513,22 +535,24 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
           <span className="live-splice-status">
             {checkingSplice ? (
               <>
-                <Loader2 size={13} /> Recalculating splice guardrail...
+                <Loader2 size={13} /> {t("inspector.spliceChecking")}
               </>
             ) : isHallucinationOverride ? (
               <>
-                <AlertTriangle size={13} /> Hallucination override: protected as keep_positive
+                <AlertTriangle size={13} /> {t("inspector.spliceHallucination")}
               </>
             ) : effectivePassed && !effectiveDowngraded ? (
               <>
-                <CheckCircle2 size={13} /> {metricSummary ? `${metricSummary} ` : ""}Seamless cut OK
+                <CheckCircle2 size={13} />{" "}
+                {t("inspector.splicePass", { metric: metricSummary ? `${metricSummary} ` : "" })}
                 {activeLiveCheck && (
                   <span className="muted small">({activeLiveCheck.compute_ms.toFixed(0)}ms)</span>
                 )}
               </>
             ) : (
               <>
-                <AlertTriangle size={13} /> {metricSummary ? `${metricSummary} ` : ""}Jump exceeds threshold
+                <AlertTriangle size={13} />{" "}
+                {t("inspector.spliceWarn", { metric: metricSummary ? `${metricSummary} ` : "" })}
               </>
             )}
           </span>
@@ -544,16 +568,20 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
                 })
               }
             >
-              <Crosshair size={12} /> Snap ({optStart!.toFixed(2)}–{optEnd!.toFixed(2)}s)
+              <Crosshair size={12} />{" "}
+              {t("inspector.snapBtn", {
+                start: optStart!.toFixed(2),
+                end: optEnd!.toFixed(2),
+              })}
             </button>
           )}
         </div>
       )}
 
       <label className="field-group">
-        <span>QC Label (label_id)</span>
+        <span>{t("inspector.qcLabel")}</span>
         <select
-          aria-label="QC Label"
+          aria-label={t("inspector.qcLabelAria")}
           disabled={readOnly}
           value={seg.label_id}
           onChange={(e) => applyPatch({ label_id: e.target.value })}
@@ -572,12 +600,12 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
           <div className="hint-desc">{labelDef.collector_ui.hint}</div>
           {isLead && labelDef.vlm_semantics.definition && (
             <details className="vlm-semantics-details">
-              <summary>VLM Semantics &amp; Counter-Examples</summary>
+              <summary>{t("inspector.vlmSemanticsSummary")}</summary>
               <p>{labelDef.vlm_semantics.definition}</p>
               {labelDef.vlm_semantics.counter_examples.length > 0 && (
                 <ul>
                   {labelDef.vlm_semantics.counter_examples.map((ex, i) => (
-                    <li key={i}>Counter-example: {ex}</li>
+                    <li key={i}>{t("inspector.counterExamplePrefix", { ex })}</li>
                   ))}
                 </ul>
               )}
@@ -588,11 +616,11 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
 
       <div className="two-col">
         <div className="field-group">
-          <span>Start (t_start, s)</span>
+          <span>{t("inspector.segStartLabel")}</span>
           <div className="input-with-btn">
             <input
               type="number"
-              aria-label="Segment start"
+              aria-label={t("inspector.segStartAria")}
               step={0.05}
               min={0}
               max={durationS}
@@ -613,7 +641,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
               <button
                 type="button"
                 className="mini-btn"
-                title="Set to current playhead ([)"
+                title={t("inspector.segStartNowTitle")}
                 onClick={() => {
                   const next = Math.min(
                     seg.t_end - 0.05,
@@ -622,18 +650,18 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
                   applyPatch({ t_start: next });
                 }}
               >
-                Now
+                {t("inspector.nowBtn")}
               </button>
             )}
           </div>
         </div>
 
         <div className="field-group">
-          <span>End (t_end, s)</span>
+          <span>{t("inspector.segEndLabel")}</span>
           <div className="input-with-btn">
             <input
               type="number"
-              aria-label="Segment end"
+              aria-label={t("inspector.segEndAria")}
               step={0.05}
               min={0.05}
               max={durationS}
@@ -654,7 +682,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
               <button
                 type="button"
                 className="mini-btn"
-                title="Set to current playhead (])"
+                title={t("inspector.segEndNowTitle")}
                 onClick={() => {
                   const next = Math.max(
                     seg.t_start + 0.05,
@@ -663,7 +691,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
                   applyPatch({ t_end: next });
                 }}
               >
-                Now
+                {t("inspector.nowBtn")}
               </button>
             )}
           </div>
@@ -672,9 +700,9 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
 
       <div className="three-col">
         <label className="field-group">
-          <span>Training Role</span>
+          <span>{t("inspector.trainingRole")}</span>
           <select
-            aria-label="Training Role"
+            aria-label={t("inspector.trainingRole")}
             disabled={readOnly}
             value={seg.training_role}
             onChange={(e) => applyPatch({ training_role: e.target.value as TrainingRole })}
@@ -687,9 +715,9 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
         </label>
 
         <label className="field-group">
-          <span>Splice Policy</span>
+          <span>{t("inspector.splicePolicy")}</span>
           <select
-            aria-label="Splice Policy"
+            aria-label={t("inspector.splicePolicy")}
             disabled={readOnly}
             value={seg.splice_policy}
             onChange={(e) => applyPatch({ splice_policy: e.target.value as SplicePolicy })}
@@ -701,9 +729,9 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
         </label>
 
         <label className="field-group">
-          <span>Mask Side</span>
+          <span>{t("inspector.maskSide")}</span>
           <select
-            aria-label="Mask Side"
+            aria-label={t("inspector.maskSide")}
             disabled={readOnly || seg.splice_policy !== "mask_loss"}
             value={seg.mask_side ?? ""}
             onChange={(e) =>
@@ -712,20 +740,24 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
               })
             }
           >
-            {seg.splice_policy !== "mask_loss" && <option value="">None (null)</option>}
-            <option value="left">left (Left Arm)</option>
-            <option value="right">right (Right Arm)</option>
-            <option value="both">both (Both Arms)</option>
+            {seg.splice_policy !== "mask_loss" && (
+              <option value="">{t("inspector.maskSideNone")}</option>
+            )}
+            <option value="left">{t("inspector.maskSideLeft")}</option>
+            <option value="right">{t("inspector.maskSideRight")}</option>
+            <option value="both">{t("inspector.maskSideBoth")}</option>
           </select>
         </label>
       </div>
 
       <div className="evidence-card">
-        <div className="card-subtitle">Visual Evidence (VLM / Manual)</div>
+        <div className="card-subtitle">{t("inspector.visualEvidenceTitle")}</div>
         <p>
-          <strong>Start:</strong> {seg.visual_evidence.initial_state || "—"} ·{" "}
-          <strong>Process:</strong> {seg.visual_evidence.process_change || "—"} ·{" "}
-          <strong>End:</strong> {seg.visual_evidence.end_state || "—"}
+          <strong>{t("inspector.evidenceStart")}</strong>{" "}
+          {seg.visual_evidence.initial_state || "—"} ·{" "}
+          <strong>{t("inspector.evidenceProcess")}</strong>{" "}
+          {seg.visual_evidence.process_change || "—"} ·{" "}
+          <strong>{t("inspector.evidenceEnd")}</strong> {seg.visual_evidence.end_state || "—"}
         </p>
       </div>
 
@@ -737,12 +769,12 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
             checked={seg.is_unknown}
             onChange={(e) => applyPatch({ is_unknown: e.target.checked })}
           />
-          <span>Flag as unknown anomaly (send to VLM Lab triage)</span>
+          <span>{t("inspector.flagUnknown")}</span>
         </label>
         {seg.is_unknown && (
           <input
             type="text"
-            placeholder="Describe the undefined anomaly..."
+            placeholder={t("inspector.unknownPlaceholder")}
             disabled={readOnly}
             value={seg.unknown_note}
             onChange={(e) => applyPatch({ unknown_note: e.target.value })}
@@ -755,17 +787,29 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
         <div className="lead-diagnostics" data-testid="lead-guardrail-diagnostics">
           <div className="diag-header">
             <ShieldAlert size={13} />
-            <span>Guardrail Physics Diagnostics (Lead Only)</span>
+            <span>{t("inspector.leadDiagTitle")}</span>
           </div>
           <div className="diag-grid">
-            <span>Gate: {activeLiveCheck ? activeLiveCheck.mode : seg.guardrail.gate_type}</span>
-            <span>VLM Raw: {seg.vlm_raw_policy}</span>
-            <span>Downgraded: {effectiveDowngraded ? "Yes" : "No"}</span>
-            <span>Bimanual Coupled: {diagCoupled ? "Yes" : "No"}</span>
-            <span>EEF Disp: {(diagEefPosM * 100).toFixed(2)} cm</span>
-            <span>EEF Rot: {diagEefRotRad.toFixed(3)} rad</span>
-            <span>Hand Joint: {diagHandRad.toFixed(3)} rad</span>
-            <span>Other Arm: {(diagOtherArmM * 100).toFixed(2)} cm</span>
+            <span>
+              {t("inspector.diagGate", {
+                value: activeLiveCheck ? activeLiveCheck.mode : seg.guardrail.gate_type,
+              })}
+            </span>
+            <span>{t("inspector.diagVlmRaw", { value: seg.vlm_raw_policy })}</span>
+            <span>
+              {t("inspector.diagDowngraded", {
+                value: effectiveDowngraded ? t("inspector.yes") : t("inspector.no"),
+              })}
+            </span>
+            <span>
+              {t("inspector.diagBimanualCoupled", {
+                value: diagCoupled ? t("inspector.yes") : t("inspector.no"),
+              })}
+            </span>
+            <span>{t("inspector.diagEefDisp", { value: (diagEefPosM * 100).toFixed(2) })}</span>
+            <span>{t("inspector.diagEefRot", { value: diagEefRotRad.toFixed(3) })}</span>
+            <span>{t("inspector.diagHandJoint", { value: diagHandRad.toFixed(3) })}</span>
+            <span>{t("inspector.diagOtherArm", { value: (diagOtherArmM * 100).toFixed(2) })}</span>
           </div>
           {effectiveReason && <div className="diag-reason">{effectiveReason}</div>}
 
@@ -776,7 +820,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
               data-testid="add-few-shot-btn"
               onClick={() => setFewShotOpen((v) => !v)}
             >
-              <BookmarkPlus size={13} /> Add to Mistake Book (Few-Shot)
+              <BookmarkPlus size={13} /> {t("inspector.addFewShotBtn")}
             </button>
           </div>
 
@@ -784,34 +828,38 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
             <div className="few-shot-popover" data-testid="few-shot-form">
               <div className="two-col">
                 <label className="field-group">
-                  <span>Scope</span>
+                  <span>{t("inspector.fsScope")}</span>
                   <select value={fsScope} onChange={(e) => setFsScope(e.target.value)}>
-                    <option value="global">Global (global)</option>
-                    <option value={`task:${taskId}`}>Current Task (task:{taskId})</option>
-                    <option value={`label:${seg.label_id}`}>Current Label (label:{seg.label_id})</option>
+                    <option value="global">{t("inspector.fsScopeGlobal")}</option>
+                    <option value={`task:${taskId}`}>
+                      {t("inspector.fsScopeTask", { taskId })}
+                    </option>
+                    <option value={`label:${seg.label_id}`}>
+                      {t("inspector.fsScopeLabel", { labelId: seg.label_id })}
+                    </option>
                   </select>
                 </label>
                 <label className="field-group">
-                  <span>Error Type</span>
+                  <span>{t("inspector.fsErrorType")}</span>
                   <select
                     value={fsErrorType}
                     onChange={(e) => setFsErrorType(e.target.value as DiagnosisErrorType)}
                   >
-                    <option value="fp_overflag">FP Overflag</option>
-                    <option value="fn_missed">FN Missed</option>
-                    <option value="policy_flip">Policy / Overcut Flip</option>
-                    <option value="boundary">Boundary Drift</option>
-                    <option value="success_flip">Success Flip</option>
+                    <option value="fp_overflag">{t("inspector.fsErrFpOverflag")}</option>
+                    <option value="fn_missed">{t("inspector.fsErrFnMissed")}</option>
+                    <option value="policy_flip">{t("inspector.fsErrPolicyFlip")}</option>
+                    <option value="boundary">{t("inspector.fsErrBoundary")}</option>
+                    <option value="success_flip">{t("inspector.fsErrSuccessFlip")}</option>
                   </select>
                 </label>
               </div>
               <label className="field-group">
-                <span>Rationale (rationale)</span>
+                <span>{t("inspector.fsRationale")}</span>
                 <textarea
                   rows={2}
                   value={fsRationale}
                   onChange={(e) => setFsRationale(e.target.value)}
-                  placeholder="Explain why the VLM prediction was wrong and the correct visual criterion..."
+                  placeholder={t("inspector.fsRationalePlaceholder")}
                 />
               </label>
               <button
@@ -820,7 +868,7 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
                 disabled={fsSaving}
                 onClick={handleSaveFewShot}
               >
-                {fsSaving ? "Saving..." : "Save Few-Shot (with 2x2 Tile)"}
+                {fsSaving ? t("inspector.fsSaving") : t("inspector.fsSaveBtn")}
               </button>
             </div>
           )}
@@ -841,25 +889,34 @@ export const SegmentInspector: React.FC<SegmentInspectorProps> = ({
           <div className="modal-card modal-card-wide">
             <div className="inspector-header">
               <h3 style={{ margin: 0 }}>
-                Start vs End Frame Comparison · {seg.name || seg.label_id} ({seg.t_start.toFixed(2)}s
-                vs {seg.t_end.toFixed(2)}s)
+                {t("inspector.lightboxTitle", {
+                  name: seg.name || seg.label_id,
+                  start: seg.t_start.toFixed(2),
+                  end: seg.t_end.toFixed(2),
+                })}
               </h3>
               <button
                 type="button"
                 className="mini-btn"
                 onClick={() => setFrameLightboxOpen(false)}
               >
-                <X size={14} /> Close
+                <X size={14} /> {t("common.close")}
               </button>
             </div>
             <div className="frame-lightbox-grid">
               <div className="frame-lightbox-pane">
-                <strong>Start Frame t_start = {seg.t_start.toFixed(2)}s</strong>
-                <img src={startThumbUrl} alt={`HD start frame ${seg.t_start.toFixed(2)}s`} />
+                <strong>{t("inspector.lightboxStartLabel", { t: seg.t_start.toFixed(2) })}</strong>
+                <img
+                  src={startThumbUrl}
+                  alt={t("inspector.lightboxStartAlt", { t: seg.t_start.toFixed(2) })}
+                />
               </div>
               <div className="frame-lightbox-pane">
-                <strong>End Frame t_end = {seg.t_end.toFixed(2)}s</strong>
-                <img src={endThumbUrl} alt={`HD end frame ${seg.t_end.toFixed(2)}s`} />
+                <strong>{t("inspector.lightboxEndLabel", { t: seg.t_end.toFixed(2) })}</strong>
+                <img
+                  src={endThumbUrl}
+                  alt={t("inspector.lightboxEndAlt", { t: seg.t_end.toFixed(2) })}
+                />
               </div>
             </div>
           </div>

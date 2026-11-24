@@ -7,6 +7,7 @@ import type {
   LabHistoryRollbackResponse,
   LabHistoryTarget,
 } from "../api/types";
+import { type Locale, useI18n } from "../stores/i18nStore";
 
 export interface LabHistoryDrawerProps {
   open: boolean;
@@ -15,17 +16,17 @@ export interface LabHistoryDrawerProps {
   onRolledBack: (res: LabHistoryRollbackResponse) => void | Promise<void>;
 }
 
-const TARGET_TABS: Array<{ key: LabHistoryTarget; label: string }> = [
-  { key: "labels", label: "Labels (labels)" },
-  { key: "prompts", label: "Prompt Templates" },
-  { key: "tasks", label: "TaskSpec" },
+const TARGET_TABS: Array<{ key: LabHistoryTarget; labelKey: string }> = [
+  { key: "labels", labelKey: "lab.history.target.labels" },
+  { key: "prompts", labelKey: "lab.history.target.prompts" },
+  { key: "tasks", labelKey: "lab.history.target.tasks" },
 ];
 
-function fmtTimestamp(ts: number): string {
+function fmtTimestamp(ts: number, locale: Locale): string {
   if (!Number.isFinite(ts) || ts <= 0) return "—";
   const ms = ts > 1e12 ? ts : ts * 1000;
   try {
-    return new Date(ms).toLocaleString();
+    return new Date(ms).toLocaleString(locale === "zh" ? "zh-CN" : undefined);
   } catch {
     return String(ts);
   }
@@ -37,6 +38,9 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
   onClose,
   onRolledBack,
 }) => {
+  const { t, locale } = useI18n();
+  const tRef = useRef(t);
+  tRef.current = t;
   const [activeTarget, setActiveTarget] = useState<LabHistoryTarget>(target);
   const [items, setItems] = useState<LabHistoryItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -62,7 +66,7 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
       setItems(res.items);
     } catch (err) {
       if (seq !== listSeqRef.current) return;
-      setError(err instanceof Error ? err.message : "Failed to load .history/ snapshots");
+      setError(err instanceof Error ? err.message : tRef.current("lab.history.errLoadList"));
     } finally {
       if (seq === listSeqRef.current) {
         setLoadingList(false);
@@ -102,7 +106,7 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
       setDiff(res);
     } catch (err) {
       if (seq !== diffSeqRef.current) return;
-      setError(err instanceof Error ? err.message : "Failed to load snapshot diff");
+      setError(err instanceof Error ? err.message : t("lab.history.errLoadDiff"));
     } finally {
       if (seq === diffSeqRef.current) {
         setLoadingDiff(false);
@@ -119,7 +123,7 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
       await onRolledBack(res);
       await loadList(activeTarget);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to roll back snapshot");
+      setError(err instanceof Error ? err.message : t("lab.history.errRollback"));
     } finally {
       setRollingBack(false);
     }
@@ -138,11 +142,11 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
       <aside
         className="drawer-panel drawer-wide"
         data-testid="lab-history-drawer"
-        aria-label=".history/ version browser and rollback"
+        aria-label={t("lab.history.drawerAria")}
       >
         <div className="drawer-header">
           <h3>
-            <History size={16} /> .history/ Config Snapshots &amp; Rollback
+            <History size={16} /> {t("lab.history.title")}
           </h3>
           <div className="header-actions">
             <button
@@ -151,7 +155,7 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
               onClick={() => void loadList(activeTarget)}
               disabled={loadingList}
             >
-              <RefreshCw size={13} /> Refresh
+              <RefreshCw size={13} /> {t("lab.common.refresh")}
             </button>
             <button
               type="button"
@@ -159,22 +163,22 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
               onClick={onClose}
               data-testid="close-history-drawer-btn"
             >
-              <X size={14} /> Close
+              <X size={14} /> {t("lab.common.close")}
             </button>
           </div>
         </div>
 
         <div className="drawer-body">
           <div className="tab-group">
-            {TARGET_TABS.map((t) => (
+            {TARGET_TABS.map((tab) => (
               <button
-                key={t.key}
+                key={tab.key}
                 type="button"
-                className={`tab-btn ${activeTarget === t.key ? "active" : ""}`}
-                onClick={() => setActiveTarget(t.key)}
-                data-testid={`history-target-${t.key}`}
+                className={`tab-btn ${activeTarget === tab.key ? "active" : ""}`}
+                onClick={() => setActiveTarget(tab.key)}
+                data-testid={`history-target-${tab.key}`}
               >
-                {t.label}
+                {t(tab.labelKey)}
               </button>
             ))}
           </div>
@@ -182,11 +186,11 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
           {error && <div className="error-banner">{error}</div>}
 
           <div className="field-group">
-            <strong>Archived Snapshots ({items.length})</strong>
+            <strong>{t("lab.history.archivedCount", { count: items.length })}</strong>
             {loadingList ? (
-              <div className="muted small">Loading snapshots...</div>
+              <div className="muted small">{t("lab.history.loadingList")}</div>
             ) : items.length === 0 ? (
-              <div className="empty-cell">No .history/ snapshots archived for this target.</div>
+              <div className="empty-cell">{t("lab.history.emptyList")}</div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 {items.map((item) => (
@@ -201,10 +205,12 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
                       <span className="mono small">
                         <strong>{item.relative_path || item.name}</strong>
                       </span>
-                      <span className="badge-pill">{item.reason || "snapshot"}</span>
+                      <span className="badge-pill">
+                        {item.reason || t("lab.history.defaultReason")}
+                      </span>
                     </div>
                     <div className="muted small">
-                      {fmtTimestamp(item.created_at)} · {item.size_bytes} B · ID:{" "}
+                      {fmtTimestamp(item.created_at, locale)} · {item.size_bytes} B · ID:{" "}
                       <span className="mono">{item.snapshot_id}</span>
                     </div>
                   </button>
@@ -217,7 +223,7 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
             <div className="panel-card" data-testid="history-diff-panel">
               <div className="section-header-row">
                 <div>
-                  <strong>Line-by-Line Diff vs Active Config</strong>
+                  <strong>{t("lab.history.diffTitle")}</strong>
                   {diff && (
                     <div className="muted small mono">
                       {diff.relative_path} · {diff.reason}
@@ -232,12 +238,12 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
                   data-testid="history-rollback-btn"
                 >
                   <RotateCcw size={13} />{" "}
-                  {rollingBack ? "Rolling back..." : "Rollback to This Version"}
+                  {rollingBack ? t("lab.history.rollingBack") : t("lab.history.rollbackBtn")}
                 </button>
               </div>
 
               {loadingDiff ? (
-                <div className="muted small">Computing diff...</div>
+                <div className="muted small">{t("lab.history.loadingDiff")}</div>
               ) : diff ? (
                 diff.lines && diff.lines.length > 0 ? (
                   <div className="diff-viewer-lines" data-testid="history-diff-viewer">
@@ -259,7 +265,7 @@ export const LabHistoryDrawer: React.FC<LabHistoryDrawerProps> = ({
                   </div>
                 ) : (
                   <pre className="json-box" data-testid="history-diff-viewer">
-                    {diff.unified_diff || "(Identical to active config, no differences)"}
+                    {diff.unified_diff || t("lab.history.identicalDiff")}
                   </pre>
                 )
               ) : null}

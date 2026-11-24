@@ -8,7 +8,7 @@ from typing import Any, Sequence
 
 from ..config import ConfigManager
 from ..io.media import select_tile_mode
-from ..models.annotation import MacroStage, QcSegment
+from ..models.annotation import GroundingResult, MacroStage, QcSegment
 from ..models.taxonomy import FewShotItem, LabelRegistry, PromptBundle, TaskSpec
 
 _IF_BLOCK_RE = re.compile(
@@ -87,11 +87,164 @@ def format_macro_backbone(macro_stages: Sequence[MacroStage]) -> str:
         return "(No macro stage backbone provided; evaluate strictly using Precision-First criteria.)"
     lines = []
     for st in macro_stages:
+        instr = f" | instruction: {st.instruction.strip()}" if getattr(st, "instruction", "").strip() else ""
         summary = f" -- {st.summary}" if st.summary else ""
         lines.append(
-            f"- {st.stage_id} [{st.t_start:.2f}s..{st.t_end:.2f}s] {st.label}{summary}"
+            f"- {st.stage_id} [{st.t_start:.2f}s..{st.t_end:.2f}s] {st.label}{instr}{summary}"
         )
     return "\n".join(lines)
+
+
+def format_grounding_summary(
+    grounding: GroundingResult | None,
+    *,
+    max_chars: int = 1600,
+    max_transitions_per_obj: int = 8,
+) -> str:
+    """Format a compact S1 2D object state & motion transition summary for S2 / subtask inference."""
+    if grounding is None or not grounding.object_tracks_2d:
+        return ""
+
+    lines: list[str] = []
+    for oid, track in grounding.object_tracks_2d.items():
+        kfs = sorted(track.keyframes, key=lambda k: k.time_s)
+        if not kfs:
+            continue
+
+        # Compress consecutive keyframes sharing the same (visible, normalized state)
+        runs: list[dict[str, Any]] = []
+        for kf in kfs:
+            st = (kf.state or ("visible" if kf.visible else "occluded")).strip()
+            cx = 0.5 * (kf.bbox_norm_1000[0] + kf.bbox_norm_1000[2]) if kf.visible else None
+            cy = 0.5 * (kf.bbox_norm_1000[1] + kf.bbox_norm_1000[3]) if kf.visible else None
+            key = (bool(kf.visible), st.lower())
+            if runs and runs[-1]["key"] == key:
+                runs[-1]["t_end"] = kf.time_s
+                if cx is not None and cy is not None:
+                    runs[-1]["end_xy"] = (cx, cy)
+            else:
+                runs.append(
+                    {
+                        "key": key,
+                        "visible": bool(kf.visible),
+                        "state": st,
+                        "t_start": kf.time_s,
+                        "t_end": kf.time_s,
+                        "start_xy": (cx, cy) if cx is not None and cy is not None else None,
+                        "end_xy": (cx, cy) if cx is not None and cy is not None else None,
+                    }
+                )
+
+        # Keep visible spans plus any meaningful occlusion transitions between visible spans
+        parts: list[str] = []
+        for r_idx, r in enumerate(runs):
+            if not r["visible"]:
+                has_vis_before = any(prev["visible"] for prev in runs[:r_idx])
+                has_vis_after = any(nxt["visible"] for nxt in runs[r_idx + 1 :])
+                if not (has_vis_before and has_vis_after):
+                    continue
+                t_span = (
+                    f"{r['t_start']:.2f}s"
+                    if abs(r["t_end"] - r["t_start"]) < 1e-3
+                    else f"{r['t_start']:.2f}..{r['t_end']:.2f}s"
+                )
+                parts.append(f"{t_span} [not visible]")
+                continue
+
+            t_span = (
+                f"{r['t_start']:.2f}s"
+                if abs(r["t_end"] - r["t_start"]) < 1e-3
+                else f"{r['t_start']:.2f}..{r['t_end']:.2f}s"
+            )
+            motion_note = ""
+            if not track.is_static_container and r["start_xy"] and r["end_xy"]:
+                dx = r["end_xy"][0] - r["start_xy"][0]
+                dy = r["end_xy"][1] - r["start_xy"][1]
+                if (dx * dx + dy * dy) ** 0.5 >= 45.0:
+                    motion_note = f", moved dx={dx:+.0f}, dy={dy:+.0f}"
+            parts.append(f"{t_span} [{r['state']}{motion_note}]")
+
+        if not parts:
+            continue
+        if len(parts) > max_transitions_per_obj:
+            half = max(1, max_transitions_per_obj // 2)
+            parts = parts[:half] + ["..."] + parts[-(max_transitions_per_obj - half) :]
+        disp_name = track.name.strip() if track.name and track.name.strip() != oid else ""
+        header = f"{oid} ({disp_name})" if disp_name else oid
+        if track.is_static_container:
+            header += " [static]"
+        lines.append(f"- {header}: " + " -> ".join(parts))
+
+    text = "\n".join(lines).strip()
+    if len(text) > max_chars:
+        text = text[: max(0, max_chars - 3)].rstrip() + "..."
+    return text
+
+
+def format_qc_segments_summary(
+    qc_segments: Sequence[QcSegment],
+    duration_s: float,
+) -> str:
+    """Format verified QC segments highlighting cut_clean exclusions, recovery spans, and kept intervals."""
+    dur = max(0.01, float(duration_s))
+    ordered = sorted(qc_segments, key=lambda s: (s.t_start, s.t_end))
+    cut_intervals: list[tuple[float, float]] = []
+    seg_lines: list[str] = []
+
+    for seg in ordered:
+        ts = max(0.0, min(dur, float(seg.t_start)))
+        te = max(ts, min(dur, float(seg.t_end)))
+        ev_txt = seg.visual_evidence.as_text().strip()
+        ev_suffix = f" | evidence: {ev_txt[:140]}" if ev_txt else ""
+        if seg.splice_policy == "cut_clean":
+            cut_intervals.append((ts, te))
+            seg_lines.append(
+                f"- [{ts:.2f}s..{te:.2f}s] CUT_CLEAN EXCLUDED ({seg.label_id}, role={seg.training_role}): "
+                f"excluded idle/cut span; align subtask boundaries to this cut{ev_suffix}"
+            )
+        elif seg.training_role == "recovery":
+            seg_lines.append(
+                f"- [{ts:.2f}s..{te:.2f}s] RECOVERY ({seg.label_id}, policy={seg.splice_policy}, side={seg.affected_arm}): "
+                f"retry/recovery span{ev_suffix}"
+            )
+        elif seg.splice_policy == "mask_loss":
+            seg_lines.append(
+                f"- [{ts:.2f}s..{te:.2f}s] MASK_LOSS ({seg.label_id}, role={seg.training_role}, side={seg.affected_arm}){ev_suffix}"
+            )
+        else:
+            seg_lines.append(
+                f"- [{ts:.2f}s..{te:.2f}s] KEEP_POSITIVE ({seg.label_id}, role={seg.training_role}){ev_suffix}"
+            )
+
+    # Merge cut_clean spans to compute retained active execution intervals
+    merged_cuts: list[list[float]] = []
+    for cs, ce in sorted(cut_intervals):
+        if ce <= cs + 1e-4:
+            continue
+        if merged_cuts and cs <= merged_cuts[-1][1] + 1e-3:
+            merged_cuts[-1][1] = max(merged_cuts[-1][1], ce)
+        else:
+            merged_cuts.append([cs, ce])
+
+    kept: list[tuple[float, float]] = []
+    cursor = 0.0
+    for cs, ce in merged_cuts:
+        if cs > cursor + 1e-3:
+            kept.append((cursor, cs))
+        cursor = max(cursor, ce)
+    if cursor < dur - 1e-3:
+        kept.append((cursor, dur))
+
+    parts: list[str] = []
+    if kept:
+        kept_str = ", ".join(f"[{a:.2f}s..{b:.2f}s]" for a, b in kept)
+        parts.append(f"Active retained execution spans (outside cut_clean): {kept_str}")
+    if seg_lines:
+        parts.append("Verified QC segments:")
+        parts.extend(seg_lines)
+    else:
+        parts.append(f"No QC anomalies or cuts flagged; full episode [0.00s..{dur:.2f}s] is retained.")
+    return "\n".join(parts)
 
 
 def format_labels_desc(labels: LabelRegistry) -> str:
@@ -266,6 +419,37 @@ class PromptBuilder:
             render_template(tpl.user_template, ctx),
         )
 
+    def build_s1_discovery(
+        self,
+        *,
+        task: TaskSpec | None = None,
+        task_spec: TaskSpec | None = None,
+        camera_roles: dict[str, str] | None = None,
+    ) -> tuple[str, str]:
+        t = task or task_spec
+        assert t is not None
+        tpl = self.prompts.s1_grounding
+        main_cam = (camera_roles or {}).get("main", "main")
+        ctx = {
+            "task_id": t.task_id,
+            "task_goal": t.goal or t.description or t.title or t.task_id,
+            "camera_layout_desc": f"Main HD camera overview frames (camera={main_cam})",
+            "task_prompt": t.task_prompt.strip()
+            or "Identify the 1-4 primary physical objects manipulated by robot arms/grippers or human hands plus the target receptacle.",
+        }
+        sys_t = tpl.extra_templates.get("discover_system") or (
+            "You are an embodied manipulation visual grounding expert (2D Grounding canonical vocabulary discovery). "
+            "Inspect the overview keyframes and select 1 to 4 task-relevant physical objects prioritized by manipulator/hand interaction and target container/receptacle. "
+            'Output strict JSON only: {"canonical_objects": [{"id": "snake_case_id", "name": str, "desc": str, "is_static": bool}]}.'
+        )
+        usr_t = tpl.extra_templates.get("discover_user") or (
+            "Task: {{ task_id }} -- {{ task_goal }}\n"
+            "Camera view: {{ camera_layout_desc }}\n"
+            "Task guidance: {{ task_prompt }}\n"
+            "Identify 1-4 canonical physical objects with stable snake_case ids."
+        )
+        return render_template(sys_t, ctx), render_template(usr_t, ctx)
+
     def build_s2(
         self,
         *,
@@ -273,23 +457,86 @@ class PromptBuilder:
         task_spec: TaskSpec | None = None,
         camera_roles: dict[str, str] | None = None,
         duration_s: float = 0.0,
+        grounding: GroundingResult | None = None,
+        grounding_summary: str | None = None,
     ) -> tuple[str, str]:
         t = task or task_spec
         assert t is not None
         tpl = self.prompts.s2_macro
         steps = "\n".join(f"- {s}" for s in t.steps) if t.steps else "- Segment stages according to observed task progression"
+        g_text = (
+            grounding_summary.strip()
+            if isinstance(grounding_summary, str)
+            else format_grounding_summary(grounding)
+        )
         ctx = {
             "task_id": t.task_id,
             "duration_s": round(float(duration_s), 2),
             "task_goal": t.goal or t.description or t.title or t.task_id,
             "expected_steps": steps,
             "camera_layout_desc": describe_camera_layout(camera_roles),
-            "task_prompt": t.task_prompt.strip() or "Segment macro stages and dual-arm timelines strictly from visual evidence.",
+            "grounding_summary_text": g_text,
+            "task_prompt": t.task_prompt.strip()
+            or "Segment macro subtask stages with VLA instructions and dual-manipulator timelines strictly from visual evidence.",
         }
-        return (
-            render_template(tpl.system_template, ctx),
-            render_template(tpl.user_template, ctx),
+        sys_rendered = render_template(tpl.system_template, ctx)
+        usr_rendered = render_template(tpl.user_template, ctx)
+        if g_text and "grounding_summary_text" not in tpl.user_template:
+            usr_rendered = (
+                f"{usr_rendered}\n\n[Stage 1 Grounding Object State Summary]:\n{g_text}"
+            )
+        return sys_rendered, usr_rendered
+
+    def build_infer_subtasks(
+        self,
+        *,
+        task: TaskSpec | None = None,
+        task_spec: TaskSpec | None = None,
+        camera_roles: dict[str, str] | None = None,
+        duration_s: float = 0.0,
+        qc_segments: Sequence[QcSegment] = (),
+        macro_stages: Sequence[MacroStage] = (),
+        grounding: GroundingResult | None = None,
+        grounding_summary: str | None = None,
+        custom_hint: str | None = None,
+    ) -> tuple[str, str]:
+        t = task or task_spec
+        assert t is not None
+        tpl = self.prompts.s2_macro
+        g_text = (
+            grounding_summary.strip()
+            if isinstance(grounding_summary, str)
+            else format_grounding_summary(grounding)
         )
+        existing_text = format_macro_backbone(macro_stages) if macro_stages else ""
+        qc_text = format_qc_segments_summary(qc_segments, duration_s)
+        hint_text = (custom_hint or "").strip()
+        ctx = {
+            "task_id": t.task_id,
+            "duration_s": round(float(duration_s), 2),
+            "task_goal": t.goal or t.description or t.title or t.task_id,
+            "camera_layout_desc": describe_camera_layout(camera_roles),
+            "qc_segments_text": qc_text,
+            "existing_stages_text": existing_text,
+            "grounding_summary_text": g_text,
+            "custom_hint": hint_text,
+        }
+        sys_t = tpl.extra_templates.get("infer_subtasks_system") or (
+            "You are an embodied manipulation subtask alignment expert (supporting both robot arms/grippers and human hands). "
+            "Align contiguous macro_stages covering 0.0s to total duration to the verified QC segmentation (respecting cut_clean exclusions and recovery spans) and provide concise imperative VLA instructions. "
+            'Output strict JSON only: {"macro_stages": [{"stage_id": "S1", "t_start": float, "t_end": float, "label": str, "label_en": str, "instruction": str, "summary": str}]} (leave arm_timelines omitted).'
+        )
+        usr_t = tpl.extra_templates.get("infer_subtasks_user") or (
+            "Task: {{ task_id }} (duration {{ duration_s }}s)\n"
+            "Goal: {{ task_goal }}\n"
+            "Camera layout: {{ camera_layout_desc }}\n"
+            "[Verified QC Segmentation Skeleton]:\n{{ qc_segments_text }}\n"
+            "{% if existing_stages_text %}\n[Current Subtask Stages Draft]:\n{{ existing_stages_text }}\n{% endif %}"
+            "{% if grounding_summary_text %}\n[Stage 1 Grounding Object State Summary]:\n{{ grounding_summary_text }}\n{% endif %}"
+            "{% if custom_hint %}\n[Reviewer Guidance]:\n{{ custom_hint }}\n{% endif %}"
+            "\nAlign contiguous macro_stages covering 0.0s to {{ duration_s }}s with imperative VLA instructions."
+        )
+        return render_template(sys_t, ctx), render_template(usr_t, ctx)
 
     def build_s3(
         self,
@@ -461,7 +708,9 @@ class PromptBuilder:
         return render_template(sys_t, ctx), render_template(usr_t, ctx)
 
     render_s1 = build_s1
+    render_s1_discovery = build_s1_discovery
     render_s2 = build_s2
+    render_infer_subtasks = build_infer_subtasks
     render_s3 = build_s3
     render_s4a = build_s4a
     render_s4b = build_s4b

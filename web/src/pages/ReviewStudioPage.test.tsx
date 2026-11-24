@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthProvider } from "../stores/authStore";
+import { I18nProvider } from "../stores/i18nStore";
 import { makeResolvedEpisode, makeReviewArtifact } from "../test/fixtures";
 import { ReviewStudioPage } from "./ReviewStudioPage";
 
@@ -197,5 +198,103 @@ describe("ReviewStudioPage", () => {
     fireEvent.click(screen.getByTestId("action-save-draft"));
     await waitFor(() => expect(draftSaved).toBe(true));
     await waitFor(() => expect(screen.getByTestId("watch-coverage-badge")).toHaveTextContent("100%"));
+  });
+
+  it("provides Export popover: downloads Episode JSON for Reviewer and prompts Lead auth for Export Studio", async () => {
+    setupFetchMock();
+
+    const createdBlobs: Blob[] = [];
+    const origCreateObjectURL = URL.createObjectURL;
+    const origRevokeObjectURL = URL.revokeObjectURL;
+    const anchorClickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    URL.createObjectURL = vi.fn((blob: Blob | MediaSource) => {
+      createdBlobs.push(blob as Blob);
+      return "blob:mock-episode-json";
+    });
+    URL.revokeObjectURL = vi.fn();
+
+    try {
+      render(
+        <AuthProvider initialAuth={{ token: "rev-token", username: "rev_a", role: "reviewer" }}>
+          <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+            <Routes>
+              <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+              <Route path="/export" element={<div data-testid="export-page-mock">Export</div>} />
+            </Routes>
+          </MemoryRouter>
+        </AuthProvider>,
+      );
+
+      await waitFor(() => expect(screen.getByTestId("review-studio-page")).toBeInTheDocument());
+
+      // Open Export popover and click Download Episode JSON
+      fireEvent.click(screen.getByTestId("studio-export-btn"));
+      expect(screen.getByTestId("studio-export-menu")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId("export-download-json-btn"));
+      expect(anchorClickSpy).toHaveBeenCalledTimes(1);
+      expect(createdBlobs).toHaveLength(1);
+      const text = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(createdBlobs[0]);
+      });
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      expect(parsed.episode_id).toBe("demo_ds/ep_001");
+      expect(Array.isArray(parsed.qc_segments)).toBe(true);
+      expect(Array.isArray(parsed.macro_stages)).toBe(true);
+      expect(parsed.success).toBeDefined();
+      expect(parsed.meta).toBeDefined();
+      expect(parsed).toHaveProperty("notes");
+
+      // Reviewer clicking Open in Export Studio stays on studio and sees warning toast
+      fireEvent.click(screen.getByTestId("studio-export-btn"));
+      fireEvent.click(screen.getByTestId("export-open-studio-btn"));
+      expect(screen.queryByTestId("export-page-mock")).toBeNull();
+      expect(screen.getByTestId("studio-info-banner")).toHaveTextContent("Lead role");
+    } finally {
+      URL.createObjectURL = origCreateObjectURL;
+      URL.revokeObjectURL = origRevokeObjectURL;
+    }
+  });
+
+  it("renders Chinese (locale='zh') ReviewStudioPage controls, tabs, status badge, Export popover, and Shortcuts modal", async () => {
+    setupFetchMock({ status: "vlm_ready" });
+
+    render(
+      <I18nProvider initialLocale="zh">
+        <AuthProvider initialAuth={{ token: "lead-token", username: "lead_a", role: "lead" }}>
+          <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+            <Routes>
+              <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+            </Routes>
+          </MemoryRouter>
+        </AuthProvider>
+      </I18nProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("review-studio-page")).toBeInTheDocument());
+
+    const page = screen.getByTestId("review-studio-page");
+    expect(page).toHaveTextContent("待审核");
+    expect(page).toHaveTextContent("分段 / 阶段");
+    expect(page).toHaveTextContent("成功判定");
+    expect(page).toHaveTextContent("VLM 差异与历史");
+    expect(screen.getByTestId("action-save-draft")).toHaveTextContent("保存草稿");
+    expect(screen.getByTestId("action-submit-review")).toHaveTextContent("提交审核");
+    expect(screen.getByTestId("action-approve")).toHaveTextContent("审核通过");
+    expect(screen.getByTestId("action-freeze-gt")).toHaveTextContent("冻结为 GT");
+    expect(screen.getByTestId("studio-export-btn")).toHaveTextContent("导出");
+
+    // Open Export popover in Chinese
+    fireEvent.click(screen.getByTestId("studio-export-btn"));
+    expect(screen.getByTestId("export-download-json-btn")).toHaveTextContent("下载单条标注 JSON");
+    expect(screen.getByTestId("export-open-studio-btn")).toHaveTextContent("前往导出中心 →");
+
+    // Open ShortcutsModal in Chinese
+    fireEvent.click(screen.getByTestId("open-shortcuts-btn"));
+    expect(screen.getByTestId("shortcuts-modal")).toHaveTextContent("审核工作台快捷键速查");
+    expect(screen.getByTestId("shortcuts-modal")).toHaveTextContent("播放 / 暂停");
   });
 });

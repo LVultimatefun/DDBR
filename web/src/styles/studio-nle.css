@@ -786,3 +786,518 @@
   cursor: pointer;
   user-select: none;
 }
+
+/* ==========================================================================
+   7. SuccessPanel (Layer 2) Full-Width UX, Tri-State Pills, Timestamp & Sync
+   ========================================================================== */
+.success-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+}
+
+.verdict-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.success-panel .section-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+.verdict-summary-textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 66px;
+  resize: vertical;
+  line-height: 1.45;
+  font-size: 12.5px;
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+}
+
+.verdict-summary-textarea:focus,
+.criterion-title-input:focus,
+.criterion-evidence:focus,
+.criterion-time-input:focus {
+  outline: 2px solid var(--focus-ring, var(--primary));
+  outline-offset: -1px;
+  border-color: var(--primary);
+}
+
+.verdict-sync-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: var(--text);
+}
+
+.verdict-sync-bar.suggest-success {
+  background: var(--success-bg);
+  border-color: var(--success-border);
+  color: var(--success-text);
+}
+
+.verdict-sync-bar.suggest-failure {
+  background: var(--error-bg);
+  border-color: var(--danger);
+  color: var(--error-text);
+}
+
+.verdict-sync-bar.suggest-unsure {
+  background: var(--badge-warn-bg);
+  border-color: var(--badge-warn-border);
+  color: var(--badge-warn-text);
+}
+
+.verdict-sync-text {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.verdict-sync-current {
+  opacity: 0.85;
+}
+
+.verdict-sync-btn {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.verdict-sync-btn:hover:not(:disabled) {
+  background: var(--primary-solid);
+  border-color: var(--primary-solid);
+  color: var(--on-solid);
+}
+
+.criteria-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.criteria-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.add-criterion-btn {
+  font-weight: 600;
+}
+
+.empty-hint {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px dashed var(--border);
+  background: var(--surface-alt);
+  text-align: center;
+}
+
+.criteria-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.criterion-card {
+  width: 100%;
+  min-width: 0;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.criterion-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+.criterion-title-input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  resize: none;
+  overflow: hidden;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 3px 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.criterion-title-input:hover:not(:disabled) {
+  border-color: var(--border);
+  background: var(--input-bg);
+}
+
+.criterion-title-input:focus {
+  background: var(--input-bg);
+}
+
+.criterion-delete-btn {
+  flex-shrink: 0;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 3px 5px;
+  line-height: 1;
+}
+
+.criterion-delete-btn:hover:not(:disabled) {
+  color: var(--error-text);
+  background: var(--error-bg);
+  border-color: var(--danger);
+}
+
+.criterion-controls-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+}
+
+.tri-state-group {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--surface);
+  flex-shrink: 0;
+}
+
+.tri-state-btn {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-radius: 0;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+.tri-state-btn + .tri-state-btn {
+  border-left: 1px solid var(--border);
+}
+
+.tri-state-btn:hover:not(:disabled):not(.active) {
+  background: var(--hover-bg);
+  color: var(--text);
+}
+
+.tri-state-btn.met.active {
+  background: var(--success-solid);
+  color: var(--on-solid);
+}
+
+.tri-state-btn.not-met.active {
+  background: var(--danger-solid);
+  color: var(--on-solid);
+}
+
+.tri-state-btn.unsure.active {
+  background: var(--warning-solid);
+  color: var(--on-solid);
+}
+
+.criterion-time-row {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.seek-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  background: var(--badge-info-bg);
+  color: var(--badge-info-text);
+  border: 1px solid var(--badge-info-border);
+  white-space: nowrap;
+}
+
+.seek-pill:hover {
+  background: var(--primary-solid);
+  border-color: var(--primary-solid);
+  color: var(--on-solid);
+}
+
+.criterion-time-input {
+  width: 66px;
+  padding: 2px 5px;
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.criterion-time-btn,
+.criterion-set-now-btn {
+  padding: 3px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.criterion-time-btn:hover:not(:disabled),
+.criterion-set-now-btn:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--text);
+}
+
+.criterion-time-clear {
+  padding: 2px 6px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.1;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+.criterion-time-clear:hover:not(:disabled) {
+  color: var(--error-text);
+  background: var(--error-bg);
+  border-color: var(--danger);
+}
+
+.criterion-evidence {
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  resize: vertical;
+  font-size: 12px;
+  line-height: 1.4;
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  box-sizing: border-box;
+}
+
+/* ==========================================================================
+   8. StudioPlayer Per-Object Grounding Toggle Bar
+   ========================================================================== */
+.grounding-object-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px 12px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+}
+
+.grounding-object-bar.dimmed {
+  opacity: 0.6;
+}
+
+.grounding-object-bar-label {
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.grounding-object-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.object-toggle-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: var(--muted);
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+}
+
+.object-toggle-chip.active {
+  background: var(--badge-info-bg);
+  color: var(--badge-info-text);
+  border-color: var(--badge-info-border);
+}
+
+.object-toggle-chip.muted-off {
+  text-decoration: line-through;
+  opacity: 0.72;
+}
+
+.object-toggle-chip:hover {
+  border-color: var(--primary);
+}
+
+.object-chip-check {
+  font-size: 10px;
+}
+
+.object-show-all-btn {
+  padding: 2px 7px;
+  font-size: 11px;
+  background: transparent;
+  color: var(--link-color);
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+
+.object-show-all-btn:hover {
+  background: var(--primary-soft);
+}
+
+/* ==========================================================================
+   9. FourTrackTimeline Cross-Track QC Snap Guide & Subtask Actions
+   ========================================================================== */
+.four-track-timeline .timeline-toolbar {
+  flex-wrap: wrap;
+}
+
+.four-track-timeline .timeline-actions {
+  flex-wrap: wrap;
+}
+
+.timeline-snap-guide-overlay {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 120px;
+  right: 0;
+  pointer-events: none;
+  z-index: 9;
+}
+
+.timeline-snap-guide {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent, #14b8a6);
+  box-shadow: 0 0 6px var(--accent, #14b8a6);
+  pointer-events: none;
+}
+
+@keyframes studio-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.studio-spin {
+  animation: studio-spin 0.9s linear infinite;
+}
+
+/* ==========================================================================
+   10. ReviewStudio Export Popover & Custom Objects S1 Modal
+   ========================================================================== */
+.export-menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.export-popover {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  min-width: 248px;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-elevated);
+  z-index: 48;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.custom-objects-modal-card {
+  width: min(480px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.custom-objects-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.custom-object-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--badge-info-bg);
+  color: var(--badge-info-text);
+  border: 1px solid var(--badge-info-border);
+}

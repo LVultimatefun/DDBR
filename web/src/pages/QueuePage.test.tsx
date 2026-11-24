@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AppRoutes } from "../App";
 import { AuthProvider } from "../stores/authStore";
+import { I18nProvider } from "../stores/i18nStore";
 import { makeEpisodeListItem, makeJobStatus } from "../test/fixtures";
 import { QueuePage } from "./QueuePage";
 
@@ -558,5 +559,119 @@ describe("QueuePage", () => {
       episode_ids: ["ds/ep_s1"],
       stage: "s1_grounding",
     });
+  });
+
+  it("navigates to /export with selected episode_ids & statuses via Export Selected and opens VLM modal from Workspace Settings popover", async () => {
+    const items = [
+      makeEpisodeListItem({ episode_id: "ds/ep_a", dataset: "ds", status: "vlm_ready" }),
+      makeEpisodeListItem({ episode_id: "ds/ep_b", dataset: "ds", status: "reviewed" }),
+    ];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/api/settings") {
+          return new Response(
+            JSON.stringify({ min_watch_coverage: 0.95, batch_vlm_concurrency: 4 }),
+            { status: 200 },
+          );
+        }
+        if (url === "/api/settings/vlm") {
+          return new Response(
+            JSON.stringify({
+              provider: "openai_compat",
+              base_url: "https://api.openai.com/v1",
+              api_key_env: "OPENAI_API_KEY",
+              api_key_configured: true,
+              api_key_masked: "sk-***1234",
+              thinking_mode: "disabled",
+              stage_models: { s1_grounding: "gpt-4o" },
+              presets: [],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/exports") || url.startsWith("/api/jobs")) {
+          return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+        }
+        return new Response(
+          JSON.stringify({
+            items,
+            total: items.length,
+            status_counts: { vlm_ready: 1, reviewed: 1 },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    render(
+      <AuthProvider initialAuth={{ token: "lead-tok", username: "lead_1", role: "lead" }}>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("episode-row-ds/ep_a")).toBeInTheDocument());
+
+    // Open Workspace Settings popover -> click Configure VLM Model / API...
+    fireEvent.click(screen.getByTestId("open-settings-popover-btn"));
+    fireEvent.click(await screen.findByTestId("settings-open-vlm-modal-btn"));
+    expect(await screen.findByTestId("vlm-settings-modal")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("close-vlm-settings-btn"));
+    await waitFor(() => expect(screen.queryByTestId("vlm-settings-modal")).toBeNull());
+
+    // Export Selected button disabled when nothing selected
+    const exportSelectedBtn = screen.getByTestId("queue-export-selected-btn") as HTMLButtonElement;
+    expect(exportSelectedBtn).toBeDisabled();
+
+    // Select both rows -> button shows Export Selected (2) and navigates to ExportPage pre-populated
+    fireEvent.click(screen.getByTestId("episode-row-ds/ep_a").querySelector("input[type='checkbox']")!);
+    fireEvent.click(screen.getByTestId("episode-row-ds/ep_b").querySelector("input[type='checkbox']")!);
+    expect(exportSelectedBtn).not.toBeDisabled();
+    expect(exportSelectedBtn).toHaveTextContent("Export Selected (2)");
+
+    fireEvent.click(exportSelectedBtn);
+
+    expect(await screen.findByTestId("export-page")).toBeInTheDocument();
+    const scopedBanner = screen.getByTestId("scoped-episodes-banner");
+    expect(scopedBanner).toHaveTextContent("Scoped to 2 selected episode(s)");
+    expect(scopedBanner).toHaveTextContent("ds/ep_a");
+    expect(scopedBanner).toHaveTextContent("ds/ep_b");
+  });
+
+  it("renders Chinese headings, status pills, and batch controls when locale is zh", async () => {
+    const items = [makeEpisodeListItem({ episode_id: "ds/ep_zh", status: "vlm_ready" })];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            items,
+            total: 1,
+            status_counts: { vlm_ready: 1 },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    render(
+      <I18nProvider initialLocale="zh">
+        <AuthProvider initialAuth={{ token: "lead-tok", username: "lead_1", role: "lead" }}>
+          <MemoryRouter>
+            <QueuePage />
+          </MemoryRouter>
+        </AuthProvider>
+      </I18nProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("episode-row-ds/ep_zh")).toBeInTheDocument());
+    expect(screen.getByText("全局质检队列与批量调度（组长）")).toBeInTheDocument();
+    expect(screen.getByTestId("lead-status-strip")).toHaveTextContent("待审核 (1)");
+    expect(screen.getByTestId("batch-vlm-btn")).toHaveTextContent("批量运行 VLM");
+    expect(screen.getByTestId("queue-export-selected-btn")).toHaveTextContent("导出已选 (0)");
   });
 });

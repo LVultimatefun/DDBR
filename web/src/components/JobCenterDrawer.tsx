@@ -3,30 +3,32 @@ import { Activity, Download, RefreshCw, X, XCircle } from "lucide-react";
 import { exportDownloadUrl } from "../api/client";
 import type { JobStatus } from "../api/types";
 import { useAuth } from "../stores/authStore";
+import { useI18n } from "../stores/i18nStore";
 import { useJobs } from "../stores/jobStore";
-
-function formatJobStatusLabel(status: JobStatus["status"]): string {
-  switch (status) {
-    case "queued":
-      return "Queued";
-    case "running":
-      return "Running";
-    case "completed":
-      return "Completed";
-    case "failed":
-      return "Failed";
-    case "cancelled":
-      return "Cancelled";
-    default:
-      return status;
-  }
-}
 
 export const JobCenterDrawer: React.FC = () => {
   const { isLead, token } = useAuth();
+  const { t } = useI18n();
   const { jobs, drawerOpen, setDrawerOpen, refreshJobs, cancelJob, artifactDownloadUrl } =
     useJobs();
   const [cancellingIds, setCancellingIds] = useState<Record<string, boolean>>({});
+
+  const formatJobStatusLabel = (status: JobStatus["status"]): string => {
+    switch (status) {
+      case "queued":
+        return t("jobs.status.queued");
+      case "running":
+        return t("jobs.status.running");
+      case "completed":
+        return t("jobs.status.completed");
+      case "failed":
+        return t("jobs.status.failed");
+      case "cancelled":
+        return t("jobs.status.cancelled");
+      default:
+        return status;
+    }
+  };
 
   const handleCancelClick = async (jobId: string) => {
     if (cancellingIds[jobId]) return;
@@ -61,10 +63,10 @@ export const JobCenterDrawer: React.FC = () => {
         if (e.target === e.currentTarget) setDrawerOpen(false);
       }}
     >
-      <aside className="drawer-panel" data-testid="job-center-drawer" aria-label="Async Job Center">
+      <aside className="drawer-panel" data-testid="job-center-drawer" aria-label={t("jobs.drawerAria")}>
         <div className="drawer-header">
           <h3>
-            <Activity size={16} /> Async Job Center ({jobs.length})
+            <Activity size={16} /> {t("jobs.drawerTitle", { count: jobs.length })}
           </h3>
           <div className="header-actions">
             <button
@@ -73,23 +75,23 @@ export const JobCenterDrawer: React.FC = () => {
               onClick={() => void refreshJobs()}
               data-testid="refresh-job-drawer-btn"
             >
-              <RefreshCw size={13} /> Refresh
+              <RefreshCw size={13} /> {t("common.refresh")}
             </button>
             <button
               type="button"
               className="mini-btn"
               onClick={() => setDrawerOpen(false)}
               data-testid="close-job-drawer-btn"
-              aria-label="Close job drawer"
+              aria-label={t("jobs.closeAria")}
             >
-              <X size={14} /> Close
+              <X size={14} /> {t("common.close")}
             </button>
           </div>
         </div>
 
         <div className="drawer-body">
           {jobs.length === 0 ? (
-            <div className="empty-cell">No async jobs recorded yet.</div>
+            <div className="empty-cell">{t("jobs.empty")}</div>
           ) : (
             jobs.map((job) => {
               const total = Math.max(0, job.progress_total ?? 0);
@@ -134,7 +136,7 @@ export const JobCenterDrawer: React.FC = () => {
 
                   <div className="section-header-row small muted">
                     <span>
-                      Progress: {done}/{total} ({pct}%)
+                      {t("jobs.progress", { done, total, pct })}
                     </span>
                     <div className="header-actions">
                       {isActive && (
@@ -145,7 +147,8 @@ export const JobCenterDrawer: React.FC = () => {
                           data-testid={`drawer-cancel-job-${job.job_id}`}
                           onClick={() => void handleCancelClick(job.job_id)}
                         >
-                          <XCircle size={12} /> {cancellingIds[job.job_id] ? "Cancelling..." : "Cancel"}
+                          <XCircle size={12} />{" "}
+                          {cancellingIds[job.job_id] ? t("jobs.cancelling") : t("common.cancel")}
                         </button>
                       )}
                       {job.status === "completed" &&
@@ -157,7 +160,10 @@ export const JobCenterDrawer: React.FC = () => {
                             download={art.name || undefined}
                             data-testid={`drawer-download-job-${job.job_id}-${idx}`}
                           >
-                            <Download size={12} /> Download {art.name || `Artifact #${idx + 1}`}
+                            <Download size={12} />{" "}
+                            {t("jobs.downloadItem", {
+                              name: art.name || t("queue.artifactFallback", { index: idx + 1 }),
+                            })}
                           </a>
                         ))}
                       {job.status === "completed" && artifacts.length === 0 && exportId && (
@@ -167,7 +173,7 @@ export const JobCenterDrawer: React.FC = () => {
                           download={`${exportId}.zip`}
                           data-testid={`drawer-download-export-${job.job_id}`}
                         >
-                          <Download size={12} /> Download {exportId}.zip
+                          <Download size={12} /> {t("jobs.downloadExport", { id: exportId })}
                         </a>
                       )}
                     </div>
@@ -176,19 +182,26 @@ export const JobCenterDrawer: React.FC = () => {
                   {job.job_type === "ingest" &&
                     typeof job.summary?.discovered === "number" && (
                       <div className="small muted mono">
-                        Discovered {job.summary.discovered} · Inserted {job.summary.inserted ?? 0} ·
-                        Updated {job.summary.updated ?? 0} · Skipped {job.summary.skipped ?? 0}
+                        {t("jobs.ingestSummary", {
+                          discovered: job.summary.discovered,
+                          inserted: job.summary.inserted ?? 0,
+                          updated: job.summary.updated ?? 0,
+                          skipped: job.summary.skipped ?? 0,
+                        })}
                       </div>
                     )}
 
                   {job.job_type === "eval_gt" &&
                     (job.summary?.eval_run_id || job.summary?.metrics) && (
                       <div className="small muted mono">
-                        {job.summary?.eval_run_id ? `Eval: ${job.summary.eval_run_id}` : ""}
+                        {job.summary?.eval_run_id
+                          ? t("jobs.evalPrefix", { id: job.summary.eval_run_id })
+                          : ""}
                         {job.summary?.metrics
-                          ? ` · F1 ${job.summary.metrics.f1.toFixed(3)} · Cache ${(
-                              job.summary.metrics.cache_hit_rate * 100
-                            ).toFixed(0)}%`
+                          ? t("jobs.evalMetrics", {
+                              f1: job.summary.metrics.f1.toFixed(3),
+                              cache: (job.summary.metrics.cache_hit_rate * 100).toFixed(0),
+                            })
                           : ""}
                       </div>
                     )}
@@ -196,7 +209,7 @@ export const JobCenterDrawer: React.FC = () => {
                   {(results.length > 0 || errors.length > 0) && (
                     <details className="diag-raw-json">
                       <summary>
-                        Per-item details (succeeded {results.length} · failed {errors.length})
+                        {t("jobs.perItemDetails", { ok: results.length, failed: errors.length })}
                       </summary>
                       <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
                         {results.map((r, idx) => (
@@ -206,7 +219,7 @@ export const JobCenterDrawer: React.FC = () => {
                         ))}
                         {errors.map((err, idx) => (
                           <div key={`err-${idx}`} className="mono small delta-neg">
-                            ✗ {err.episode_id ?? "*"}: {err.error ?? "Unknown error"}
+                            ✗ {err.episode_id ?? "*"}: {err.error ?? t("common.unknownError")}
                           </div>
                         ))}
                       </div>

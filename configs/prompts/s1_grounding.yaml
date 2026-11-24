@@ -8,8 +8,8 @@ system_template: |
   Output strict JSON only:
   {"frames": [{"frame_index": 0, "time_s": 0.0, "objects": {obj_id: {"visible": bool, "bbox": [x1,y1,x2,y2], "state": str, "status_kind": "neutral|warn|error|good"}}}]}.
   Strictly follow these temporal consistency and boundary rules:
-  1. Target Identity Lock: Across the entire batch, the same obj_id must consistently lock onto the same physical object instance (for example, the specific cup, block, or tool being grasped, moved, or operated on in the active workspace); never switch mid-batch to a stationary distractor of the same category in the background.
-  2. Consistent Box Boundary: Keep the semantic extent of each object's bounding box consistent across every frame (for example, a container bounds only the container body and a target object bounds only the object body), tightly fitting the object's true outer contour; never suddenly include shadows, robot arms/fingers, spills, or background fixtures in isolated frames and cause box breathing or scale jumps.
+  1. Target Identity Lock: Across the entire batch, the same obj_id must consistently lock onto the same physical object instance (for example, the specific cup, block, or tool being grasped, moved, or operated on by manipulators -- robot arms/grippers or human hands -- in the active workspace); never switch mid-batch to a stationary distractor of the same category in the background.
+  2. Consistent Box Boundary: Keep the semantic extent of each object's bounding box consistent across every frame (for example, a container bounds only the container body and a target object bounds only the object body), tightly fitting the object's true outer contour; never suddenly include shadows, manipulators (robot arms/grippers or human hands/fingers), spills, or background fixtures in isolated frames and cause box breathing or scale jumps.
   3. Occlusion and invisibility handling: If an object is not visible or completely occluded in a frame, set visible=false and bbox=[0, 0, 0, 0]; never guess positions.
 user_template: |
   Task: {{ task_id }} -- {{ task_goal }}
@@ -18,3 +18,18 @@ user_template: |
   {{ objects_desc }}
   Task guidance: {{ task_prompt }}
   Output the 2D bounding boxes and states in chronological order for every keyframe in this batch (the frames list must cover all input frame_index and time_s entries), ensuring target identity stays locked without cross-object switching and bounding-box semantic boundaries remain stable.
+extra_templates:
+  discover_system: |
+    You are an embodied manipulation visual grounding expert (2D Grounding canonical vocabulary discovery).
+    Inspect the provided overview keyframes spanning an entire demonstration trajectory (which may be performed by robot arms/grippers or human hands) and select a compact canonical list of 1 to 4 task-relevant physical objects to track consistently across all batches.
+    Prioritize:
+    1. Primary object(s) or tools actively contacted, grasped, lifted, poured, opened, or manipulated by the robot arms/grippers or human hands.
+    2. The primary target container, receptacle, fixture, or destination surface involved in the manipulation.
+    Do NOT include robot arms/grippers, human hands, or irrelevant background clutter.
+    Output strict JSON only:
+    {"canonical_objects": [{"id": "snake_case_id", "name": "Short Display Name", "desc": "concise distinguishing visual description", "is_static": bool}]}.
+  discover_user: |
+    Task: {{ task_id }} -- {{ task_goal }}
+    Camera view: {{ camera_layout_desc }}
+    Task guidance: {{ task_prompt }}
+    Identify the 1 to 4 most task-relevant canonical physical objects (active manipulated objects + target container/receptacle) and output strict JSON with stable snake_case ids.

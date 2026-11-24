@@ -18,6 +18,8 @@ import type {
   FewShotItem,
   FewShotListResponse,
   HumanReviewArtifact,
+  InferSubtasksRequest,
+  InferSubtasksResponse,
   IngestBrowseResponse,
   JobRunStatus,
   JobStatus,
@@ -47,6 +49,10 @@ import type {
   UnknownListResponse,
   UnknownTriageRequest,
   UnknownTriageResponse,
+  VlmSettingsResponse,
+  VlmSettingsUpdatePayload,
+  VlmTestPayload,
+  VlmTestResponse,
   WatchCoverage,
   WorkspaceSettings,
 } from "./types";
@@ -289,6 +295,19 @@ export async function checkSplice(
   });
 }
 
+export async function inferSubtasks(
+  episodeId: string,
+  payload: InferSubtasksRequest,
+): Promise<InferSubtasksResponse> {
+  return apiFetch<InferSubtasksResponse>(
+    `/api/episodes/${encodeEpPath(episodeId)}/infer-subtasks`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
 export async function getSettings(): Promise<WorkspaceSettings> {
   return apiFetch<WorkspaceSettings>("/api/settings");
 }
@@ -303,6 +322,28 @@ export async function updateSettings(
 }
 
 export const putSettings = updateSettings;
+
+export async function getVlmSettings(): Promise<VlmSettingsResponse> {
+  return apiFetch<VlmSettingsResponse>("/api/settings/vlm");
+}
+
+export async function updateVlmSettings(
+  payload: VlmSettingsUpdatePayload,
+): Promise<VlmSettingsResponse> {
+  return apiFetch<VlmSettingsResponse>("/api/settings/vlm", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function testVlmSettings(
+  payload?: VlmTestPayload,
+): Promise<VlmTestResponse> {
+  return apiFetch<VlmTestResponse>("/api/settings/vlm/test", {
+    method: "POST",
+    body: JSON.stringify(payload ?? {}),
+  });
+}
 
 export interface ClaimResponse {
   episode_id: string;

@@ -2,10 +2,10 @@ stage: "s3_discover"
 version: "1.0.0"
 description: "Stage 3 Precision-First sliding-window QC discovery with S2 backbone protection and Few-Shot injection"
 system_template: |
-  You are a high-precision embodied trajectory quality-control (QC) expert following the Precision-First principle:
-  1. Assume the trajectory is normal by default. Any smooth, monotonically progressing grasp, transport, alignment, placement, or stabilizing hold that advances the active macro stage is positive behavior -- even if slow or delicate -- and MUST NOT be flagged as an anomaly or badcase.
+  You are a high-precision embodied trajectory quality-control (QC) expert (supporting both robot arms/grippers and human hands / egocentric demonstrations) following the Precision-First principle:
+  1. Assume the trajectory is normal by default. Any smooth, monotonically progressing grasp, transport, alignment, placement, or stabilizing hold by manipulators (robot arms/grippers or human hands) that advances the active macro stage is positive behavior -- even if slow or delicate -- and MUST NOT be flagged as an anomaly or badcase.
   2. Flag candidate segments ONLY when you clearly observe failure, missed-grasp retry, object slip recovery, placement redo, aimless hesitation/oscillation, unintended collision/knock, leading/trailing or mid-episode rigid freeze, terminal failure, or a genuine unknown anomaly.
-  3. Never use abolished legacy labels (such as long_pause or back_and_forth). Select label_id strictly from the provided pure-visual label registry; if a clear anomaly does not match any active label, use unknown_anomaly and explain in unknown_note.
+  3. Never use abolished legacy labels (such as long_pause or back_and_forth). Select label_id strictly from the provided pure-visual label registry; if a clear anomaly does not match any active label, use unknown_anomaly and explain in unknown_note. Use affected_arm ("left|right|both") to indicate the affected manipulator/hand side.
   Output strict JSON only: {"segments": [{"t_start": float, "t_end": float, "label_id": str, "affected_arm": "left|right|both", "splice_policy": "keep_positive|mask_loss|cut_clean", "visual_evidence": {"initial_state": str, "process_change": str, "end_state": str}, "confidence": float, "unknown_note": str}]}.
 user_template: |
   Task: {{ task_id }} | Window: [{{ window_start_s }}s, {{ window_end_s }}s] / total {{ duration_s }}s

@@ -7,6 +7,7 @@ import type {
   ReviewDiff,
   SuccessVerdict,
 } from "../api/types";
+import { useI18n } from "../stores/i18nStore";
 
 export interface DiffOverlayProps {
   isLead: boolean;
@@ -150,6 +151,7 @@ export const DiffOverlay: React.FC<DiffOverlayProps> = ({
   onRestoreSnapshot,
   onSeek,
 }) => {
+  const { t } = useI18n();
   if (!isLead) {
     return null;
   }
@@ -168,7 +170,7 @@ export const DiffOverlay: React.FC<DiffOverlayProps> = ({
       <div className="diff-header">
         <div className="diff-title">
           <GitCompare size={15} />
-          <span>VLM Raw vs Human Revision (Lead View)</span>
+          <span>{t("diff.title")}</span>
         </div>
         <label className="checkbox-inline">
           <input
@@ -177,54 +179,64 @@ export const DiffOverlay: React.FC<DiffOverlayProps> = ({
             onChange={(e) => onToggleDiff(e.target.checked)}
             data-testid="toggle-diff-track"
           />
-          <span>Show ghost comparison track on timeline</span>
+          <span>{t("diff.showGhostTrack")}</span>
         </label>
       </div>
 
       <div className="diff-metrics-grid" data-testid="diff-metrics">
         <div className="diff-stat">
           <span className="stat-val">{diff.fp_deleted}</span>
-          <span className="stat-lbl">FP Deleted (fp_deleted)</span>
+          <span className="stat-lbl">{t("diff.metricFpDeleted")}</span>
         </div>
         <div className="diff-stat">
           <span className="stat-val">{diff.fn_added}</span>
-          <span className="stat-lbl">FN Added (fn_added)</span>
+          <span className="stat-lbl">{t("diff.metricFnAdded")}</span>
         </div>
         <div className="diff-stat">
           <span className="stat-val">{diff.policy_flips}</span>
-          <span className="stat-lbl">Policy Flips (policy_flips)</span>
+          <span className="stat-lbl">{t("diff.metricPolicyFlips")}</span>
         </div>
         <div className="diff-stat">
           <span className="stat-val">{diff.label_changes}</span>
-          <span className="stat-lbl">Label Changes (label_changes)</span>
+          <span className="stat-lbl">{t("diff.metricLabelChanges")}</span>
         </div>
         <div className="diff-stat">
           <span className="stat-val">{diff.boundary_nudges}</span>
-          <span className="stat-lbl">Boundary Nudges (boundary_nudges)</span>
+          <span className="stat-lbl">{t("diff.metricBoundaryNudges")}</span>
         </div>
         <div className="diff-stat">
           <span className="stat-val">{diff.macro_stage_edits}</span>
-          <span className="stat-lbl">Stage Edits (macro_stage_edits)</span>
+          <span className="stat-lbl">{t("diff.metricStageEdits")}</span>
         </div>
         <div className={`diff-stat ${diff.success_flipped ? "highlight" : ""}`}>
-          <span className="stat-val">{diff.success_flipped ? "Yes" : "No"}</span>
-          <span className="stat-lbl">Success Flipped (success_flipped)</span>
+          <span className="stat-val">{diff.success_flipped ? t("diff.yes") : t("diff.no")}</span>
+          <span className="stat-lbl">{t("diff.metricSuccessFlipped")}</span>
         </div>
       </div>
 
       <div className="diff-table-section">
-        <div className="section-label">Segment Comparison Details</div>
+        <div className="section-label">{t("diff.segmentDetailsTitle")}</div>
         <div className="diff-list">
           {rawVlmSegments.map((raw, idx) => {
             const cur = matchedByRawIdx.get(idx);
             const statusText = !cur
-              ? "Deleted (FP)"
+              ? t("diff.statusDeletedFp")
               : cur.splice_policy !== raw.splice_policy || cur.label_id !== raw.label_id
-                ? `Modified (${raw.label_id}/${raw.splice_policy} → ${cur.label_id}/${cur.splice_policy})`
+                ? t("diff.statusModified", {
+                    rawLabel: raw.label_id,
+                    rawPolicy: raw.splice_policy,
+                    curLabel: cur.label_id,
+                    curPolicy: cur.splice_policy,
+                  })
                 : Math.abs(cur.t_start - raw.t_start) > 0.05 + 1e-9 ||
                     Math.abs(cur.t_end - raw.t_end) > 0.05 + 1e-9
-                  ? `Boundary Nudged (${raw.t_start.toFixed(2)}-${raw.t_end.toFixed(2)} → ${cur.t_start.toFixed(2)}-${cur.t_end.toFixed(2)})`
-                  : "Unchanged";
+                  ? t("diff.statusBoundaryNudged", {
+                      rStart: raw.t_start.toFixed(2),
+                      rEnd: raw.t_end.toFixed(2),
+                      cStart: cur.t_start.toFixed(2),
+                      cEnd: cur.t_end.toFixed(2),
+                    })
+                  : t("diff.statusUnchanged");
             return (
               <div
                 key={`raw-${raw.seg_id}-${idx}`}
@@ -232,7 +244,8 @@ export const DiffOverlay: React.FC<DiffOverlayProps> = ({
                 onClick={() => onSeek?.(raw.t_start)}
               >
                 <span>
-                  [VLM] {raw.name || raw.label_id} ({raw.t_start.toFixed(2)}s-{raw.t_end.toFixed(2)}s)
+                  {t("diff.tagVlm")} {raw.name || raw.label_id} ({raw.t_start.toFixed(2)}s-
+                  {raw.t_end.toFixed(2)}s)
                 </span>
                 <span className="diff-status-badge">{statusText}</span>
               </div>
@@ -247,8 +260,8 @@ export const DiffOverlay: React.FC<DiffOverlayProps> = ({
                 onClick={() => onSeek?.(added.t_start)}
               >
                 <span>
-                  [Manual FN] {added.name || added.label_id} ({added.t_start.toFixed(2)}s-
-                  {added.t_end.toFixed(2)}s)
+                  {t("diff.tagManualFn")} {added.name || added.label_id} ({added.t_start.toFixed(2)}
+                  s-{added.t_end.toFixed(2)}s)
                 </span>
                 <span className="diff-status-badge">{added.splice_policy}</span>
               </div>
@@ -258,17 +271,20 @@ export const DiffOverlay: React.FC<DiffOverlayProps> = ({
 
       {rawVlmSuccess && (
         <div className="diff-success-compare">
-          <strong>Success Comparison: </strong>VLM={rawVlmSuccess.verdict} → Human=
-          {currentSuccess.verdict}
+          <strong>{t("diff.successComparePrefix")}</strong>
+          {t("diff.successCompareValue", {
+            vlm: rawVlmSuccess.verdict,
+            human: currentSuccess.verdict,
+          })}
         </div>
       )}
 
       <div className="revision-history-drawer" data-testid="revision-history-drawer">
         <div className="section-label">
-          <History size={13} /> Immutable Review Snapshots ({reviews.length})
+          <History size={13} /> {t("diff.snapshotsTitle", { count: reviews.length })}
         </div>
         {reviews.length === 0 ? (
-          <div className="empty-hint">No review snapshots recorded yet.</div>
+          <div className="empty-hint">{t("diff.snapshotsEmpty")}</div>
         ) : (
           <div className="revision-list">
             {reviews.map((rev) => (
@@ -279,14 +295,16 @@ export const DiffOverlay: React.FC<DiffOverlayProps> = ({
                     {new Date(rev.created_at * 1000).toLocaleString()}
                   </span>
                 </div>
-                {rev.notes && <div className="revision-notes">Notes: {rev.notes}</div>}
+                {rev.notes && (
+                  <div className="revision-notes">{t("diff.notesPrefix", { notes: rev.notes })}</div>
+                )}
                 <button
                   type="button"
                   className="mini-btn"
                   onClick={() => onRestoreSnapshot(rev)}
                   data-testid={`restore-rev-${rev.rev_id}`}
                 >
-                  <RotateCcw size={12} /> Restore Snapshot to Edit Stack
+                  <RotateCcw size={12} /> {t("diff.restoreBtn")}
                 </button>
               </div>
             ))}

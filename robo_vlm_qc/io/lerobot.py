@@ -630,8 +630,23 @@ class LeRobotAdapter(InputAdapter):
                 else None
             )
 
-            state_names = features.get("observation.state", {}).get("names") or []
-            parsed = _parse_named_state(raw_state, list(state_names))
+            raw_state_dim = (
+                int(raw_state.shape[1])
+                if (raw_state is not None and raw_state.ndim == 2)
+                else None
+            )
+            raw_action_dim = (
+                int(raw_action.shape[1])
+                if (raw_action is not None and raw_action.ndim == 2)
+                else None
+            )
+            state_names = _extract_feature_names(
+                features.get("observation.state"), raw_state_dim
+            )
+            action_names = _extract_feature_names(
+                features.get("action"), raw_action_dim
+            )
+            parsed = _parse_named_state(raw_state, list(state_names or []))
             valid_mask = (
                 np.isfinite(raw_state).all(axis=1)
                 if raw_state is not None
@@ -651,6 +666,8 @@ class LeRobotAdapter(InputAdapter):
                 arm_q=parsed.get("arm_q"),
                 head_q=parsed.get("head_q"),
                 eef_quat_wxyz=parsed.get("eef_quat_wxyz"),
+                state_names=state_names,
+                action_names=action_names,
             )
 
         has_kin = kin_data is not None
@@ -723,6 +740,34 @@ class LeRobotAdapter(InputAdapter):
             },
         )
         return EpisodeView(meta=meta, media=media, kinematics=kin_data)
+
+
+def _extract_feature_names(
+    feat_spec: Any, expected_dim: int | None = None
+) -> list[str] | None:
+    """Extract flat list of feature dimension names from LeRobot info.json feature metadata."""
+    if not isinstance(feat_spec, dict):
+        return None
+    raw = feat_spec.get("names")
+    if raw is None:
+        return None
+
+    names: list[str] = []
+    if isinstance(raw, list):
+        if len(raw) == 1 and isinstance(raw[0], list):
+            raw = raw[0]
+        if all(not isinstance(item, (list, dict)) for item in raw):
+            names = [str(item) for item in raw if str(item)]
+    elif isinstance(raw, dict):
+        for val in raw.values():
+            if isinstance(val, list):
+                names.extend(str(item) for item in val if str(item))
+
+    if not names:
+        return None
+    if expected_dim is not None and len(names) != expected_dim:
+        return None
+    return names
 
 
 def _parse_named_state(

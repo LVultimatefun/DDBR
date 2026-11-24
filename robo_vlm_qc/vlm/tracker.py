@@ -44,6 +44,10 @@ class TrackingConfig:
     smooth_window: int = 5
     camera_motion_threshold_norm: float = 25.0
     outlier_jump_norm: float = 250.0
+    moderate_outlier_jump_norm: float = 75.0
+    anchor_scale_jitter_ratio: float = 0.22
+    anchor_min_blend_weight: float = 0.15
+    anchor_max_blend_weight: float = 0.80
     adaptive_reanchor_max_calls: int = 0
     adaptive_disagree_ratio: float = 0.65
 
@@ -51,6 +55,8 @@ class TrackingConfig:
     def from_dict(cls, raw: dict[str, Any] | None) -> "TrackingConfig":
         if not isinstance(raw, dict):
             return cls()
+        min_w = float(np.clip(float(raw.get("anchor_min_blend_weight", 0.15)), 0.05, 0.90))
+        max_w = float(np.clip(float(raw.get("anchor_max_blend_weight", 0.80)), min_w, 0.95))
         return cls(
             enabled=bool(raw.get("enabled", True)),
             track_fps=max(1.0, float(raw.get("track_fps", 15.0))),
@@ -69,6 +75,14 @@ class TrackingConfig:
                 1.0, float(raw.get("camera_motion_threshold_norm", 25.0))
             ),
             outlier_jump_norm=max(20.0, float(raw.get("outlier_jump_norm", 250.0))),
+            moderate_outlier_jump_norm=max(
+                20.0, float(raw.get("moderate_outlier_jump_norm", 75.0))
+            ),
+            anchor_scale_jitter_ratio=float(
+                np.clip(float(raw.get("anchor_scale_jitter_ratio", 0.22)), 0.05, 0.80)
+            ),
+            anchor_min_blend_weight=min_w,
+            anchor_max_blend_weight=max_w,
             adaptive_reanchor_max_calls=max(
                 0, int(raw.get("adaptive_reanchor_max_calls", 0))
             ),
@@ -499,6 +513,43 @@ def _extract_template(
     return patch.astype(np.float32), (0, 0, 0, 0)
 
 
+def _patch_ncc(
+    gray: np.ndarray,
+    box_px: np.ndarray,
+    tmpl: np.ndarray | None,
+) -> float:
+    """Compute normalized cross-correlation in [0, 1] between a candidate box patch and reference template."""
+    if tmpl is None or tmpl.size < 16 or float(np.std(tmpl)) < 1.0:
+        return 0.0
+    h, w = gray.shape[:2]
+    x1 = max(0, min(w - 2, int(round(float(box_px[0])))))
+    y1 = max(0, min(h - 2, int(round(float(box_px[1])))))
+    x2 = max(x1 + 2, min(w, int(round(float(box_px[2])))))
+    y2 = max(y1 + 2, min(h, int(round(float(box_px[3])))))
+    patch = gray[y1:y2, x1:x2]
+    if patch.size < 16 or patch.shape[0] < 4 or patch.shape[1] < 4:
+        return 0.0
+    th, tw = tmpl.shape[:2]
+    pf = patch.astype(np.float32)
+    if pf.shape[0] != th or pf.shape[1] != tw:
+        pf = cv2.resize(
+            pf,
+            (tw, th),
+            interpolation=cv2.INTER_AREA if (tw < pf.shape[1] or th < pf.shape[0]) else cv2.INTER_LINEAR,
+        )
+    p_std = float(np.std(pf))
+    t_std = float(np.std(tmpl))
+    if p_std < 1.0 or t_std < 1.0:
+        return 0.0
+    p_zm = pf - float(np.mean(pf))
+    t_zm = tmpl - float(np.mean(tmpl))
+    denom = float(np.linalg.norm(p_zm) * np.linalg.norm(t_zm))
+    if denom <= 1e-6:
+        return 0.0
+    score = float(np.sum(p_zm * t_zm) / denom)
+    return float(np.clip(score, 0.0, 1.0)) if math.isfinite(score) else 0.0
+
+
 def _match_template_best(
     gray: np.ndarray,
     pred_box: np.ndarray,
@@ -690,7 +741,7 @@ def _rollout_one_direction(
     return boxes, confs, ncc_scores
 
 
-def track_interval_bidirectional(
+def _track_interval_bidirectional_detailed(
     grays: Sequence[np.ndarray],
     flow_fwd: Sequence[np.ndarray],
     flow_bwd: Sequence[np.ndarray],
@@ -700,10 +751,19 @@ def track_interval_bidirectional(
     cfg: TrackingConfig,
     w: int,
     h: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Bidirectional forward-backward BAFT tracking & confidence-weighted fusion.
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    float,
+    np.ndarray,
+    float,
+    np.ndarray,
+    float,
+]:
+    """Bidirectional forward-backward BAFT tracking plus endpoint rollout arrival predictions.
 
-    Returns (fused_boxes (L, 4), flags (L,), confs (L,), disagree_ratio).
+    Returns (fused_boxes, flags, confs, disagree_ratio, fwd_end_box, fwd_end_conf, bwd_start_box, bwd_start_conf).
     """
     L = len(grays)
     if L <= 1:
@@ -713,6 +773,10 @@ def track_interval_bidirectional(
             np.array([FLAG_VLM_ANCHOR], dtype=np.int32),
             np.array([1.0], dtype=np.float64),
             0.0,
+            b.copy(),
+            1.0,
+            b.copy(),
+            1.0,
         )
 
     fwd_boxes, fwd_confs, _ = _rollout_one_direction(
@@ -817,6 +881,36 @@ def track_interval_bidirectional(
         i = j
 
     disagree_ratio = float(np.percentile(disagrees, 75)) if disagrees else 0.0
+    return (
+        fused,
+        flags,
+        confs,
+        disagree_ratio,
+        fwd_boxes[-1].copy(),
+        float(fwd_confs[-1]),
+        bwd_boxes[0].copy(),
+        float(bwd_confs[0]),
+    )
+
+
+def track_interval_bidirectional(
+    grays: Sequence[np.ndarray],
+    flow_fwd: Sequence[np.ndarray],
+    flow_bwd: Sequence[np.ndarray],
+    bg_steps: Sequence[tuple[float, float]],
+    box_start_px: np.ndarray,
+    box_end_px: np.ndarray,
+    cfg: TrackingConfig,
+    w: int,
+    h: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Bidirectional forward-backward BAFT tracking & confidence-weighted fusion.
+
+    Returns (fused_boxes (L, 4), flags (L,), confs (L,), disagree_ratio).
+    """
+    fused, flags, confs, disagree_ratio, _, _, _, _ = _track_interval_bidirectional_detailed(
+        grays, flow_fwd, flow_bwd, bg_steps, box_start_px, box_end_px, cfg, w, h
+    )
     return fused, flags, confs, disagree_ratio
 
 
@@ -902,14 +996,55 @@ def _track_interval_onesided(
     return boxes_r[::-1], flags_r[::-1], confs_r[::-1]
 
 
+def _compute_adaptive_anchor_weight(
+    anchor_box: np.ndarray,
+    ref_box: np.ndarray,
+    flow_consistency: float,
+    flow_conf: float,
+    *,
+    min_w: float = 0.15,
+    max_w: float = 0.80,
+) -> float:
+    """Compute flow-agreement adaptive anchor weight in [min_w, max_w].
+
+    When local optical flow is smooth and self-consistent across an anchor while the
+    anchor jumps in center or scale, down-weight the noisy anchor to avoid rubber-banding.
+    When flow is uncertain or agrees closely with the anchor, preserve max_w.
+    """
+    agree_iou = box_iou(anchor_box, ref_box)
+    rw = max(4.0, float(ref_box[2] - ref_box[0]))
+    rh = max(4.0, float(ref_box[3] - ref_box[1]))
+    aw = max(4.0, float(anchor_box[2] - anchor_box[0]))
+    ah = max(4.0, float(anchor_box[3] - anchor_box[1]))
+    r_diag = max(8.0, math.hypot(rw, rh))
+    c_err = box_center_dist(anchor_box, ref_box) / r_diag
+    s_err = max(abs(aw - rw) / rw, abs(ah - rh) / rh)
+
+    iou_factor = float(np.clip((agree_iou - 0.40) / 0.45, 0.0, 1.0))
+    geom_pen = max(c_err / 0.25, s_err / 0.28)
+    geom_factor = float(np.clip(1.0 - 0.80 * max(0.0, geom_pen - 0.12), 0.0, 1.0))
+    anchor_trust = min(iou_factor, geom_factor)
+
+    flow_strength = float(np.clip((flow_consistency - 0.45) / 0.35, 0.0, 1.0)) * float(
+        np.clip((flow_conf - 0.35) / 0.45, 0.0, 1.0)
+    )
+    eff_trust = 1.0 - flow_strength * (1.0 - anchor_trust)
+    return float(min_w + (max_w - min_w) * eff_trust)
+
+
 def _smooth_dense_track(
     boxes_px: np.ndarray,
     flags: np.ndarray,
     smooth_window: int,
     w: int,
     h: int,
+    *,
+    confs: np.ndarray | None = None,
+    anchor_flow_info: dict[int, tuple[float, float, float, np.ndarray]] | None = None,
+    min_anchor_weight: float = 0.15,
+    max_anchor_weight: float = 0.80,
 ) -> np.ndarray:
-    """Apply zero-phase Savitzky-Golay smoothing on contiguous visible runs, softly pinning anchors."""
+    """Apply zero-phase Savitzky-Golay smoothing with flow-agreement adaptive anchor weighting."""
     n = len(flags)
     out = boxes_px.copy()
     win = int(smooth_window)
@@ -917,6 +1052,10 @@ def _smooth_dense_track(
         return out
     if win % 2 == 0:
         win += 1
+
+    flow_map = anchor_flow_info or {}
+    min_w = float(np.clip(min_anchor_weight, 0.05, 0.90))
+    max_w = float(np.clip(max_anchor_weight, min_w, 0.95))
 
     i = 0
     while i < n:
@@ -932,11 +1071,55 @@ def _smooth_dense_track(
             j += 1
         run_len = j - i
         if run_len >= win:
-            seg = boxes_px[i:j]
-            cx = 0.5 * (seg[:, 0] + seg[:, 2])
-            cy = 0.5 * (seg[:, 1] + seg[:, 3])
-            bw = np.maximum(2.0, seg[:, 2] - seg[:, 0])
-            bh = np.maximum(2.0, seg[:, 3] - seg[:, 1])
+            seg = boxes_px[i:j].copy()
+            seg_denoised = seg.copy()
+            anchor_weights: dict[int, tuple[float, np.ndarray | None]] = {}
+
+            # Pass 1: estimate flow-agreement adaptive weights for interior anchors &
+            # pre-denoise severe jitter spikes before Savitzky-Golay to avoid Gibbs ringing.
+            for k in range(run_len):
+                idx = i + k
+                if flags[idx] != FLAG_VLM_ANCHOR:
+                    continue
+                a_box = seg[k]
+                if idx in flow_map:
+                    _agree_iou, f_cons, f_conf, f_box = flow_map[idx]
+                    w_a = _compute_adaptive_anchor_weight(
+                        a_box, f_box, f_cons, f_conf, min_w=min_w, max_w=max_w
+                    )
+                    anchor_weights[k] = (w_a, f_box)
+                    if w_a < max_w - 0.05:
+                        seg_denoised[k] = _clamp_box_px(
+                            w_a * a_box + (1.0 - w_a) * f_box, w, h
+                        )
+                elif 0 < k < run_len - 1:
+                    nb_near = 0.5 * (seg[k - 1] + seg[k + 1])
+                    nb_cons = box_iou(seg[k - 1], seg[k + 1])
+                    ref_nb = nb_near
+                    if k >= 2 and k <= run_len - 3:
+                        wide_cons = box_iou(seg[k - 2], seg[k + 2])
+                        if wide_cons >= 0.45:
+                            ref_nb = 0.5 * nb_near + 0.25 * (seg[k - 2] + seg[k + 2])
+                            nb_cons = max(nb_cons, wide_cons)
+                    if confs is not None:
+                        nb_conf = 0.5 * (float(confs[idx - 1]) + float(confs[idx + 1]))
+                    else:
+                        nb_conf = 0.80
+                    w_a = _compute_adaptive_anchor_weight(
+                        a_box, ref_nb, nb_cons, nb_conf, min_w=min_w, max_w=max_w
+                    )
+                    anchor_weights[k] = (w_a, ref_nb)
+                    if w_a < max_w - 0.05:
+                        seg_denoised[k] = _clamp_box_px(
+                            w_a * a_box + (1.0 - w_a) * ref_nb, w, h
+                        )
+                else:
+                    anchor_weights[k] = (max_w, None)
+
+            cx = 0.5 * (seg_denoised[:, 0] + seg_denoised[:, 2])
+            cy = 0.5 * (seg_denoised[:, 1] + seg_denoised[:, 3])
+            bw = np.maximum(2.0, seg_denoised[:, 2] - seg_denoised[:, 0])
+            bh = np.maximum(2.0, seg_denoised[:, 3] - seg_denoised[:, 1])
 
             s_cx = savgol_filter(cx, window_length=win, polyorder=2)
             s_cy = savgol_filter(cy, window_length=win, polyorder=2)
@@ -955,7 +1138,12 @@ def _smooth_dense_track(
             for k in range(run_len):
                 idx = i + k
                 if flags[idx] == FLAG_VLM_ANCHOR:
-                    blended = 0.8 * boxes_px[idx] + 0.2 * sm[k]
+                    w_a, ref_box = anchor_weights.get(k, (max_w, None))
+                    if ref_box is not None and w_a < max_w - 0.05:
+                        smooth_target = 0.5 * sm[k] + 0.5 * ref_box
+                    else:
+                        smooth_target = sm[k]
+                    blended = w_a * boxes_px[idx] + (1.0 - w_a) * smooth_target
                 else:
                     blended = sm[k]
                 out[idx] = _clamp_box_px(blended, w, h)
@@ -966,10 +1154,30 @@ def _smooth_dense_track(
 def _find_candidate_outliers(
     keyframes: Sequence[GroundingKeyframe],
     outlier_jump_norm: float,
+    *,
+    moderate_jump_norm: float = 75.0,
+    scale_jitter_ratio: float = 0.22,
 ) -> dict[int, tuple[int, int]]:
-    """Return mapping {anchor_k: (prev_vis_k, next_vis_k)} for geometric jump candidates."""
+    """Return mapping {anchor_k: (prev_vis_k, next_vis_k)} for extreme, moderate & multi-frame jitter candidates."""
     vis_indices = [i for i, kf in enumerate(keyframes) if kf.visible]
     cands: dict[int, tuple[int, int]] = {}
+
+    def _interp_box(b0: Sequence[int], b1: Sequence[int], alpha: float) -> list[float]:
+        a = max(0.0, min(1.0, float(alpha)))
+        return [(1.0 - a) * float(b0[m]) + a * float(b1[m]) for m in range(4)]
+
+    def _is_moderate_jitter(b_cur: Sequence[int], b_exp: Sequence[float]) -> bool:
+        d_resid = box_center_dist(b_cur, b_exp)
+        ew = max(4.0, float(b_exp[2] - b_exp[0]))
+        eh = max(4.0, float(b_exp[3] - b_exp[1]))
+        cw = max(4.0, float(b_cur[2] - b_cur[0]))
+        ch = max(4.0, float(b_cur[3] - b_cur[1]))
+        exp_diag = max(20.0, math.hypot(ew, eh))
+        scale_dev = max(abs(cw - ew) / ew, abs(ch - eh) / eh)
+        center_thresh = max(35.0, min(float(moderate_jump_norm), 0.35 * exp_diag))
+        return d_resid > center_thresh or scale_dev > float(scale_jitter_ratio)
+
+    # Pass 1: single-anchor isolated spikes & moderate center/scale jitter off linear bridge
     for pos in range(1, len(vis_indices) - 1):
         k_prev = vis_indices[pos - 1]
         k_cur = vis_indices[pos]
@@ -982,6 +1190,38 @@ def _find_candidate_outliers(
         d_bridge = box_center_dist(b_prev, b_next)
         if d_prev > outlier_jump_norm and d_next > outlier_jump_norm and d_bridge < 120.0:
             cands[k_cur] = (k_prev, k_next)
+            continue
+        dt_tot = max(1e-3, keyframes[k_next].time_s - keyframes[k_prev].time_s)
+        alpha = (keyframes[k_cur].time_s - keyframes[k_prev].time_s) / dt_tot
+        b_exp = _interp_box(b_prev, b_next, alpha)
+        if _is_moderate_jitter(b_cur, b_exp):
+            cands[k_cur] = (k_prev, k_next)
+
+    # Pass 2: multi-frame (2-consecutive) jitter burst bridged across (k0 -> k3)
+    for pos in range(len(vis_indices) - 3):
+        k0, k1, k2, k3 = (
+            vis_indices[pos],
+            vis_indices[pos + 1],
+            vis_indices[pos + 2],
+            vis_indices[pos + 3],
+        )
+        b0 = keyframes[k0].bbox_norm_1000
+        b1 = keyframes[k1].bbox_norm_1000
+        b2 = keyframes[k2].bbox_norm_1000
+        b3 = keyframes[k3].bbox_norm_1000
+        w0 = max(4.0, float(b0[2] - b0[0]))
+        h0 = max(4.0, float(b0[3] - b0[1]))
+        w3 = max(4.0, float(b3[2] - b3[0]))
+        h3 = max(4.0, float(b3[3] - b3[1]))
+        if max(abs(w3 - w0) / w0, abs(h3 - h0) / h0) > 0.45:
+            continue
+        dt_tot = max(1e-3, keyframes[k3].time_s - keyframes[k0].time_s)
+        b_exp1 = _interp_box(b0, b3, (keyframes[k1].time_s - keyframes[k0].time_s) / dt_tot)
+        b_exp2 = _interp_box(b0, b3, (keyframes[k2].time_s - keyframes[k0].time_s) / dt_tot)
+        if _is_moderate_jitter(b1, b_exp1) and _is_moderate_jitter(b2, b_exp2):
+            cands[k1] = (k0, k3)
+            cands[k2] = (k0, k3)
+
     return cands
 
 
@@ -1175,9 +1415,14 @@ def run_baft_tracking(
         for oid, tr in raw_tracks.items()
     }
 
-    # Identify candidate VLM instance-switch outliers per object BEFORE streaming intervals
+    # Identify candidate VLM instance-switch & moderate/multi-frame jitter outliers BEFORE streaming intervals
     cand_outliers: dict[str, dict[int, tuple[int, int]]] = {
-        oid: _find_candidate_outliers(tr.keyframes, cfg.outlier_jump_norm)
+        oid: _find_candidate_outliers(
+            tr.keyframes,
+            cfg.outlier_jump_norm,
+            moderate_jump_norm=cfg.moderate_outlier_jump_norm,
+            scale_jitter_ratio=cfg.anchor_scale_jitter_ratio,
+        )
         for oid, tr in work_tracks.items()
     }
     # Merge adjacent anchor intervals whenever any object has a candidate outlier on the middle anchor
@@ -1186,11 +1431,17 @@ def run_baft_tracking(
         merged_boundary_anchors.update(c_map.keys())
 
     # Build contiguous anchor-index spans [a_start, a_end] to decode & flow-compute ONCE
+    # Cap span width at 4 intervals to keep streaming memory bounded on long episodes
+    max_merged_span = 4
     spans: list[tuple[int, int]] = []
     a_cur = 0
     while a_cur < max(1, n_anchors - 1):
         a_next = min(n_anchors - 1, a_cur + 1)
-        while a_next < n_anchors - 1 and a_next in merged_boundary_anchors:
+        while (
+            a_next < n_anchors - 1
+            and a_next in merged_boundary_anchors
+            and (a_next - a_cur) < max_merged_span
+        ):
             a_next += 1
         spans.append((a_cur, a_next))
         a_cur = a_next
@@ -1206,6 +1457,13 @@ def run_baft_tracking(
     }
     obj_confs: dict[str, np.ndarray] = {
         oid: np.zeros(n_dense, dtype=np.float64) for oid in work_tracks
+    }
+    # Per-object endpoint flow arrival predictions at anchors: dense_idx -> (pred_box_px, conf)
+    anchor_fwd_in: dict[str, dict[int, tuple[np.ndarray, float]]] = {
+        oid: {} for oid in work_tracks
+    }
+    anchor_bwd_out: dict[str, dict[int, tuple[np.ndarray, float]]] = {
+        oid: {} for oid in work_tracks
     }
 
     dis = _create_dis_flow(cfg.flow_preset)
@@ -1293,14 +1551,18 @@ def run_baft_tracking(
             chk()
             c_map = cand_outliers.get(oid, {})
 
-            # Validate any candidate outlier inside (a_start, a_end) using forward optical flow
+            # Validate candidate outlier/jitter anchors inside (a_start, a_end) using optical flow residual + NCC
             dropped_anchors: set[int] = set()
+            bridge_groups: dict[tuple[int, int], list[int]] = {}
             for ak in range(a_start + 1, a_end):
                 if ak not in c_map:
                     continue
                 k_prev, k_next = c_map[ak]
                 if k_prev < a_start or k_next > a_end:
                     continue
+                bridge_groups.setdefault((k_prev, k_next), []).append(ak)
+
+            for (k_prev, k_next), aks in bridge_groups.items():
                 rel0 = anchor_dense_idx[k_prev] - d_start
                 rel1 = anchor_dense_idx[k_next] - d_start
                 if rel1 <= rel0:
@@ -1311,7 +1573,7 @@ def run_baft_tracking(
                 b_next_px = _norm_to_px(
                     tr.keyframes[k_next].bbox_norm_1000, eff_w, eff_h
                 )
-                fwd_b, _, _ = _rollout_one_direction(
+                fwd_b, fwd_c, fwd_ncc = _rollout_one_direction(
                     grays[rel0 : rel1 + 1],
                     flow_fwd[rel0:rel1],
                     flow_bwd[rel0:rel1],
@@ -1321,8 +1583,46 @@ def run_baft_tracking(
                     eff_w,
                     eff_h,
                 )
-                if box_iou(fwd_b[-1], b_next_px) > 0.35:
-                    dropped_anchors.add(ak)
+                bridge_iou = box_iou(fwd_b[-1], b_next_px)
+                if bridge_iou <= 0.35:
+                    continue
+                tmpl_prev, _ = _extract_template(grays[rel0], b_prev_px)
+                for ak in aks:
+                    r_off = anchor_dense_idx[ak] - anchor_dense_idx[k_prev]
+                    if not (0 < r_off < len(fwd_b)):
+                        continue
+                    pred_px = fwd_b[r_off]
+                    c_pred = float(fwd_c[r_off])
+                    ncc_pred = float(fwd_ncc[r_off])
+                    b_ak_px = _norm_to_px(
+                        tr.keyframes[ak].bbox_norm_1000, eff_w, eff_h
+                    )
+                    iou_pred = box_iou(pred_px, b_ak_px)
+                    if iou_pred < 0.35:
+                        dropped_anchors.add(ak)
+                        continue
+                    pred_w = max(4.0, float(pred_px[2] - pred_px[0]))
+                    pred_h = max(4.0, float(pred_px[3] - pred_px[1]))
+                    ak_w = max(4.0, float(b_ak_px[2] - b_ak_px[0]))
+                    ak_h = max(4.0, float(b_ak_px[3] - b_ak_px[1]))
+                    pred_diag = max(8.0, math.hypot(pred_w, pred_h))
+                    rel_center_err = box_center_dist(pred_px, b_ak_px) / pred_diag
+                    scale_err = max(
+                        abs(ak_w - pred_w) / pred_w,
+                        abs(ak_h - pred_h) / pred_h,
+                    )
+                    ncc_anchor = _patch_ncc(
+                        grays[rel0 + r_off], b_ak_px, tmpl_prev
+                    )
+                    if bridge_iou > 0.45 and c_pred >= 0.45 and ncc_pred >= 0.45:
+                        if (
+                            rel_center_err > 0.18
+                            and (iou_pred < 0.72 or ncc_anchor < ncc_pred - 0.03)
+                        ) or (
+                            scale_err > cfg.anchor_scale_jitter_ratio
+                            and ncc_anchor <= ncc_pred + 0.03
+                        ):
+                            dropped_anchors.add(ak)
 
             active_anchors = [
                 ak for ak in range(a_start, a_end + 1) if ak not in dropped_anchors
@@ -1347,7 +1647,16 @@ def run_baft_tracking(
                 if kf0.visible and kf1.visible:
                     b0_px = _norm_to_px(kf0.bbox_norm_1000, eff_w, eff_h)
                     b1_px = _norm_to_px(kf1.bbox_norm_1000, eff_w, eff_h)
-                    f_boxes, f_flags, f_confs, disagree = track_interval_bidirectional(
+                    (
+                        f_boxes,
+                        f_flags,
+                        f_confs,
+                        disagree,
+                        fwd_end_box,
+                        fwd_end_conf,
+                        bwd_start_box,
+                        bwd_start_conf,
+                    ) = _track_interval_bidirectional_detailed(
                         sub_grays,
                         sub_ff,
                         sub_fb,
@@ -1361,6 +1670,8 @@ def run_baft_tracking(
                     obj_boxes_px[oid][i0 : i1 + 1] = f_boxes
                     obj_flags[oid][i0 : i1 + 1] = f_flags
                     obj_confs[oid][i0 : i1 + 1] = f_confs
+                    anchor_fwd_in[oid][i1] = (fwd_end_box, fwd_end_conf)
+                    anchor_bwd_out[oid][i0] = (bwd_start_box, bwd_start_conf)
                     interval_reports.append(
                         IntervalDisagreement(
                             object_id=oid,
@@ -1508,9 +1819,35 @@ def run_baft_tracking(
                 )
                 continue
 
+        # Build per-anchor optical-flow agreement info for adaptive anchor weighting
+        flow_info: dict[int, tuple[float, float, float, np.ndarray]] = {}
+        fwd_map = anchor_fwd_in.get(oid, {})
+        bwd_map = anchor_bwd_out.get(oid, {})
+        for idx in range(n_dense):
+            if int(obj_flags[oid][idx]) != FLAG_VLM_ANCHOR:
+                continue
+            has_in = idx in fwd_map
+            has_out = idx in bwd_map
+            if has_in and has_out:
+                p_in, c_in = fwd_map[idx]
+                p_out, c_out = bwd_map[idx]
+                f_cons = box_iou(p_in, p_out)
+                f_conf = min(c_in, c_out)
+                f_box = (c_in * p_in + c_out * p_out) / max(1e-6, c_in + c_out)
+                agree_iou = box_iou(obj_boxes_px[oid][idx], f_box)
+                flow_info[idx] = (agree_iou, f_cons, f_conf, f_box)
+
         # Moving object OR static container observed by a moving camera -> BAFT dense track
         smoothed_px = _smooth_dense_track(
-            obj_boxes_px[oid], obj_flags[oid], cfg.smooth_window, eff_w, eff_h
+            obj_boxes_px[oid],
+            obj_flags[oid],
+            cfg.smooth_window,
+            eff_w,
+            eff_h,
+            confs=obj_confs[oid],
+            anchor_flow_info=flow_info,
+            min_anchor_weight=cfg.anchor_min_blend_weight,
+            max_anchor_weight=cfg.anchor_max_blend_weight,
         )
         dense_boxes: list[list[int]] = []
         dense_flags: list[int] = []
@@ -1725,7 +2062,16 @@ def retrack_split_intervals(
                 seg_flags[rel_mid:] = fl
                 seg_confs[rel_mid:] = fc
 
-            sm_px = _smooth_dense_track(seg_boxes, seg_flags, cfg.smooth_window, eff_w, eff_h)
+            sm_px = _smooth_dense_track(
+                seg_boxes,
+                seg_flags,
+                cfg.smooth_window,
+                eff_w,
+                eff_h,
+                confs=seg_confs,
+                min_anchor_weight=cfg.anchor_min_blend_weight,
+                max_anchor_weight=cfg.anchor_max_blend_weight,
+            )
             for off in range(L):
                 g_idx = d0 + off
                 fl_val = int(seg_flags[off])

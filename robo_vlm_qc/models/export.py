@@ -11,6 +11,7 @@ from .review import EpisodeStatus
 ExportFormat = Literal["lerobot_v3", "h5_clean", "zero_copy_index", "viz_mp4"]
 ExportRecipeName = Literal["bc_clean", "recovery_plus", "badcase_pairs"]
 SmoothTailMode = Literal["on_jump", "always", "never"]
+StateSchemaMode = Literal["auto", "preserve_native", "canonical_81d"]
 
 
 class ExportRecipe(BaseModel):
@@ -28,6 +29,8 @@ class ExportRecipe(BaseModel):
     context_window_s: float = Field(default=2.0, ge=0.0)
     dataset_filter: str | None = None
     task_filter: str | None = None
+    state_schema_mode: StateSchemaMode = "auto"
+    split_by_subtask: bool = False
 
 
 class SubtaskSpan(BaseModel):
@@ -37,6 +40,7 @@ class SubtaskSpan(BaseModel):
     stage_id: str
     label: str
     label_en: str = ""
+    instruction: str = ""
     start_row: int = Field(ge=0)
     end_row: int = Field(gt=0)
 
@@ -78,6 +82,7 @@ class KeepPiece(BaseModel):
     is_tail: list[bool] = Field(default_factory=list)
     subtask_indices: list[int] = Field(default_factory=list)
     subtasks: list[SubtaskSpan] = Field(default_factory=list)
+    task_override: str | None = None
     smooth_tail_applied: bool = False
     dropped: bool = False
     drop_reason: str | None = None

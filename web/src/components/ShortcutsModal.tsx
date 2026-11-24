@@ -1,5 +1,6 @@
 import React from "react";
 import { Keyboard, X } from "lucide-react";
+import { useI18n } from "../stores/i18nStore";
 
 export interface ShortcutsModalProps {
   open: boolean;
@@ -8,27 +9,28 @@ export interface ShortcutsModalProps {
 
 interface ShortcutEntry {
   keys: string[];
-  desc: string;
+  descKey: string;
 }
 
 const SHORTCUT_ITEMS: ShortcutEntry[] = [
-  { keys: ["Space"], desc: "Play / Pause" },
-  { keys: ["←", "→"], desc: "Previous / Next frame" },
-  { keys: ["J", "L"], desc: "Seek -0.5s / +0.5s" },
-  { keys: ["Shift+J", "Shift+L"], desc: "Seek -2.0s / +2.0s" },
-  { keys: ["[", "]"], desc: "Set selected segment/stage start or end to playhead" },
-  { keys: ["N"], desc: "Add QC segment at playhead" },
-  { keys: ["S"], desc: "Split macro stage at playhead" },
-  { keys: ["R"], desc: "Loop selected segment (±0.5s padding)" },
-  { keys: ["K"], desc: "Toggle Cut-Skip preview mode" },
-  { keys: ["1", "2", "3"], desc: "Switch policy (keep / mask / cut)" },
-  { keys: ["Delete", "Backspace"], desc: "Delete selected segment or stage" },
-  { keys: ["Ctrl+Z", "Ctrl+Shift+Z"], desc: "Undo / Redo" },
-  { keys: ["Ctrl+S"], desc: "Save draft" },
-  { keys: ["?"], desc: "Open / close shortcuts cheat sheet" },
+  { keys: ["Space"], descKey: "shortcuts.playPause" },
+  { keys: ["←", "→"], descKey: "shortcuts.prevNextFrame" },
+  { keys: ["J", "L"], descKey: "shortcuts.seekHalf" },
+  { keys: ["Shift+J", "Shift+L"], descKey: "shortcuts.seekTwo" },
+  { keys: ["[", "]"], descKey: "shortcuts.setEdge" },
+  { keys: ["N"], descKey: "shortcuts.addSegment" },
+  { keys: ["S"], descKey: "shortcuts.splitStage" },
+  { keys: ["R"], descKey: "shortcuts.loopSeg" },
+  { keys: ["K"], descKey: "shortcuts.toggleCutSkip" },
+  { keys: ["1", "2", "3"], descKey: "shortcuts.switchPolicy" },
+  { keys: ["Delete", "Backspace"], descKey: "shortcuts.deleteItem" },
+  { keys: ["Ctrl+Z", "Ctrl+Shift+Z"], descKey: "shortcuts.undoRedo" },
+  { keys: ["Ctrl+S"], descKey: "shortcuts.saveDraft" },
+  { keys: ["?"], descKey: "shortcuts.toggleSheet" },
 ];
 
 export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({ open, onClose }) => {
+  const { t } = useI18n();
   if (!open) return null;
 
   return (
@@ -37,7 +39,7 @@ export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({ open, onClose })
       data-testid="shortcuts-modal"
       role="dialog"
       aria-modal="true"
-      aria-label="Review Studio keyboard shortcuts"
+      aria-label={t("shortcuts.dialogAria")}
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -45,23 +47,23 @@ export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({ open, onClose })
       <div className="modal-card modal-card-wide shortcuts-modal-card">
         <div className="inspector-header">
           <h3 style={{ margin: 0, display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <Keyboard size={16} /> Review Studio Keyboard Shortcuts
+            <Keyboard size={16} /> {t("shortcuts.title")}
           </h3>
           <button
             type="button"
             className="mini-btn"
             onClick={onClose}
             data-testid="close-shortcuts-modal"
-            aria-label="Close shortcuts modal"
+            aria-label={t("shortcuts.closeAria")}
           >
-            <X size={14} /> Close (Esc)
+            <X size={14} /> {t("shortcuts.closeBtn")}
           </button>
         </div>
 
         <div className="shortcuts-grid">
           {SHORTCUT_ITEMS.map((item) => (
             <div key={item.keys.join("/")} className="shortcut-row">
-              <span>{item.desc}</span>
+              <span>{t(item.descKey)}</span>
               <span className="shortcut-keys">
                 {item.keys.map((k, idx) => (
                   <React.Fragment key={k}>
@@ -75,23 +77,11 @@ export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({ open, onClose })
         </div>
 
         <div className="shortcuts-tips">
-          <strong>Direct Timeline Manipulation Tips:</strong>
-          <span>
-            • Hover or select a QC segment / macro stage and drag the 8px left/right edge handles to
-            scrub boundaries live; releasing commits a single undo step.
-          </span>
-          <span>
-            • Click and drag horizontally (≥ 0.2s) on empty space in Track 3 (QC Segments) to
-            brush-create and auto-select a new segment.
-          </span>
-          <span>
-            • Dragging a shared boundary between adjacent macro stages (gap &lt; 0.05s) snaps both
-            edges magnetically; hold Alt to detach and move a single edge.
-          </span>
-          <span>
-            • Click any red unwatched gap on the 4px Watch Map bar below the ruler to jump directly
-            to unwatched footage.
-          </span>
+          <strong>{t("shortcuts.tipsTitle")}</strong>
+          <span>{t("shortcuts.tip1")}</span>
+          <span>{t("shortcuts.tip2")}</span>
+          <span>{t("shortcuts.tip3")}</span>
+          <span>{t("shortcuts.tip4")}</span>
         </div>
       </div>
     </div>

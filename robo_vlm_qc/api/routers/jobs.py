@@ -95,6 +95,7 @@ class JobCreatePayload(BaseModel):
     fresh: bool = False
     concurrency: int | None = Field(default=None, ge=1, le=32)
     is_eval_sandbox: bool | None = None
+    custom_objects: list[str] | None = None
     export_params: dict[str, Any] | None = None
     eval_params: dict[str, Any] | None = None
     ingest_params: dict[str, Any] | None = None
@@ -105,6 +106,23 @@ class JobCreatePayload(BaseModel):
         if isinstance(v, bool) or isinstance(v, float):
             raise ValueError("concurrency must be an integer between 1 and 32")
         return v
+
+    @field_validator("custom_objects")
+    @classmethod
+    def _normalize_custom_objects(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in v:
+            s = item.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if low not in seen:
+                seen.add(low)
+                cleaned.append(s)
+        return cleaned or None
 
 
 def _resolve_stage_options(
@@ -242,6 +260,7 @@ def _run_job_worker(
                                 view,
                                 fresh=eff_fresh,
                                 fresh_stages=fresh_stages,
+                                custom_objects=payload.custom_objects,
                                 is_eval_sandbox=sandbox_flag,
                                 cancel_event=cancel_event,
                                 on_status_change=_on_ep_status,

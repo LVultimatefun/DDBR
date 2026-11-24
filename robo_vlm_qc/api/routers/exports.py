@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ...config import ConfigManager
 from ...export import PieceSlicer, get_exporter, group_kept_pieces
+from ...export.lerobot_v3 import resolve_lerobot_state_schema
 from ...io.base import EpisodeView, validate_id_part
 from ...models.export import (
     ExportFormat,
@@ -26,6 +27,7 @@ from ...models.export import (
     ExportRecipeName,
     KeepPiece,
     SmoothTailMode,
+    StateSchemaMode,
 )
 from ...models.review import EpisodeStatus, ResolvedEpisode
 from ...store import NotFoundError
@@ -50,6 +52,8 @@ class ExportTriggerPayload(BaseModel):
     dataset_filter: str | None = None
     task_filter: str | None = None
     episode_ids: list[str] | None = None
+    state_schema_mode: StateSchemaMode | None = None
+    split_by_subtask: bool = False
 
 
 def _build_recipe(payload: ExportTriggerPayload, cfg: ConfigManager) -> ExportRecipe:
@@ -71,6 +75,11 @@ def _build_recipe(payload: ExportTriggerPayload, cfg: ConfigManager) -> ExportRe
         if payload.include_statuses is not None
         else [EpisodeStatus.APPROVED, EpisodeStatus.GT_FROZEN]
     )
+    eff_schema_mode = (
+        payload.state_schema_mode
+        if payload.state_schema_mode is not None
+        else str(exp_cfg.get("state_schema_mode", "auto"))
+    )
     return ExportRecipe(
         name=payload.recipe,
         format=payload.format,
@@ -82,6 +91,8 @@ def _build_recipe(payload: ExportTriggerPayload, cfg: ConfigManager) -> ExportRe
         context_window_s=payload.context_window_s,
         dataset_filter=payload.dataset_filter,
         task_filter=payload.task_filter,
+        state_schema_mode=eff_schema_mode,  # type: ignore[arg-type]
+        split_by_subtask=bool(payload.split_by_subtask),
     )
 
 
@@ -142,12 +153,16 @@ def _run_dry_run_sync(state: AppState, payload: ExportTriggerPayload) -> ExportM
     cfg = state.get_config()
     recipe = _build_recipe(payload, cfg)
     with contextlib.ExitStack() as stack:
-        all_pieces, resolved_list, _ = _gather_slices(
+        all_pieces, resolved_list, views_by_ep = _gather_slices(
             state, cfg, recipe, payload.episode_ids, stack
         )
-        _, entries, ep_inc, ep_skp, p_exp, p_drop, tot_f = group_kept_pieces(
+        included_pairs, entries, ep_inc, ep_skp, p_exp, p_drop, tot_f = group_kept_pieces(
             all_pieces, resolved_list, recipe
         )
+        if recipe.format == "lerobot_v3" and included_pairs:
+            resolve_lerobot_state_schema(
+                included_pairs, views_by_ep, recipe.state_schema_mode
+            )
     return ExportManifest(
         export_id="dry_run",
         created_at=time.time(),
@@ -211,6 +226,8 @@ async def dry_run_export(
         manifest = await run_in_threadpool(_run_dry_run_sync, state, payload)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return manifest.model_dump(mode="json")
 
 
@@ -225,6 +242,8 @@ async def trigger_export(
         manifest = await run_in_threadpool(_run_export_sync, state, payload)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return manifest.model_dump(mode="json")
 
 

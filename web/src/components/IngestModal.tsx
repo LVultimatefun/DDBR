@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUp, FolderOpen, Upload, X } from "lucide-react";
 import { browseIngestDir, createJob } from "../api/client";
 import type { IngestBrowseResponse, JobStatus } from "../api/types";
+import { useI18n } from "../stores/i18nStore";
 
 export interface IngestModalProps {
   open: boolean;
@@ -10,6 +11,9 @@ export interface IngestModalProps {
 }
 
 export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCreated }) => {
+  const { t } = useI18n();
+  const tRef = useRef(t);
+  tRef.current = t;
   const [pathInput, setPathInput] = useState("");
   const [browseData, setBrowseData] = useState<IngestBrowseResponse | null>(null);
   const [adapter, setAdapter] = useState<string>("auto");
@@ -26,7 +30,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
       setBrowseData(res);
       setPathInput(res.current_path || targetPath || "");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to browse directory");
+      setError(err instanceof Error ? err.message : tRef.current("ingest.errBrowse"));
     } finally {
       setLoadingBrowse(false);
     }
@@ -55,7 +59,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
     e.preventDefault();
     const targetPath = pathInput.trim();
     if (!targetPath) {
-      setError("Please enter or select a dataset directory path to ingest");
+      setError(t("ingest.errNoPath"));
       return;
     }
     setSubmitting(true);
@@ -72,7 +76,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
       onJobCreated(job);
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to submit ingest job");
+      setError(err instanceof Error ? err.message : t("ingest.errSubmit"));
     } finally {
       setSubmitting(false);
     }
@@ -91,27 +95,26 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
       <form className="modal-card modal-card-wide" onSubmit={(e) => void handleSubmit(e)}>
         <div className="section-header-row">
           <h3 style={{ margin: 0, display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <FolderOpen size={17} /> Safe Data Ingest (Web Ingest)
+            <FolderOpen size={17} /> {t("ingest.title")}
           </h3>
           <button
             type="button"
             className="mini-btn"
             onClick={onClose}
-            aria-label="Close ingest modal"
+            aria-label={t("ingest.closeAria")}
             data-testid="close-ingest-modal-btn"
           >
-            <X size={14} /> Close
+            <X size={14} /> {t("common.close")}
           </button>
         </div>
 
         <p className="muted small" style={{ margin: 0 }}>
-          Read-only scan of allowlisted data directories into SQLite; raw dataset files are never
-          modified.
+          {t("ingest.desc")}
         </p>
 
         {browseData && browseData.allowed_roots.length > 0 && (
           <div className="field-group">
-            <span>Allowlisted Roots (allowed_roots)</span>
+            <span>{t("ingest.allowedRoots")}</span>
             <div className="header-actions">
               {browseData.allowed_roots.map((root, idx) => (
                 <button
@@ -129,7 +132,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
         )}
 
         <div className="field-group">
-          <span>Target Data Path</span>
+          <span>{t("ingest.targetPath")}</span>
           <div className="input-with-btn">
             <input
               type="text"
@@ -145,7 +148,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
               disabled={loadingBrowse}
               onClick={() => void loadDirectory(pathInput)}
             >
-              {loadingBrowse ? "Scanning..." : "Browse / Probe"}
+              {loadingBrowse ? t("ingest.scanning") : t("ingest.browseBtn")}
             </button>
           </div>
         </div>
@@ -153,7 +156,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
         {browseData && (
           <div className="field-group">
             <div className="section-header-row">
-              <span>Directory Browser ({browseData.current_path})</span>
+              <span>{t("ingest.dirBrowser", { path: browseData.current_path })}</span>
               {browseData.parent_path && (
                 <button
                   type="button"
@@ -161,14 +164,14 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
                   data-testid="ingest-parent-btn"
                   onClick={() => void loadDirectory(browseData.parent_path!)}
                 >
-                  <ArrowUp size={12} /> Parent Directory
+                  <ArrowUp size={12} /> {t("ingest.parentDir")}
                 </button>
               )}
             </div>
             <div className="ingest-dir-list" data-testid="ingest-dir-list">
               {dirs.length === 0 ? (
                 <div className="small muted" style={{ padding: "6px 8px" }}>
-                  No subdirectories in current folder
+                  {t("ingest.noSubdirs")}
                 </div>
               ) : (
                 dirs.map((entry) => (
@@ -188,11 +191,14 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
 
         {browseData && browseData.detected_adapters.length > 0 && (
           <div className="field-group" data-testid="ingest-detected-adapters">
-            <span>Detected Adapters</span>
+            <span>{t("ingest.detectedAdapters")}</span>
             <div className="header-actions">
               {browseData.detected_adapters.map((item) => (
                 <span key={item.adapter_type} className="badge-pill ok">
-                  {item.adapter_type} · {item.episode_count} episodes
+                  {t("ingest.adapterEpisodes", {
+                    adapter: item.adapter_type,
+                    count: item.episode_count,
+                  })}
                 </span>
               ))}
             </div>
@@ -201,25 +207,25 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
 
         <div className="two-col">
           <label className="field-group">
-            <span>Input Adapter (adapter)</span>
+            <span>{t("ingest.inputAdapter")}</span>
             <select
               value={adapter}
               onChange={(e) => setAdapter(e.target.value)}
               data-testid="ingest-adapter-select"
             >
-              <option value="auto">auto (Auto-detect)</option>
+              <option value="auto">{t("ingest.adapterAuto")}</option>
               <option value="h5_raw_v3">h5_raw_v3</option>
               <option value="lerobot">lerobot</option>
               <option value="video_dir">video_dir</option>
             </select>
           </label>
           <label className="field-group">
-            <span>Dataset Name Override (optional)</span>
+            <span>{t("ingest.datasetOverride")}</span>
             <input
               type="text"
               value={datasetOverride}
               onChange={(e) => setDatasetOverride(e.target.value)}
-              placeholder="Leave blank to use folder name"
+              placeholder={t("ingest.datasetOverridePlaceholder")}
               data-testid="ingest-dataset-input"
             />
           </label>
@@ -229,7 +235,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
 
         <div className="modal-actions">
           <button type="button" className="secondary-btn compact" onClick={onClose}>
-            Cancel
+            {t("common.cancel")}
           </button>
           <button
             type="submit"
@@ -237,7 +243,7 @@ export const IngestModal: React.FC<IngestModalProps> = ({ open, onClose, onJobCr
             disabled={submitting}
             data-testid="submit-ingest-btn"
           >
-            <Upload size={13} /> {submitting ? "Submitting..." : "Start Async Ingest"}
+            <Upload size={13} /> {submitting ? t("ingest.submitting") : t("ingest.startBtn")}
           </button>
         </div>
       </form>

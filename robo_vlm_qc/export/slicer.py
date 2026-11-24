@@ -497,6 +497,93 @@ def extract_piece_kinematics_81d(
     return state_piece, action_piece, tactile_piece
 
 
+def extract_piece_kinematics_native(
+    piece: KeepPiece,
+    view: EpisodeView,
+    *,
+    state_dim: int | None,
+    action_dim: int | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Return native-dim `(state, action, tactile)` arrays for a KeepPiece.
+
+    Preserves native LeRobot `[D_s]` / `[D_a]` dimensions without padding to 81D,
+    applying `smooth_tail_vector` when `piece.smooth_tail_applied` is True.
+    Tactile is NEVER smoothed.
+    """
+    kin = view.kinematics
+    T = (
+        len(kin.timestamps_s)
+        if (kin is not None and len(kin.timestamps_s) > 0)
+        else int(view.meta.frame_count)
+    )
+    rows = piece_source_rows(piece, T)
+
+    state_piece: np.ndarray | None = None
+    if state_dim is not None and state_dim > 0:
+        raw_st = getattr(kin, "raw_state", None) if kin is not None else None
+        if raw_st is None:
+            state_piece = np.zeros((len(rows), state_dim), dtype=np.float32)
+        else:
+            st_arr = np.asarray(raw_st, dtype=np.float32)
+            if st_arr.ndim == 1:
+                st_arr = st_arr[:, None]
+            if st_arr.shape[1] != state_dim:
+                raise ValueError(
+                    f"Expected native state dim {state_dim}, got {st_arr.shape[1]} "
+                    f"for episode {view.meta.episode_id!r}"
+                )
+            state_piece = st_arr[rows].copy()
+            if not np.isfinite(state_piece).all():
+                state_piece = np.nan_to_num(state_piece, nan=0.0, posinf=0.0, neginf=0.0)
+            if piece.smooth_tail_applied and piece.tail_rows > 0:
+                state_piece = smooth_tail_vector(
+                    "observation.state", state_piece, piece.own_rows
+                ).astype(np.float32, copy=False)
+
+    action_piece: np.ndarray | None = None
+    if action_dim is not None and action_dim > 0:
+        raw_act = getattr(kin, "raw_action", None) if kin is not None else None
+        if raw_act is not None:
+            act_arr = np.asarray(raw_act, dtype=np.float32)
+            if act_arr.ndim == 1:
+                act_arr = act_arr[:, None]
+            if act_arr.shape[1] != action_dim:
+                raise ValueError(
+                    f"Expected native action dim {action_dim}, got {act_arr.shape[1]} "
+                    f"for episode {view.meta.episode_id!r}"
+                )
+            action_piece = act_arr[rows].copy()
+            if not np.isfinite(action_piece).all():
+                action_piece = np.nan_to_num(
+                    action_piece, nan=0.0, posinf=0.0, neginf=0.0
+                )
+            if piece.smooth_tail_applied and piece.tail_rows > 0:
+                action_piece = smooth_tail_vector(
+                    "action", action_piece, piece.own_rows
+                ).astype(np.float32, copy=False)
+        elif state_piece is not None and state_piece.shape[1] == action_dim:
+            action_piece = np.empty_like(state_piece)
+            if len(state_piece) > 1:
+                action_piece[:-1] = state_piece[1:]
+            if len(state_piece) > 0:
+                action_piece[-1] = state_piece[-1]
+        else:
+            action_piece = np.zeros((len(rows), action_dim), dtype=np.float32)
+
+    tactile_piece: np.ndarray | None = None
+    raw_tac = getattr(kin, "tactile", None) if kin is not None else None
+    if raw_tac is not None:
+        tac_arr = np.asarray(raw_tac, dtype=np.float32)
+        if tac_arr.ndim == 2 and len(tac_arr) == T:
+            tactile_piece = tac_arr[rows].copy()
+            if not np.isfinite(tactile_piece).all():
+                tactile_piece = np.nan_to_num(
+                    tactile_piece, nan=0.0, posinf=0.0, neginf=0.0
+                )
+
+    return state_piece, action_piece, tactile_piece
+
+
 def _merge_row_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     if not intervals:
         return []
@@ -591,7 +678,29 @@ def _pose_jump_exceeds(
             if dyaw > max_ch_yaw:
                 return True
 
+    has_semantic = any(
+        getattr(kin, attr, None) is not None
+        for attr in ("eef_pos", "eef_rotvec", "hand_q", "torso_q", "chassis_pose")
+    )
+    if not has_semantic:
+        raw_st = getattr(kin, "raw_state", None)
+        if raw_st is not None and len(raw_st) > max(row_a, row_b):
+            sa = np.asarray(raw_st[row_a], dtype=np.float64)
+            sb = np.asarray(raw_st[row_b], dtype=np.float64)
+            fin = np.isfinite(sa) & np.isfinite(sb)
+            if fin.any() and float(np.abs(sb[fin] - sa[fin]).max()) > max_rot:
+                return True
+
     return False
+
+
+def _subtask_instruction_text(span: SubtaskSpan) -> str:
+    return (
+        (span.instruction or "").strip()
+        or (span.label_en or "").strip()
+        or (span.label or "").strip()
+        or span.stage_id
+    )
 
 
 def _align_rows_to_subtasks(
@@ -641,6 +750,7 @@ def _align_rows_to_subtasks(
                         stage_id=st.stage_id,
                         label=st.label,
                         label_en=st.label_en,
+                        instruction=str(getattr(st, "instruction", "") or "").strip(),
                         start_row=cur_start,
                         end_row=pos,
                     )
@@ -654,6 +764,7 @@ def _align_rows_to_subtasks(
                 stage_id=st.stage_id,
                 label=st.label,
                 label_en=st.label_en,
+                instruction=str(getattr(st, "instruction", "") or "").strip(),
                 start_row=cur_start,
                 end_row=len(row_indices),
             )
@@ -800,6 +911,134 @@ class PieceSlicer:
                 getattr(kin, "hand_cmd_valid", None) if kin is not None else None
             )
             kept_pieces: list[KeepPiece] = []
+
+            if recipe.split_by_subtask and resolved.macro_stages:
+                for k, (a, b) in enumerate(kept_intervals):
+                    own_rows_list = list(range(a, b))
+                    _, own_spans = _align_rows_to_subtasks(
+                        own_rows_list, resolved.macro_stages, fps
+                    )
+                    for span_pos, span in enumerate(own_spans):
+                        sub_a = a + span.start_row
+                        sub_b = a + span.end_row
+                        sub_own = sub_b - sub_a
+                        task_text = _subtask_instruction_text(span)
+                        if sub_own < min_frames:
+                            drop_rows = list(range(sub_a, sub_b))
+                            sub_idx, sub_spans = _align_rows_to_subtasks(
+                                drop_rows, resolved.macro_stages, fps
+                            )
+                            drop_idx = len(dropped_pieces)
+                            dropped_pieces.append(
+                                KeepPiece(
+                                    piece_id=f"{resolved.episode_id}__drop_{drop_idx:03d}",
+                                    episode_id=resolved.episode_id,
+                                    piece_index=drop_idx,
+                                    start_row=sub_a,
+                                    end_row=sub_b,
+                                    own_rows=sub_own,
+                                    tail_rows=0,
+                                    total_rows=sub_own,
+                                    fps=fps,
+                                    t_start_s=round(sub_a / fps, 6),
+                                    t_end_s=round(sub_b / fps, 6),
+                                    action_loss_mask=ep_mask[drop_rows].tolist(),
+                                    is_tail=[False] * sub_own,
+                                    subtask_indices=sub_idx,
+                                    subtasks=sub_spans,
+                                    task_override=task_text,
+                                    smooth_tail_applied=False,
+                                    dropped=True,
+                                    drop_reason=f"below_min_frames({sub_own}<{min_frames})",
+                                )
+                            )
+                            continue
+
+                        tail_start: int | None = None
+                        tail_end: int | None = None
+                        tail_rows = 0
+                        smooth_applied = False
+
+                        # Only bridge tail across a cut when the next kept interval continues the SAME subtask
+                        if (
+                            span_pos == len(own_spans) - 1
+                            and k < len(kept_intervals) - 1
+                            and tail_n > 0
+                        ):
+                            next_a, next_b = kept_intervals[k + 1]
+                            cand_tail = min(tail_n, next_b - next_a)
+                            if (
+                                hand_cmd_valid is not None
+                                and len(hand_cmd_valid) >= next_a + cand_tail
+                            ):
+                                invalid_rel = np.flatnonzero(
+                                    ~np.asarray(
+                                        hand_cmd_valid[next_a : next_a + cand_tail],
+                                        dtype=bool,
+                                    )
+                                )
+                                if len(invalid_rel) > 0:
+                                    cand_tail = int(invalid_rel[0])
+                            if cand_tail > 0:
+                                next_sub_idx, _ = _align_rows_to_subtasks(
+                                    list(range(next_a, next_a + cand_tail)),
+                                    resolved.macro_stages,
+                                    fps,
+                                )
+                                same_sub_n = 0
+                                for s_i in next_sub_idx:
+                                    if s_i == span.subtask_index:
+                                        same_sub_n += 1
+                                    else:
+                                        break
+                                if same_sub_n > 0:
+                                    tail_start = next_a
+                                    tail_end = next_a + same_sub_n
+                                    tail_rows = same_sub_n
+                                    if kin is not None:
+                                        if smooth_mode == "always":
+                                            smooth_applied = True
+                                        elif smooth_mode == "on_jump":
+                                            smooth_applied = _pose_jump_exceeds(
+                                                kin, sub_b - 1, next_a, self.splice_cfg
+                                            )
+
+                        piece_rows = list(range(sub_a, sub_b)) + (
+                            list(range(tail_start, tail_end))
+                            if (tail_start is not None and tail_end is not None)
+                            else []
+                        )
+                        sub_idx, sub_spans = _align_rows_to_subtasks(
+                            piece_rows, resolved.macro_stages, fps
+                        )
+                        p_idx = len(kept_pieces)
+                        kept_pieces.append(
+                            KeepPiece(
+                                piece_id=f"{resolved.episode_id}__p{p_idx:03d}",
+                                episode_id=resolved.episode_id,
+                                piece_index=p_idx,
+                                start_row=sub_a,
+                                end_row=sub_b,
+                                tail_start_row=tail_start,
+                                tail_end_row=tail_end,
+                                own_rows=sub_own,
+                                tail_rows=tail_rows,
+                                total_rows=sub_own + tail_rows,
+                                fps=fps,
+                                t_start_s=round(sub_a / fps, 6),
+                                t_end_s=round(sub_b / fps, 6),
+                                action_loss_mask=ep_mask[piece_rows].tolist(),
+                                is_tail=[False] * sub_own + [True] * tail_rows,
+                                subtask_indices=sub_idx,
+                                subtasks=sub_spans,
+                                task_override=task_text,
+                                smooth_tail_applied=smooth_applied,
+                                dropped=False,
+                                drop_reason=None,
+                            )
+                        )
+                return kept_pieces + dropped_pieces
+
             for k, (a, b) in enumerate(kept_intervals):
                 own_rows = b - a
                 tail_start: int | None = None
