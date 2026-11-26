@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   CheckCircle,
   ChevronDown,
+  Coins,
   Download,
   Edit3,
   ExternalLink,
@@ -14,11 +15,14 @@ import {
   History,
   Keyboard,
   Lock,
+  Magnet,
   Play,
   Redo2,
   RefreshCw,
+  Rows3,
   Save,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Tag,
   Undo2,
@@ -59,6 +63,7 @@ import type {
   SplicePolicy,
   SuccessVerdict,
   TaskSpec,
+  UsageSummary,
   VisualLabelDef,
   VlmRunSummary,
   WatchCoverage,
@@ -67,6 +72,7 @@ import { DiffOverlay } from "../components/DiffOverlay";
 import { FourTrackTimeline, type StageSpanUpdate } from "../components/FourTrackTimeline";
 import { SegmentInspector } from "../components/SegmentInspector";
 import { ShortcutsModal } from "../components/ShortcutsModal";
+import { StudioSkeleton } from "../components/SkeletonLoader";
 import { StudioPlayer, type StudioPlayerHandle } from "../components/StudioPlayer";
 import { SuccessPanel } from "../components/SuccessPanel";
 import { TaskDraftWizardModal } from "../components/TaskDraftWizardModal";
@@ -92,9 +98,48 @@ type InspectorTab = "segment" | "success" | "diff";
 
 const SPLIT_STORAGE_KEY = "robo_vlm_qc.studio_split_pct";
 const AUTO_ADVANCE_STORAGE_KEY = "robo_vlm_qc.auto_advance";
+const SNAP_ENABLED_STORAGE_KEY = "robo_vlm_qc.timeline_snap";
+const COMPACT_TRACKS_STORAGE_KEY = "robo_vlm_qc.timeline_compact";
 const DEFAULT_LEFT_PCT = 61;
 const MIN_LEFT_PCT = 50;
 const MAX_LEFT_PCT = 75;
+
+const QUICK_SHORTCUT_ITEMS: Array<{ keys: string[]; descKey: string }> = [
+  { keys: ["Space"], descKey: "shortcuts.playPause" },
+  { keys: ["←", "→"], descKey: "shortcuts.prevNextFrame" },
+  { keys: ["J", "L"], descKey: "shortcuts.seekHalf" },
+  { keys: ["[", "]"], descKey: "shortcuts.setEdge" },
+  { keys: ["N"], descKey: "shortcuts.addSegment" },
+  { keys: ["S"], descKey: "shortcuts.splitStage" },
+  { keys: ["1", "2", "3"], descKey: "shortcuts.switchPolicy" },
+  { keys: ["Ctrl+S"], descKey: "shortcuts.saveDraft" },
+];
+
+function formatTokenCount(tokens: number): string {
+  if (!Number.isFinite(tokens) || tokens <= 0) return "0";
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(2)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
+  return String(Math.round(tokens));
+}
+
+function formatUsd(cost: number): string {
+  if (!Number.isFinite(cost) || cost <= 0) return "$0.00";
+  if (cost < 0.001) return `$${cost.toFixed(4)}`;
+  if (cost < 1) return `$${cost.toFixed(3)}`;
+  return `$${cost.toFixed(2)}`;
+}
+
+function loadBoolPref(key: string, defaultValue: boolean): boolean {
+  if (typeof window === "undefined") return defaultValue;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === "false") return false;
+    if (raw === "true") return true;
+  } catch {
+    // Ignore storage read errors
+  }
+  return defaultValue;
+}
 
 const EMPTY_SUCCESS: SuccessVerdict = {
   passed: null,
@@ -182,6 +227,14 @@ export const ReviewStudioPage: React.FC = () => {
   const [cutSkipEnabled, setCutSkipEnabled] = useState<boolean>(false);
   const [loopSegmentEnabled, setLoopSegmentEnabled] = useState<boolean>(false);
   const [shortcutsOpen, setShortcutsOpen] = useState<boolean>(false);
+  const [costPopoverOpen, setCostPopoverOpen] = useState<boolean>(false);
+  const [displayPopoverOpen, setDisplayPopoverOpen] = useState<boolean>(false);
+  const [snapEnabled, setSnapEnabled] = useState<boolean>(() =>
+    loadBoolPref(SNAP_ENABLED_STORAGE_KEY, true),
+  );
+  const [compactTracks, setCompactTracks] = useState<boolean>(() =>
+    loadBoolPref(COMPACT_TRACKS_STORAGE_KEY, false),
+  );
   const [rerunMenuOpen, setRerunMenuOpen] = useState<boolean>(false);
   const [exportMenuOpen, setExportMenuOpen] = useState<boolean>(false);
   const [customObjectsModalOpen, setCustomObjectsModalOpen] = useState<boolean>(false);
@@ -218,6 +271,8 @@ export const ReviewStudioPage: React.FC = () => {
   const rerunMenuWrapRef = useRef<HTMLDivElement | null>(null);
   const exportMenuWrapRef = useRef<HTMLDivElement | null>(null);
   const taskPopoverWrapRef = useRef<HTMLDivElement | null>(null);
+  const costPopoverWrapRef = useRef<HTMLDivElement | null>(null);
+  const displayPopoverWrapRef = useRef<HTMLDivElement | null>(null);
 
   const history = useReviewHistory({
     qc_segments: [],
@@ -429,6 +484,8 @@ export const ReviewStudioPage: React.FC = () => {
     setCustomObjectsInput("");
     setInferringSubtasks(false);
     setTaskPopoverOpen(false);
+    setCostPopoverOpen(false);
+    setDisplayPopoverOpen(false);
     setTaskWizardOpen(false);
     setFrozenTaskConfirmId(null);
     setTaskRerunPrompt(null);
@@ -607,6 +664,33 @@ export const ReviewStudioPage: React.FC = () => {
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [taskPopoverOpen]);
+
+  // Close run cost popover when clicking outside
+  useEffect(() => {
+    if (!costPopoverOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (costPopoverWrapRef.current && !costPopoverWrapRef.current.contains(e.target as Node)) {
+        setCostPopoverOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [costPopoverOpen]);
+
+  // Close display & shortcuts popover when clicking outside
+  useEffect(() => {
+    if (!displayPopoverOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (
+        displayPopoverWrapRef.current &&
+        !displayPopoverWrapRef.current.contains(e.target as Node)
+      ) {
+        setDisplayPopoverOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [displayPopoverOpen]);
 
   // Load label catalog separately so role probe updates do not discard unsaved edits / undo history
   useEffect(() => {
@@ -1438,6 +1522,16 @@ export const ReviewStudioPage: React.FC = () => {
           setExportMenuOpen(false);
           return;
         }
+        if (costPopoverOpen) {
+          e.preventDefault();
+          setCostPopoverOpen(false);
+          return;
+        }
+        if (displayPopoverOpen) {
+          e.preventDefault();
+          setDisplayPopoverOpen(false);
+          return;
+        }
         return;
       }
 
@@ -1687,6 +1781,8 @@ export const ReviewStudioPage: React.FC = () => {
     flagDialogOpen,
     rerunMenuOpen,
     exportMenuOpen,
+    costPopoverOpen,
+    displayPopoverOpen,
     episode,
     isReadOnly,
     saving,
@@ -1703,8 +1799,9 @@ export const ReviewStudioPage: React.FC = () => {
 
   if (loading) {
     return (
-      <div className="page-container" data-testid="review-studio-loading">
-        {t("studio.loading", { id: episodeId })}
+      <div className="page-container studio-loading-container" data-testid="review-studio-loading">
+        <div className="muted small">{t("studio.loading", { id: episodeId })}</div>
+        <StudioSkeleton />
       </div>
     );
   }
@@ -1731,6 +1828,34 @@ export const ReviewStudioPage: React.FC = () => {
   const canReassignTask = isLead
     ? !isVlmActive
     : isDefaultTask && !isGtFrozen && !isVlmActive;
+
+  const runUsage: UsageSummary | null = episode.usage ?? null;
+  const totalCachedTokens = runUsage
+    ? (runUsage.total_cached_tokens ??
+      runUsage.stages.reduce((acc, st) => acc + (st.cached_tokens ?? 0), 0))
+    : 0;
+  const cachedPct =
+    runUsage && totalCachedTokens > 0 && runUsage.total_tokens > 0
+      ? Math.min(100, Math.max(1, Math.round((totalCachedTokens / runUsage.total_tokens) * 100)))
+      : 0;
+
+  const handleToggleSnap = (next: boolean) => {
+    setSnapEnabled(next);
+    try {
+      window.localStorage.setItem(SNAP_ENABLED_STORAGE_KEY, String(next));
+    } catch {
+      // Ignore storage errors
+    }
+  };
+
+  const handleToggleCompactTracks = (next: boolean) => {
+    setCompactTracks(next);
+    try {
+      window.localStorage.setItem(COMPACT_TRACKS_STORAGE_KEY, String(next));
+    } catch {
+      // Ignore storage errors
+    }
+  };
 
   return (
     <div className="studio-page" data-testid="review-studio-page">
@@ -1848,6 +1973,132 @@ export const ReviewStudioPage: React.FC = () => {
                       : t("studio.taskBadgeLabel", { task: episode.meta.task_id })}
                   </span>
                 </span>
+              )}
+              {runUsage && (
+                <div className="studio-cost-anchor" ref={costPopoverWrapRef}>
+                  <button
+                    type="button"
+                    className={`studio-cost-chip tabular-nums ${costPopoverOpen ? "active" : ""}`}
+                    data-testid="studio-run-cost-chip"
+                    title={t("studio.costChipTitle")}
+                    aria-expanded={costPopoverOpen}
+                    onClick={() => setCostPopoverOpen((v) => !v)}
+                  >
+                    <Coins size={12} />
+                    <span>
+                      {t("studio.costChipTokens", {
+                        tokens: formatTokenCount(runUsage.total_tokens),
+                      })}
+                    </span>
+                    <span className="studio-cost-sep">·</span>
+                    <span className="studio-cost-usd">{formatUsd(runUsage.total_cost_usd)}</span>
+                    {totalCachedTokens > 0 && (
+                      <span
+                        className="studio-cost-cached"
+                        data-testid="studio-run-cost-cached"
+                      >
+                        {t("studio.costChipCached", { pct: cachedPct })}
+                      </span>
+                    )}
+                    <ChevronDown size={11} />
+                  </button>
+                  {costPopoverOpen && (
+                    <div
+                      className="studio-cost-popover"
+                      data-testid="studio-run-cost-popover"
+                      role="dialog"
+                      aria-label={t("studio.costChipTitle")}
+                    >
+                      <div className="section-header-row">
+                        <div className="studio-cost-popover-title">
+                          <Coins size={13} />
+                          <strong>{t("studio.costChipTitle")}</strong>
+                        </div>
+                        <div className="studio-cost-popover-meta tabular-nums">
+                          <span className="muted small">
+                            {runUsage.total_elapsed_s.toFixed(1)}s
+                          </span>
+                          <button
+                            type="button"
+                            className="mini-btn"
+                            onClick={() => setCostPopoverOpen(false)}
+                            aria-label={t("common.close")}
+                          >
+                            <X size={12} />
+                          </button>
+                        </div>
+                      </div>
+                      <div className="studio-cost-section-label">
+                        {t("studio.costStageBreakdown")}
+                      </div>
+                      <div className="studio-cost-table-wrap">
+                        <table className="studio-cost-table tabular-nums">
+                          <thead>
+                            <tr>
+                              <th>Stage</th>
+                              <th>Model</th>
+                              <th className="num">Tokens</th>
+                              <th className="num">Cached</th>
+                              <th className="num">Cost</th>
+                              <th className="num">Time</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {runUsage.stages.map((st, idx) => (
+                              <tr key={`${st.stage}-${idx}`}>
+                                <td className="mono">{st.stage}</td>
+                                <td className="mono muted studio-cost-model" title={st.model}>
+                                  {st.model}
+                                </td>
+                                <td
+                                  className="num mono"
+                                  title={`${st.prompt_tokens} in / ${st.completion_tokens} out`}
+                                >
+                                  {formatTokenCount(st.total_tokens)}
+                                </td>
+                                <td className="num mono">
+                                  {(st.cached_tokens ?? 0) > 0
+                                    ? formatTokenCount(st.cached_tokens ?? 0)
+                                    : "—"}
+                                  {st.cache_hit && (
+                                    <span className="studio-cache-hit-badge">
+                                      {t("studio.costStageCacheHit")}
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="num mono">{formatUsd(st.estimated_cost_usd)}</td>
+                                <td className="num mono muted">{st.elapsed_s.toFixed(2)}s</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                          <tfoot>
+                            <tr>
+                              <td colSpan={2}>
+                                <strong>Total</strong>
+                              </td>
+                              <td className="num mono">
+                                <strong>{formatTokenCount(runUsage.total_tokens)}</strong>
+                              </td>
+                              <td className="num mono">
+                                <strong>
+                                  {totalCachedTokens > 0
+                                    ? formatTokenCount(totalCachedTokens)
+                                    : "—"}
+                                </strong>
+                              </td>
+                              <td className="num mono">
+                                <strong>{formatUsd(runUsage.total_cost_usd)}</strong>
+                              </td>
+                              <td className="num mono">
+                                <strong>{runUsage.total_elapsed_s.toFixed(2)}s</strong>
+                              </td>
+                            </tr>
+                          </tfoot>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
               {hasUnsavedChanges && (
                 <span className="dirty-indicator" data-testid="unsaved-indicator">
@@ -2030,6 +2281,107 @@ export const ReviewStudioPage: React.FC = () => {
             >
               <Keyboard size={14} /> ?
             </button>
+            <div className="studio-display-anchor" ref={displayPopoverWrapRef}>
+              <button
+                type="button"
+                className={`mini-btn studio-display-btn ${displayPopoverOpen ? "active" : ""}`}
+                data-testid="studio-display-popover-btn"
+                aria-expanded={displayPopoverOpen}
+                onClick={() => setDisplayPopoverOpen((v) => !v)}
+              >
+                <SlidersHorizontal size={13} />
+                <span>{t("studio.displayControls")}</span>
+                <ChevronDown size={11} />
+              </button>
+              {displayPopoverOpen && (
+                <div
+                  className="studio-display-popover"
+                  data-testid="studio-display-popover"
+                  role="dialog"
+                  aria-label={t("studio.displayControls")}
+                >
+                  <div className="section-header-row">
+                    <strong className="small">{t("studio.displayControls")}</strong>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      onClick={() => setDisplayPopoverOpen(false)}
+                      aria-label={t("common.close")}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+
+                  <div className="studio-display-toggles">
+                    <label className="studio-display-toggle-row">
+                      <div className="studio-display-toggle-meta">
+                        <span className="studio-display-toggle-label">
+                          <Magnet size={13} /> {t("studio.snapToGuides")}
+                        </span>
+                        <span className="studio-display-toggle-hint">{t("studio.snapHint")}</span>
+                      </div>
+                      <input
+                        type="checkbox"
+                        data-testid="toggle-timeline-snap"
+                        checked={snapEnabled}
+                        onChange={(e) => handleToggleSnap(e.target.checked)}
+                      />
+                    </label>
+
+                    <label className="studio-display-toggle-row">
+                      <div className="studio-display-toggle-meta">
+                        <span className="studio-display-toggle-label">
+                          <Rows3 size={13} /> {t("studio.compactTracks")}
+                        </span>
+                      </div>
+                      <input
+                        type="checkbox"
+                        data-testid="toggle-compact-tracks"
+                        checked={compactTracks}
+                        onChange={(e) => handleToggleCompactTracks(e.target.checked)}
+                      />
+                    </label>
+                  </div>
+
+                  <div className="studio-display-divider" />
+
+                  <div className="studio-display-shortcuts">
+                    <div className="section-header-row">
+                      <span className="studio-display-section-title">
+                        {t("studio.shortcutsHeading")}
+                      </span>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        data-testid="display-open-full-shortcuts-btn"
+                        onClick={() => {
+                          setDisplayPopoverOpen(false);
+                          setShortcutsOpen(true);
+                        }}
+                      >
+                        <Keyboard size={12} /> ?
+                      </button>
+                    </div>
+                    <div className="studio-display-shortcuts-list">
+                      {QUICK_SHORTCUT_ITEMS.map((item) => (
+                        <div key={item.keys.join("/")} className="studio-quick-shortcut-row">
+                          <span className="muted">{t(item.descKey)}</span>
+                          <span className="shortcut-keys">
+                            {item.keys.map((k, idx) => (
+                              <React.Fragment key={k}>
+                                {idx > 0 && <span className="muted">/</span>}
+                                <kbd className="kbd-cap">{k}</kbd>
+                              </React.Fragment>
+                            ))}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="studio-display-tip muted small">{t("studio.zoomTip")}</div>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="claim-controls">
@@ -2174,6 +2526,8 @@ export const ReviewStudioPage: React.FC = () => {
             watchCoverage={watchCoverage}
             showDiffTrack={isLead && showDiffTrack}
             readOnly={isReadOnly}
+            snapEnabled={snapEnabled}
+            compact={compactTracks}
             selectedSegmentId={selectedSegmentId}
             selectedStageId={selectedStageId}
             onSeek={setCurrentTime}
@@ -2376,7 +2730,7 @@ export const ReviewStudioPage: React.FC = () => {
       {/* Bottom RBAC-Gated Action Footer */}
       <div className="studio-footer" data-testid="studio-action-footer">
         <div className="footer-left">
-          <div className="watch-coverage-badge" data-testid="watch-coverage-badge">
+          <div className="watch-coverage-badge tabular-nums" data-testid="watch-coverage-badge">
             <span>{t("studio.watchCoverageLabel")}</span>
             <strong>{watchPct}%</strong>
             <span className="muted">{t("studio.watchCoverageReq", { pct: minWatchPct })}</span>
@@ -2680,3 +3034,5 @@ export const ReviewStudioPage: React.FC = () => {
     </div>
   );
 };
+
+export default ReviewStudioPage;

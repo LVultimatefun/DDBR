@@ -7,12 +7,15 @@ import {
   Cpu,
   Eye,
   EyeOff,
+  Gauge,
   X,
   Zap,
 } from "lucide-react";
 import { getVlmSettings, testVlmSettings, updateVlmSettings } from "../api/client";
 import type {
   PromptStageKey,
+  VlmCostTierId,
+  VlmCostTierPreset,
   VlmPresetItem,
   VlmProvider,
   VlmSettingsResponse,
@@ -39,6 +42,97 @@ const STAGE_KEYS: Array<{ key: PromptStageKey; labelKey: string }> = [
 ];
 
 const KNOWN_PRESET_IDS = new Set(["openai", "dashscope", "gemini", "vllm", "custom"]);
+const KNOWN_COST_TIER_IDS = new Set<VlmCostTierId>(["fast", "balanced", "high_precision"]);
+
+const FALLBACK_COST_TIERS: VlmCostTierPreset[] = [
+  {
+    id: "fast",
+    label: "Fast",
+    description: "Lowest cost & latency for quick screening",
+    relative_cost_hint: "~0.15x",
+    stage_models_by_provider: {
+      openai_compat: {
+        s1_grounding: "gpt-4o-mini",
+        s2_macro: "gpt-4o-mini",
+        s3_discover: "gpt-4o-mini",
+        s4_verify: "gpt-4o-mini",
+        s5_success: "gpt-4o-mini",
+      },
+      gemini: {
+        s1_grounding: "gemini-2.5-flash",
+        s2_macro: "gemini-2.5-flash",
+        s3_discover: "gemini-2.5-flash",
+        s4_verify: "gemini-2.5-flash",
+        s5_success: "gemini-2.5-flash",
+      },
+      dashscope: {
+        s1_grounding: "qwen-vl-plus",
+        s2_macro: "qwen-vl-plus",
+        s3_discover: "qwen-vl-plus",
+        s4_verify: "qwen-vl-plus",
+        s5_success: "qwen-vl-plus",
+      },
+    },
+  },
+  {
+    id: "balanced",
+    label: "Balanced",
+    description: "Lightweight S1/S2/S5 with strong S3/S4 reasoning",
+    relative_cost_hint: "~0.55x",
+    stage_models_by_provider: {
+      openai_compat: {
+        s1_grounding: "gpt-4o-mini",
+        s2_macro: "gpt-4o-mini",
+        s3_discover: "gpt-4o",
+        s4_verify: "gpt-4o",
+        s5_success: "gpt-4o-mini",
+      },
+      gemini: {
+        s1_grounding: "gemini-2.5-flash",
+        s2_macro: "gemini-2.5-flash",
+        s3_discover: "gemini-2.5-pro",
+        s4_verify: "gemini-2.5-pro",
+        s5_success: "gemini-2.5-flash",
+      },
+      dashscope: {
+        s1_grounding: "qwen-vl-plus",
+        s2_macro: "qwen-vl-plus",
+        s3_discover: "qwen-vl-max",
+        s4_verify: "qwen-vl-max",
+        s5_success: "qwen-vl-plus",
+      },
+    },
+  },
+  {
+    id: "high_precision",
+    label: "High Precision",
+    description: "Flagship vision model across all S1–S5 stages",
+    relative_cost_hint: "1.0x",
+    stage_models_by_provider: {
+      openai_compat: {
+        s1_grounding: "gpt-4o",
+        s2_macro: "gpt-4o",
+        s3_discover: "gpt-4o",
+        s4_verify: "gpt-4o",
+        s5_success: "gpt-4o",
+      },
+      gemini: {
+        s1_grounding: "gemini-2.5-pro",
+        s2_macro: "gemini-2.5-pro",
+        s3_discover: "gemini-2.5-pro",
+        s4_verify: "gemini-2.5-pro",
+        s5_success: "gemini-2.5-pro",
+      },
+      dashscope: {
+        s1_grounding: "qwen-vl-max",
+        s2_macro: "qwen-vl-max",
+        s3_discover: "qwen-vl-max",
+        s4_verify: "qwen-vl-max",
+        s5_success: "qwen-vl-max",
+      },
+    },
+  },
+];
 
 const FALLBACK_PRESETS: VlmPresetItem[] = [
   {
@@ -175,6 +269,23 @@ function matchPresetId(
   return "custom";
 }
 
+function detectActiveProviderBucket(
+  provider: VlmProvider,
+  baseUrl: string,
+): "openai_compat" | "gemini" | "dashscope" {
+  if (provider === "gemini") return "gemini";
+  if (baseUrl.toLowerCase().includes("dashscope")) return "dashscope";
+  return "openai_compat";
+}
+
+function stagesMatch(
+  a: Record<PromptStageKey, string>,
+  b: Record<string, string> | undefined,
+): boolean {
+  if (!b) return false;
+  return STAGE_KEYS.every(({ key }) => (a[key] ?? "").trim() === (b[key] ?? "").trim());
+}
+
 export const VlmSettingsModal: React.FC<VlmSettingsModalProps> = ({
   open,
   onClose,
@@ -203,12 +314,31 @@ export const VlmSettingsModal: React.FC<VlmSettingsModalProps> = ({
     return preset.default_model || preset.stage_models?.s1_grounding || preset.provider;
   };
 
+  const getTierLabel = (tier: VlmCostTierPreset): string => {
+    if (KNOWN_COST_TIER_IDS.has(tier.id)) {
+      return t(`vlmSettings.costTier.${tier.id}.label`);
+    }
+    return tier.label || tier.id;
+  };
+
+  const getTierDesc = (tier: VlmCostTierPreset): string => {
+    if (locale === "zh" && KNOWN_COST_TIER_IDS.has(tier.id)) {
+      return t(`vlmSettings.costTier.${tier.id}.desc`);
+    }
+    if (tier.description) return tier.description;
+    if (KNOWN_COST_TIER_IDS.has(tier.id)) {
+      return t(`vlmSettings.costTier.${tier.id}.desc`);
+    }
+    return "";
+  };
+
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [presets, setPresets] = useState<VlmPresetItem[]>(FALLBACK_PRESETS);
+  const [costTiers, setCostTiers] = useState<VlmCostTierPreset[]>(FALLBACK_COST_TIERS);
   const [selectedPresetId, setSelectedPresetId] = useState<string>("custom");
   const [provider, setProvider] = useState<VlmProvider>("openai_compat");
   const [baseUrl, setBaseUrl] = useState("");
@@ -228,10 +358,15 @@ export const VlmSettingsModal: React.FC<VlmSettingsModalProps> = ({
   const hydrateFromResponse = useCallback((res: VlmSettingsResponse) => {
     const resolvedPresets =
       Array.isArray(res.presets) && res.presets.length > 0 ? res.presets : FALLBACK_PRESETS;
+    const resolvedTiers =
+      Array.isArray(res.cost_tiers) && res.cost_tiers.length > 0
+        ? res.cost_tiers
+        : FALLBACK_COST_TIERS;
     const normalizedStages = normalizeStageModels(res.stage_models);
     const { uniform, primary } = detectUniformModel(normalizedStages);
 
     setPresets(resolvedPresets);
+    setCostTiers(resolvedTiers);
     setProvider(res.provider);
     setBaseUrl(res.base_url ?? "");
     setApiKeyEnv(res.api_key_env ?? "OPENAI_API_KEY");
@@ -278,6 +413,21 @@ export const VlmSettingsModal: React.FC<VlmSettingsModalProps> = ({
   }, [open, onClose]);
 
   const isUniform = useMemo(() => detectUniformModel(stageModels).uniform, [stageModels]);
+  const activeTierProvider = useMemo(
+    () => detectActiveProviderBucket(provider, baseUrl),
+    [provider, baseUrl],
+  );
+  const activeTierId = useMemo<VlmCostTierId | null>(() => {
+    for (const tier of costTiers) {
+      const target =
+        tier.stage_models_by_provider?.[activeTierProvider] ??
+        tier.stage_models_by_provider?.openai_compat;
+      if (stagesMatch(stageModels, target)) {
+        return tier.id;
+      }
+    }
+    return null;
+  }, [costTiers, activeTierProvider, stageModels]);
 
   if (!open) return null;
 
@@ -303,6 +453,20 @@ export const VlmSettingsModal: React.FC<VlmSettingsModalProps> = ({
     const nextStages = normalizeStageModels(preset.stage_models, defaultMod);
     setStageModels(nextStages);
     setGlobalModel(detectUniformModel(nextStages).primary || defaultMod);
+  };
+
+  const handleSelectCostTier = (tier: VlmCostTierPreset) => {
+    setError(null);
+    const tierModels =
+      tier.stage_models_by_provider?.[activeTierProvider] ??
+      tier.stage_models_by_provider?.openai_compat;
+    const nextStages = normalizeStageModels(tierModels);
+    const { uniform, primary } = detectUniformModel(nextStages);
+    setStageModels(nextStages);
+    setGlobalModel(primary);
+    if (!uniform) {
+      setRoutingExpanded(true);
+    }
   };
 
   const handleGlobalModelChange = (val: string) => {
@@ -470,6 +634,37 @@ export const VlmSettingsModal: React.FC<VlmSettingsModalProps> = ({
               </div>
             </div>
 
+            {/* One-click Cost / Accuracy Tier Presets */}
+            <div className="field-group">
+              <div className="vlm-key-header">
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                  <Gauge size={13} /> {t("vlmSettings.costTierHeading")}
+                </span>
+                <span className="muted small">
+                  {t("vlmSettings.costTierSub", { provider: activeTierProvider })}
+                </span>
+              </div>
+              <div className="vlm-cost-tier-grid" data-testid="vlm-cost-tier-grid">
+                {costTiers.map((tier) => (
+                  <button
+                    key={tier.id}
+                    type="button"
+                    className={`vlm-preset-card vlm-cost-tier-card ${
+                      activeTierId === tier.id ? "selected" : ""
+                    }`}
+                    data-testid={`cost-tier-${tier.id}`}
+                    onClick={() => handleSelectCostTier(tier)}
+                  >
+                    <div className="vlm-cost-tier-head">
+                      <span className="vlm-preset-title">{getTierLabel(tier)}</span>
+                      <span className="badge-pill tabular-nums">{tier.relative_cost_hint}</span>
+                    </div>
+                    <span className="vlm-preset-sub">{getTierDesc(tier)}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
             {/* Provider & Thinking Mode */}
             <div className="two-col">
               <label className="field-group">
@@ -629,7 +824,7 @@ export const VlmSettingsModal: React.FC<VlmSettingsModalProps> = ({
                   <strong>
                     {testResult.ok ? t("vlmSettings.connectionOk") : t("vlmSettings.connectionFailed")}
                   </strong>
-                  <span className="mono small">
+                  <span className="mono small tabular-nums">
                     {testResult.model} · {Math.round(testResult.latency_ms)} ms
                   </span>
                 </div>

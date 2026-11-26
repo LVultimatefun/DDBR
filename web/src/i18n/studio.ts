@@ -438,6 +438,17 @@ export const studioEn = {
   "studio.taskRerunPromptReviewer":
     "Task reassigned to \"{taskId}\" while preserving existing annotations. A Lead can re-run VLM if needed.",
   "studio.taskRerunNowBtn": "Re-run VLM now",
+  "studio.costChipTitle": "VLM Run Cost & Token Usage",
+  "studio.costChipTokens": "{tokens} tok",
+  "studio.costChipCached": "{pct}% cached",
+  "studio.costStageBreakdown": "Per-Stage Breakdown",
+  "studio.costStageCacheHit": "cache hit",
+  "studio.displayControls": "Display & Shortcuts",
+  "studio.snapToGuides": "Magnetic Timeline Snap",
+  "studio.snapHint": "Hold Shift while dragging to bypass snap",
+  "studio.compactTracks": "Compact Track Density",
+  "studio.shortcutsHeading": "Keyboard Shortcuts",
+  "studio.zoomTip": "Ctrl/Alt + Wheel zooms around cursor",
 } as const;
 
 export const studioZh: Record<keyof typeof studioEn, string> = {
@@ -862,4 +873,15 @@ export const studioZh: Record<keyof typeof studioEn, string> = {
   "studio.taskRerunPromptReviewer":
     "已将任务修改为“{taskId}”（原有标注已保留）。如需按新任务重新分析，可联系组长重跑 VLM。",
   "studio.taskRerunNowBtn": "立即重跑 VLM",
+  "studio.costChipTitle": "VLM 运行成本与 Token 消耗",
+  "studio.costChipTokens": "{tokens} tok",
+  "studio.costChipCached": "{pct}% 缓存命中",
+  "studio.costStageBreakdown": "分阶段消耗明细",
+  "studio.costStageCacheHit": "缓存命中",
+  "studio.displayControls": "视图与快捷键",
+  "studio.snapToGuides": "时间轴磁吸对齐",
+  "studio.snapHint": "拖拽时按住 Shift 可临时关闭磁吸",
+  "studio.compactTracks": "紧凑轨道模式",
+  "studio.shortcutsHeading": "键盘快捷键",
+  "studio.zoomTip": "Ctrl/Alt + 滚轮围绕指针锚定缩放",
 };

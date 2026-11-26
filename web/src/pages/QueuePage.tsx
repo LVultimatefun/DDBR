@@ -5,6 +5,7 @@ import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
+  Calculator,
   Cpu,
   Download,
   FolderPlus,
@@ -35,15 +36,21 @@ import type {
   EpisodeFacets,
   EpisodeListItem,
   EpisodeSortField,
-  EpisodeStatus,
   EpisodeTaskSummary,
   JobStatus,
   SortDir,
   TaskSpec,
 } from "../api/types";
 import { useEventStream } from "../api/useEventStream";
+import {
+  CostEstimatePopover,
+  formatTokenCount,
+  formatUsdCost,
+} from "../components/CostEstimatePopover";
 import { FacetCombobox } from "../components/FacetCombobox";
 import { IngestModal } from "../components/IngestModal";
+import { OnboardingEmptyState } from "../components/OnboardingEmptyState";
+import { TableSkeleton } from "../components/SkeletonLoader";
 import { TaskDraftWizardModal } from "../components/TaskDraftWizardModal";
 import { VlmSettingsModal } from "../components/VlmSettingsModal";
 import {
@@ -51,6 +58,7 @@ import {
   EPISODE_STATUS_META,
   getEpisodeStatusLabel,
 } from "../constants/labels";
+import { useQueueQueryParams } from "../hooks/useQueueQueryParams";
 import { useAuth } from "../stores/authStore";
 import { useI18n } from "../stores/i18nStore";
 import { useJobs } from "../stores/jobStore";
@@ -105,35 +113,39 @@ export const QueuePage: React.FC = () => {
   const [reviewerTab, setReviewerTab] = useState<ReviewerTab>("vlm_ready");
   const [claimingNext, setClaimingNext] = useState(false);
 
-  // Lead filter & sort state
-  const [statusFilter, setStatusFilter] = useState<EpisodeStatus | "">("");
-  const [datasetFilter, setDatasetFilter] = useState("");
-  const [taskFilter, setTaskFilter] = useState("");
-  const [adapterFilter, setAdapterFilter] = useState("");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [debouncedSearch, setDebouncedSearch] = useState("");
-  const [sortBy, setSortBy] = useState<EpisodeSortField>("episode_id");
-  const [sortDir, setSortDir] = useState<SortDir>("asc");
-  const [passedFilter, setPassedFilter] = useState<"all" | "true" | "false">("all");
-  const [downgradedOnly, setDowngradedOnly] = useState(false);
+  // Lead filter & sort state (synced with URL searchParams)
+  const {
+    statusFilter,
+    setStatusFilter,
+    datasetFilter,
+    setDatasetFilter,
+    taskFilter,
+    setTaskFilter,
+    adapterFilter,
+    setAdapterFilter,
+    passedFilter,
+    setPassedFilter,
+    downgradedOnly,
+    setDowngradedOnly,
+    searchQuery,
+    debouncedSearch,
+    setSearchQuery,
+    sortBy,
+    setSortBy,
+    sortDir,
+    setSortDir,
+    hasActiveFilters,
+  } = useQueueQueryParams();
   const queueSeqRef = useRef(0);
-
-  // Debounce search query to prevent spamming backend on fast typing
-  useEffect(() => {
-    const trimmed = searchQuery.trim();
-    if (!trimmed) {
-      setDebouncedSearch("");
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      setDebouncedSearch(trimmed);
-    }, 150);
-    return () => window.clearTimeout(timer);
-  }, [searchQuery]);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const estimateWrapRef = useRef<HTMLDivElement | null>(null);
+  const [estimateOpen, setEstimateOpen] = useState(false);
+  const [focusedRowIndex, setFocusedRowIndex] = useState<number>(-1);
 
   // Clear batch selection whenever visible filter/page/role scope changes
   useEffect(() => {
     setSelectedIds([]);
+    setEstimateOpen(false);
   }, [
     isLead,
     page,
@@ -813,6 +825,111 @@ export const QueuePage: React.FC = () => {
 
   const displayRows = isLead ? leadRows : reviewerFiltered;
 
+  useEffect(() => {
+    if (!estimateOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (estimateWrapRef.current && !estimateWrapRef.current.contains(e.target as Node)) {
+        setEstimateOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [estimateOpen]);
+
+  useEffect(() => {
+    setFocusedRowIndex((prev) => {
+      if (displayRows.length === 0) return -1;
+      if (prev >= displayRows.length) return displayRows.length - 1;
+      return prev;
+    });
+  }, [displayRows.length]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (
+        ingestOpen ||
+        vlmModalOpen ||
+        taskWizardOpen ||
+        Boolean(frozenConfirm) ||
+        estimateOpen ||
+        settingsOpen ||
+        document.querySelector(".modal-backdrop")
+      ) {
+        return;
+      }
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toUpperCase() ?? "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) {
+        return;
+      }
+
+      if (e.key === "/") {
+        if (isLead && searchInputRef.current) {
+          e.preventDefault();
+          searchInputRef.current.focus();
+          searchInputRef.current.select();
+        }
+        return;
+      }
+
+      if (displayRows.length === 0) return;
+
+      if (e.key === "j" || e.key === "ArrowDown") {
+        e.preventDefault();
+        setFocusedRowIndex((prev) => (prev < 0 ? 0 : Math.min(displayRows.length - 1, prev + 1)));
+      } else if (e.key === "k" || e.key === "ArrowUp") {
+        e.preventDefault();
+        setFocusedRowIndex((prev) => (prev <= 0 ? 0 : prev - 1));
+      } else if (e.key === "x" || e.key === "X") {
+        if (isLead) {
+          e.preventDefault();
+          const idx = focusedRowIndex >= 0 && focusedRowIndex < displayRows.length ? focusedRowIndex : 0;
+          if (focusedRowIndex < 0) setFocusedRowIndex(0);
+          toggleSelect(displayRows[idx].episode_id);
+        }
+      } else if (e.key === "Enter") {
+        if (focusedRowIndex >= 0 && focusedRowIndex < displayRows.length) {
+          e.preventDefault();
+          navigate(`/review/${encodeEpPath(displayRows[focusedRowIndex].episode_id)}`);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    displayRows,
+    focusedRowIndex,
+    isLead,
+    navigate,
+    ingestOpen,
+    vlmModalOpen,
+    taskWizardOpen,
+    frozenConfirm,
+    estimateOpen,
+    settingsOpen,
+  ]);
+
+  const handleToggleEstimate = () => {
+    if (selectedIds.length === 0) {
+      toast.showToast({
+        message: t("queue.toastSelectOne"),
+        variant: "warning",
+        testId: "queue-job-toast",
+      });
+      return;
+    }
+    setEstimateOpen((prev) => !prev);
+  };
+
+  const showOnboardingEmpty =
+    !loading &&
+    !error &&
+    displayRows.length === 0 &&
+    (isLead
+      ? !hasActiveFilters && allCount === 0
+      : reviewerTab === "vlm_ready" && totalEpisodes === 0 && myClaimedCount === 0);
+
   return (
     <div className="page-container" data-testid="queue-page">
       <div className="page-header">
@@ -963,7 +1080,7 @@ export const QueuePage: React.FC = () => {
             </button>
             <button
               type="button"
-              className={`tab-btn ${reviewerTab === "my_claimed" ? "active" : ""}`}
+              className={`tab-btn tabular-nums ${reviewerTab === "my_claimed" ? "active" : ""}`}
               onClick={() => {
                 setPage(0);
                 setReviewerTab("my_claimed");
@@ -991,7 +1108,7 @@ export const QueuePage: React.FC = () => {
       {/* Lead 9-Status Summary + Filter Bar + Batch Controls */}
       {isLead && (
         <>
-          <div className="status-strip" data-testid="lead-status-strip">
+          <div className="status-strip tabular-nums" data-testid="lead-status-strip">
             <button
               type="button"
               className={`status-pill ${statusFilter === "" ? "active" : ""}`}
@@ -1019,6 +1136,7 @@ export const QueuePage: React.FC = () => {
 
           <div className="filter-toolbar" data-testid="lead-filter-toolbar">
             <input
+              ref={searchInputRef}
               type="text"
               aria-label={t("queue.searchAria")}
               placeholder={t("queue.searchPlaceholder")}
@@ -1128,7 +1246,7 @@ export const QueuePage: React.FC = () => {
           </div>
 
           <div className="batch-job-bar" data-testid="lead-batch-controls">
-            <span>{t("queue.selectedCount", { count: selectedIds.length })}</span>
+            <span className="tabular-nums">{t("queue.selectedCount", { count: selectedIds.length })}</span>
             <select
               aria-label={t("queue.rerunStageAria")}
               data-testid="batch-vlm-stage-select"
@@ -1150,6 +1268,25 @@ export const QueuePage: React.FC = () => {
             >
               <Play size={14} /> {t("queue.runBatchVlm")}
             </button>
+            <div className="estimate-popover-anchor" ref={estimateWrapRef}>
+              <button
+                type="button"
+                className="secondary-btn compact"
+                onClick={handleToggleEstimate}
+                data-testid="estimate-vlm-cost-btn"
+                title={t("queue.estimateCostTitle")}
+                aria-expanded={estimateOpen}
+              >
+                <Calculator size={13} /> {t("queue.estimateCostBtn")}
+              </button>
+              <CostEstimatePopover
+                open={estimateOpen}
+                episodeIds={selectedIds}
+                stage={vlmStage || undefined}
+                onClose={() => setEstimateOpen(false)}
+                onConfirmRun={() => handleTriggerJob("batch_vlm")}
+              />
+            </div>
             <button
               type="button"
               className="secondary-btn compact"
@@ -1160,7 +1297,7 @@ export const QueuePage: React.FC = () => {
             </button>
             <button
               type="button"
-              className="accent-btn compact"
+              className="accent-btn compact tabular-nums"
               disabled={selectedIds.length === 0}
               onClick={handleExportSelected}
               data-testid="queue-export-selected-btn"
@@ -1247,7 +1384,7 @@ export const QueuePage: React.FC = () => {
 
           {activeJob && (
             <div className="job-progress-banner" data-testid="active-job-banner">
-              <div>
+              <div className="tabular-nums">
                 <strong>
                   {t("queue.jobBannerTitle", { jobId: activeJob.job_id, jobType: activeJob.job_type })}
                 </strong>{" "}
@@ -1315,256 +1452,307 @@ export const QueuePage: React.FC = () => {
 
       {error && <div className="error-banner">{error}</div>}
 
-      <div className="table-wrap">
-        <table className="data-table">
-          <thead>
-            <tr>
-              {isLead && (
-                <th>
-                  <input
-                    type="checkbox"
-                    aria-label={t("queue.selectAllAria")}
-                    checked={
-                      displayRows.length > 0 &&
-                      displayRows.every((r) => selectedIds.includes(r.episode_id))
-                    }
-                    onChange={(e) =>
-                      setSelectedIds(e.target.checked ? displayRows.map((r) => r.episode_id) : [])
-                    }
-                  />
-                </th>
-              )}
-              <th>
-                {isLead ? (
-                  <button
-                    type="button"
-                    className={`sort-col-btn ${sortBy === "episode_id" ? "active" : ""}`}
-                    data-testid="sort-col-episode_id"
-                    onClick={() => toggleSortColumn("episode_id")}
-                  >
-                    {t("queue.colEpisodeId")} {renderSortIcon("episode_id")}
-                  </button>
-                ) : (
-                  t("queue.colEpisodeId")
-                )}
-              </th>
-              <th>{t("queue.colTaskAdapter")}</th>
-              <th>{t("queue.colStatus")}</th>
-              <th>
-                {isLead ? (
-                  <button
-                    type="button"
-                    className={`sort-col-btn ${sortBy === "duration_s" ? "active" : ""}`}
-                    data-testid="sort-col-duration_s"
-                    onClick={() => toggleSortColumn("duration_s")}
-                  >
-                    {t("queue.colDurationFps")} {renderSortIcon("duration_s")}
-                  </button>
-                ) : (
-                  t("queue.colDurationFps")
-                )}
-              </th>
-              <th>{t("queue.colOutcome")}</th>
-              <th>
-                {isLead ? (
-                  <div className="sort-col-group">
-                    <button
-                      type="button"
-                      className={`sort-col-btn ${sortBy === "badcase_count" ? "active" : ""}`}
-                      data-testid="sort-col-badcase_count"
-                      onClick={() => toggleSortColumn("badcase_count")}
-                    >
-                      {t("queue.colBadcase")} {renderSortIcon("badcase_count")}
-                    </button>
-                    <span>/</span>
-                    <button
-                      type="button"
-                      className={`sort-col-btn ${sortBy === "cut_ratio" ? "active" : ""}`}
-                      data-testid="sort-col-cut_ratio"
-                      onClick={() => toggleSortColumn("cut_ratio")}
-                    >
-                      {t("queue.colCut")} {renderSortIcon("cut_ratio")}
-                    </button>
-                    <span>/ {t("queue.colMask")}</span>
-                  </div>
-                ) : (
-                  t("queue.colBadcaseCutMask")
-                )}
-              </th>
-              {isLead && (
-                <th>
-                  <button
-                    type="button"
-                    className={`sort-col-btn ${sortBy === "updated_at" ? "active" : ""}`}
-                    data-testid="sort-col-updated_at"
-                    onClick={() => toggleSortColumn("updated_at")}
-                  >
-                    {t("queue.colUpdated")} {renderSortIcon("updated_at")}
-                  </button>
-                </th>
-              )}
-              <th>{t("queue.colClaimedBy")}</th>
-              <th>{t("queue.colAction")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading && displayRows.length === 0 ? (
-              <tr>
-                <td colSpan={isLead ? 10 : 8} className="empty-cell">
-                  {t("common.loading")}
-                </td>
-              </tr>
-            ) : displayRows.length === 0 ? (
-              <tr>
-                <td colSpan={isLead ? 10 : 8} className="empty-cell">
-                  {t("queue.emptyTable")}
-                </td>
-              </tr>
-            ) : (
-              displayRows.map((ep) => {
-                const meta = EPISODE_STATUS_META[ep.status];
-                const statusLabel = getEpisodeStatusLabel(ep.status, locale);
-                const statusColor = meta?.color ?? "#64748b";
-                const passedText =
-                  ep.resolved_passed === null || ep.resolved_passed === undefined
-                    ? t("queue.outcomeUnsure")
-                    : ep.resolved_passed
-                      ? t("queue.outcomePass")
-                      : t("queue.outcomeFail");
-                return (
-                  <tr key={ep.episode_id} data-testid={`episode-row-${ep.episode_id}`}>
-                    {isLead && (
-                      <td>
-                        <input
-                          type="checkbox"
-                          checked={selectedIds.includes(ep.episode_id)}
-                          onChange={() => toggleSelect(ep.episode_id)}
-                        />
-                      </td>
+      {showOnboardingEmpty ? (
+        <OnboardingEmptyState
+          isLead={isLead}
+          onOpenIngest={() => setIngestOpen(true)}
+          onOpenVlmSettings={() => setVlmModalOpen(true)}
+        />
+      ) : (
+        <>
+          <div className="table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  {isLead && (
+                    <th>
+                      <input
+                        type="checkbox"
+                        aria-label={t("queue.selectAllAria")}
+                        checked={
+                          displayRows.length > 0 &&
+                          displayRows.every((r) => selectedIds.includes(r.episode_id))
+                        }
+                        onChange={(e) =>
+                          setSelectedIds(e.target.checked ? displayRows.map((r) => r.episode_id) : [])
+                        }
+                      />
+                    </th>
+                  )}
+                  <th>
+                    {isLead ? (
+                      <button
+                        type="button"
+                        className={`sort-col-btn ${sortBy === "episode_id" ? "active" : ""}`}
+                        data-testid="sort-col-episode_id"
+                        onClick={() => toggleSortColumn("episode_id")}
+                      >
+                        {t("queue.colEpisodeId")} {renderSortIcon("episode_id")}
+                      </button>
+                    ) : (
+                      t("queue.colEpisodeId")
                     )}
-                    <td className="mono">{ep.episode_id}</td>
-                    <td>
-                      {ep.task_id === "_default" ? (
-                        <div>
-                          <span
-                            className="badge-pill warn"
-                            data-testid={`default-task-badge-${ep.episode_id}`}
-                          >
-                            <AlertTriangle size={11} /> {t("queue.unrecognizedBadge")}
-                          </span>
-                          {isLead &&
-                            ep.status !== "vlm_queued" &&
-                            ep.status !== "vlm_running" && (
-                              <div className="inline-task-assign">
-                                <select
-                                  aria-label={t("queue.inlineAssignAria", {
-                                    episodeId: ep.episode_id,
-                                  })}
-                                  data-testid={`inline-task-select-${ep.episode_id}`}
-                                  value={
-                                    inlineTaskMap[ep.episode_id] ??
-                                    nonDefaultTaskOptions[0]?.task_id ??
-                                    ""
-                                  }
-                                  onChange={(e) =>
-                                    setInlineTaskMap((prev) => ({
-                                      ...prev,
-                                      [ep.episode_id]: e.target.value,
-                                    }))
-                                  }
-                                >
-                                  <option value="">{t("queue.assignTaskPlaceholder")}</option>
-                                  {nonDefaultTaskOptions.map((item) => (
-                                    <option key={item.task_id} value={item.task_id}>
-                                      {item.task_id}
-                                    </option>
-                                  ))}
-                                </select>
-                                <button
-                                  type="button"
-                                  className="mini-btn primary"
-                                  data-testid={`inline-assign-btn-${ep.episode_id}`}
-                                  disabled={
-                                    assigningTask ||
-                                    !(
-                                      inlineTaskMap[ep.episode_id] ??
-                                      nonDefaultTaskOptions[0]?.task_id
-                                    )
-                                  }
-                                  onClick={() => {
-                                    const chosen =
-                                      inlineTaskMap[ep.episode_id] ??
-                                      nonDefaultTaskOptions[0]?.task_id ??
-                                      "";
-                                    void executeTaskAssignment(
-                                      [ep.episode_id],
-                                      chosen,
-                                      "single",
-                                      false,
-                                    );
-                                  }}
-                                >
-                                  {t("queue.inlineAssignBtn")}
-                                </button>
-                                <button
-                                  type="button"
-                                  className="mini-btn accent"
-                                  data-testid={`inline-new-task-btn-${ep.episode_id}`}
-                                  onClick={() =>
-                                    handleOpenTaskWizard(ep.episode_id, [ep.episode_id])
-                                  }
-                                >
-                                  <Sparkles size={11} /> {t("queue.inlineNewTaskBtn")}
-                                </button>
-                              </div>
-                            )}
-                        </div>
-                      ) : (
-                        <div>{ep.task_id}</div>
-                      )}
-                      <div className="muted small">{ep.adapter_type}</div>
-                    </td>
-                    <td>
-                      <span className="status-tag" style={{ backgroundColor: statusColor }}>
-                        {statusLabel}
-                      </span>
-                      {ep.guardrail_downgraded && (
-                        <span
-                          className="inline-warn"
-                          title={t("queue.guardrailDowngradedTitle")}
+                  </th>
+                  <th>{t("queue.colTaskAdapter")}</th>
+                  <th>{t("queue.colStatus")}</th>
+                  <th>
+                    {isLead ? (
+                      <button
+                        type="button"
+                        className={`sort-col-btn ${sortBy === "duration_s" ? "active" : ""}`}
+                        data-testid="sort-col-duration_s"
+                        onClick={() => toggleSortColumn("duration_s")}
+                      >
+                        {t("queue.colDurationFps")} {renderSortIcon("duration_s")}
+                      </button>
+                    ) : (
+                      t("queue.colDurationFps")
+                    )}
+                  </th>
+                  <th>{t("queue.colOutcome")}</th>
+                  <th>
+                    {isLead ? (
+                      <div className="sort-col-group">
+                        <button
+                          type="button"
+                          className={`sort-col-btn ${sortBy === "badcase_count" ? "active" : ""}`}
+                          data-testid="sort-col-badcase_count"
+                          onClick={() => toggleSortColumn("badcase_count")}
                         >
-                          <ShieldAlert size={13} />
-                        </span>
-                      )}
-                    </td>
-                    <td>
-                      {ep.duration_s.toFixed(1)}s · {ep.fps.toFixed(0)}fps
-                    </td>
-                    <td>{passedText}</td>
-                    <td>
-                      {t("queue.rowStats", {
-                        segs: ep.badcase_count ?? 0,
-                        cut: ((ep.cut_ratio ?? 0) * 100).toFixed(0),
-                        mask: ((ep.mask_ratio ?? 0) * 100).toFixed(0),
-                      })}
-                    </td>
-                    {isLead && <td className="mono small muted">{formatUpdatedAt(ep.updated_at)}</td>}
-                    <td>{ep.claimed_by ?? "—"}</td>
-                    <td>
-                      <Link className="link-btn" to={`/review/${encodeEpPath(ep.episode_id)}`}>
-                        {t("queue.openStudio")}
-                      </Link>
+                          {t("queue.colBadcase")} {renderSortIcon("badcase_count")}
+                        </button>
+                        <span>/</span>
+                        <button
+                          type="button"
+                          className={`sort-col-btn ${sortBy === "cut_ratio" ? "active" : ""}`}
+                          data-testid="sort-col-cut_ratio"
+                          onClick={() => toggleSortColumn("cut_ratio")}
+                        >
+                          {t("queue.colCut")} {renderSortIcon("cut_ratio")}
+                        </button>
+                        <span>/ {t("queue.colMask")}</span>
+                      </div>
+                    ) : (
+                      t("queue.colBadcaseCutMask")
+                    )}
+                  </th>
+                  <th className="hide-md">{t("queue.colTokensCost")}</th>
+                  {isLead && (
+                    <th className="hide-sm">
+                      <button
+                        type="button"
+                        className={`sort-col-btn ${sortBy === "updated_at" ? "active" : ""}`}
+                        data-testid="sort-col-updated_at"
+                        onClick={() => toggleSortColumn("updated_at")}
+                      >
+                        {t("queue.colUpdated")} {renderSortIcon("updated_at")}
+                      </button>
+                    </th>
+                  )}
+                  <th className="hide-sm">{t("queue.colClaimedBy")}</th>
+                  <th>{t("queue.colAction")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading && displayRows.length === 0 ? (
+                  <TableSkeleton rows={5} columns={isLead ? 11 : 9} />
+                ) : displayRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={isLead ? 11 : 9} className="empty-cell">
+                      {t("queue.emptyTable")}
                     </td>
                   </tr>
-                );
-              })
-            )}
-          </tbody>
-        </table>
-      </div>
+                ) : (
+                  displayRows.map((ep, rowIdx) => {
+                    const meta = EPISODE_STATUS_META[ep.status];
+                    const statusLabel = getEpisodeStatusLabel(ep.status, locale);
+                    const statusColor = meta?.color ?? "#64748b";
+                    const passedText =
+                      ep.resolved_passed === null || ep.resolved_passed === undefined
+                        ? t("queue.outcomeUnsure")
+                        : ep.resolved_passed
+                          ? t("queue.outcomePass")
+                          : t("queue.outcomeFail");
+                    const isFocused = rowIdx === focusedRowIndex;
+                    const hasCostInfo =
+                      (typeof ep.tokens_total === "number" && ep.tokens_total > 0) ||
+                      (typeof ep.estimated_cost_usd === "number" && ep.estimated_cost_usd > 0);
+                    const cachedPct =
+                      typeof ep.cached_tokens === "number" &&
+                      ep.cached_tokens > 0 &&
+                      typeof ep.tokens_total === "number" &&
+                      ep.tokens_total > 0
+                        ? Math.min(100, Math.round((ep.cached_tokens / ep.tokens_total) * 100))
+                        : 0;
+                    return (
+                      <tr
+                        key={ep.episode_id}
+                        data-testid={`episode-row-${ep.episode_id}`}
+                        data-focused={isFocused ? "true" : undefined}
+                        className={isFocused ? "queue-row-focused" : undefined}
+                        onClick={() => setFocusedRowIndex(rowIdx)}
+                      >
+                        {isLead && (
+                          <td>
+                            <input
+                              type="checkbox"
+                              checked={selectedIds.includes(ep.episode_id)}
+                              onChange={() => toggleSelect(ep.episode_id)}
+                            />
+                          </td>
+                        )}
+                        <td className="mono">{ep.episode_id}</td>
+                        <td>
+                          {ep.task_id === "_default" ? (
+                            <div>
+                              <span
+                                className="badge-pill warn"
+                                data-testid={`default-task-badge-${ep.episode_id}`}
+                              >
+                                <AlertTriangle size={11} /> {t("queue.unrecognizedBadge")}
+                              </span>
+                              {isLead &&
+                                ep.status !== "vlm_queued" &&
+                                ep.status !== "vlm_running" && (
+                                  <div className="inline-task-assign">
+                                    <select
+                                      aria-label={t("queue.inlineAssignAria", {
+                                        episodeId: ep.episode_id,
+                                      })}
+                                      data-testid={`inline-task-select-${ep.episode_id}`}
+                                      value={
+                                        inlineTaskMap[ep.episode_id] ??
+                                        nonDefaultTaskOptions[0]?.task_id ??
+                                        ""
+                                      }
+                                      onChange={(e) =>
+                                        setInlineTaskMap((prev) => ({
+                                          ...prev,
+                                          [ep.episode_id]: e.target.value,
+                                        }))
+                                      }
+                                    >
+                                      <option value="">{t("queue.assignTaskPlaceholder")}</option>
+                                      {nonDefaultTaskOptions.map((item) => (
+                                        <option key={item.task_id} value={item.task_id}>
+                                          {item.task_id}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    <button
+                                      type="button"
+                                      className="mini-btn primary"
+                                      data-testid={`inline-assign-btn-${ep.episode_id}`}
+                                      disabled={
+                                        assigningTask ||
+                                        !(
+                                          inlineTaskMap[ep.episode_id] ??
+                                          nonDefaultTaskOptions[0]?.task_id
+                                        )
+                                      }
+                                      onClick={() => {
+                                        const chosen =
+                                          inlineTaskMap[ep.episode_id] ??
+                                          nonDefaultTaskOptions[0]?.task_id ??
+                                          "";
+                                        void executeTaskAssignment(
+                                          [ep.episode_id],
+                                          chosen,
+                                          "single",
+                                          false,
+                                        );
+                                      }}
+                                    >
+                                      {t("queue.inlineAssignBtn")}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="mini-btn accent"
+                                      data-testid={`inline-new-task-btn-${ep.episode_id}`}
+                                      onClick={() =>
+                                        handleOpenTaskWizard(ep.episode_id, [ep.episode_id])
+                                      }
+                                    >
+                                      <Sparkles size={11} /> {t("queue.inlineNewTaskBtn")}
+                                    </button>
+                                  </div>
+                                )}
+                            </div>
+                          ) : (
+                            <div>{ep.task_id}</div>
+                          )}
+                          <div className="muted small">{ep.adapter_type}</div>
+                        </td>
+                        <td>
+                          <span className="status-tag" style={{ backgroundColor: statusColor }}>
+                            {statusLabel}
+                          </span>
+                          {ep.guardrail_downgraded && (
+                            <span
+                              className="inline-warn"
+                              title={t("queue.guardrailDowngradedTitle")}
+                            >
+                              <ShieldAlert size={13} />
+                            </span>
+                          )}
+                        </td>
+                        <td className="tabular-nums">
+                          {ep.duration_s.toFixed(1)}s · {ep.fps.toFixed(0)}fps
+                        </td>
+                        <td>{passedText}</td>
+                        <td className="tabular-nums">
+                          {t("queue.rowStats", {
+                            segs: ep.badcase_count ?? 0,
+                            cut: ((ep.cut_ratio ?? 0) * 100).toFixed(0),
+                            mask: ((ep.mask_ratio ?? 0) * 100).toFixed(0),
+                          })}
+                        </td>
+                        <td
+                          className="hide-md tabular-nums"
+                          data-testid={`episode-cost-${ep.episode_id}`}
+                        >
+                          {hasCostInfo ? (
+                            <div>
+                              <div className="mono small">
+                                {formatTokenCount(ep.tokens_total ?? 0)} ·{" "}
+                                {formatUsdCost(ep.estimated_cost_usd ?? 0)}
+                              </div>
+                              {cachedPct > 0 && (
+                                <div className="small muted">
+                                  {t("queue.costCachedBadge", { pct: cachedPct })}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
+                        </td>
+                        {isLead && (
+                          <td className="mono small muted tabular-nums hide-sm">
+                            {formatUpdatedAt(ep.updated_at)}
+                          </td>
+                        )}
+                        <td className="hide-sm">{ep.claimed_by ?? "—"}</td>
+                        <td>
+                          <Link className="link-btn" to={`/review/${encodeEpPath(ep.episode_id)}`}>
+                            {t("queue.openStudio")}
+                          </Link>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+          {displayRows.length > 0 && (
+            <div className="queue-keyboard-hint hide-sm">{t("queue.keyboardHint")}</div>
+          )}
+        </>
+      )}
 
       {(page > 0 || totalEpisodes > PAGE_SIZE) && (
-        <div className="pagination-bar" data-testid="queue-pagination">
+        <div className="pagination-bar tabular-nums" data-testid="queue-pagination">
           <button
             type="button"
             className="secondary-btn compact"

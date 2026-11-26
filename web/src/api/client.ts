@@ -29,6 +29,8 @@ import type {
   InferSubtasksResponse,
   IngestBrowseResponse,
   JobClearScope,
+  JobEstimateRequest,
+  JobEstimateResponse,
   JobRunStatus,
   JobStatus,
   JobStatusCounts,
@@ -445,6 +447,13 @@ export async function submitReview(
 
 export async function createJob(body: CreateJobRequest): Promise<JobStatus> {
   return apiFetch<JobStatus>("/api/jobs", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function estimateJobCost(body: JobEstimateRequest): Promise<JobEstimateResponse> {
+  return apiFetch<JobEstimateResponse>("/api/jobs/estimate", {
     method: "POST",
     body: JSON.stringify(body),
   });

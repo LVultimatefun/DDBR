@@ -6,6 +6,27 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules")) {
+            if (id.includes("lucide-react")) {
+              return "icons";
+            }
+            if (
+              id.includes("/react/") ||
+              id.includes("/react-dom/") ||
+              id.includes("/react-router") ||
+              id.includes("/scheduler/")
+            ) {
+              return "react-vendor";
+            }
+            return "vendor";
+          }
+          return undefined;
+        },
+      },
+    },
   },
   server: {
     port: 5173,

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Loader2,
@@ -37,6 +37,8 @@ export interface FourTrackTimelineProps {
   watchCoverage?: WatchCoverage;
   showDiffTrack?: boolean;
   readOnly?: boolean;
+  snapEnabled?: boolean;
+  compact?: boolean;
   selectedSegmentId: string | null;
   selectedStageId: string | null;
   onSeek: (tS: number) => void;
@@ -63,6 +65,7 @@ type ActiveDrag =
       tEnd: number;
       origStart: number;
       origEnd: number;
+      snappedTime?: number | null;
     }
   | {
       kind: "stage";
@@ -89,6 +92,11 @@ type ActiveDrag =
       tEnd: number;
     };
 
+interface PendingScrollAnchor {
+  ratio: number;
+  viewportOffsetX: number;
+}
+
 const ARM_STATE_COLORS: Record<ArmState, string> = {
   idle: "#64748b",
   work: "#2563eb",
@@ -104,10 +112,38 @@ const POLICY_CLASS: Record<SplicePolicy, string> = {
   cut_clean: "seg-cut",
 };
 
+const TRACK_LABEL_WIDTH_PX = 120;
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 8;
+const ZOOM_PRESETS = [1, 2, 4] as const;
 const MIN_SPAN_S = 0.1;
 const MAGNETIC_GAP_S = 0.05;
+const MAGNETIC_SNAP_THRESHOLD_S = 0.15;
 const QC_SNAP_THRESHOLD_S = 0.08;
 const MIN_BRUSH_SPAN_S = 0.2;
+
+function snapTimeToTargets(
+  rawT: number,
+  targets: number[],
+  minT: number,
+  maxT: number,
+  thresholdS: number,
+): { value: number; snappedTo: number | null } {
+  let bestTarget: number | null = null;
+  let bestDist = thresholdS + 1e-9;
+  for (const candidate of targets) {
+    if (!Number.isFinite(candidate)) continue;
+    if (candidate < minT - 1e-9 || candidate > maxT + 1e-9) continue;
+    const dist = Math.abs(candidate - rawT);
+    if (dist <= bestDist) {
+      bestDist = dist;
+      bestTarget = clamp(candidate, minT, maxT);
+    }
+  }
+  return bestTarget !== null
+    ? { value: bestTarget, snappedTo: bestTarget }
+    : { value: rawT, snappedTo: null };
+}
 
 function snapTimeToQcBoundary(
   rawT: number,
@@ -115,21 +151,11 @@ function snapTimeToQcBoundary(
   minT: number,
   maxT: number,
 ): { value: number; snappedTo: number | null } {
-  let bestBoundary: number | null = null;
-  let bestDist = QC_SNAP_THRESHOLD_S + 1e-9;
+  const targets: number[] = [];
   for (const seg of qcSegments) {
-    for (const boundary of [seg.t_start, seg.t_end]) {
-      if (boundary < minT - 1e-9 || boundary > maxT + 1e-9) continue;
-      const dist = Math.abs(boundary - rawT);
-      if (dist <= bestDist) {
-        bestDist = dist;
-        bestBoundary = clamp(boundary, minT, maxT);
-      }
-    }
+    targets.push(seg.t_start, seg.t_end);
   }
-  return bestBoundary !== null
-    ? { value: bestBoundary, snappedTo: bestBoundary }
-    : { value: rawT, snappedTo: null };
+  return snapTimeToTargets(rawT, targets, minT, maxT, QC_SNAP_THRESHOLD_S);
 }
 
 function pct(t: number, durationS: number): number {
@@ -167,6 +193,8 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
   watchCoverage,
   showDiffTrack = false,
   readOnly = false,
+  snapEnabled = true,
+  compact = false,
   selectedSegmentId,
   selectedStageId,
   onSeek,
@@ -187,6 +215,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
   const [zoom, setZoom] = useState<number>(1);
   const [activeDrag, setActiveDrag] = useState<ActiveDrag | null>(null);
 
+  const scrollRef = useRef<HTMLDivElement | null>(null);
   const rulerRef = useRef<HTMLDivElement | null>(null);
   const macroLaneRef = useRef<HTMLDivElement | null>(null);
   const qcLaneRef = useRef<HTMLDivElement | null>(null);
@@ -194,6 +223,14 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
   const pendingSeekRef = useRef<number | null>(null);
   const suppressClickRef = useRef<boolean>(false);
   const cleanupDragListenersRef = useRef<(() => void) | null>(null);
+  const pendingScrollAnchorRef = useRef<PendingScrollAnchor | null>(null);
+
+  const zoomRef = useRef<number>(zoom);
+  zoomRef.current = zoom;
+  const currentTimeRef = useRef<number>(currentTime);
+  currentTimeRef.current = currentTime;
+  const durationRef = useRef<number>(durationS);
+  durationRef.current = durationS;
 
   useEffect(() => {
     return () => {
@@ -204,6 +241,89 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
       }
     };
   }, []);
+
+  // Re-anchor horizontal scroll around cursor/playhead timestamp right after zoom commits
+  useLayoutEffect(() => {
+    const anchor = pendingScrollAnchorRef.current;
+    const scrollEl = scrollRef.current;
+    if (!anchor || !scrollEl) return;
+    pendingScrollAnchorRef.current = null;
+
+    if (zoom <= 1) {
+      scrollEl.scrollLeft = 0;
+      return;
+    }
+
+    const clientW = scrollEl.clientWidth;
+    const canvasWidth =
+      scrollEl.scrollWidth > clientW ? scrollEl.scrollWidth : Math.max(clientW, 1) * zoom;
+    const newLaneWidth = Math.max(1, canvasWidth - TRACK_LABEL_WIDTH_PX);
+    const targetContentX = TRACK_LABEL_WIDTH_PX + anchor.ratio * newLaneWidth;
+    const maxScroll = Math.max(0, canvasWidth - clientW);
+    scrollEl.scrollLeft = clamp(targetContentX - anchor.viewportOffsetX, 0, maxScroll);
+  }, [zoom]);
+
+  // Native non-passive wheel listener for smooth Ctrl/Alt/Meta + Wheel cursor-anchored zoom
+  useEffect(() => {
+    const scrollEl = scrollRef.current;
+    if (!scrollEl) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.altKey || e.metaKey)) return;
+      e.preventDefault();
+
+      const curZoom = zoomRef.current;
+      const factor = e.deltaY < 0 ? 1.25 : 0.8;
+      const nextZoom = clamp(Number((curZoom * factor).toFixed(2)), MIN_ZOOM, MAX_ZOOM);
+      if (Math.abs(nextZoom - curZoom) < 1e-4) return;
+
+      const rect = scrollEl.getBoundingClientRect();
+      const clientW = scrollEl.clientWidth || rect.width;
+      const oldCanvasWidth =
+        scrollEl.scrollWidth > clientW ? scrollEl.scrollWidth : Math.max(clientW, 1) * curZoom;
+      const oldLaneWidth = Math.max(1, oldCanvasWidth - TRACK_LABEL_WIDTH_PX);
+      const pointerViewportX = e.clientX - rect.left;
+      const oldContentX = scrollEl.scrollLeft + pointerViewportX;
+
+      let ratio: number;
+      let viewportOffsetX: number;
+      if (rect.width > 0 && oldContentX >= TRACK_LABEL_WIDTH_PX) {
+        ratio = clamp((oldContentX - TRACK_LABEL_WIDTH_PX) / oldLaneWidth, 0, 1);
+        viewportOffsetX = pointerViewportX;
+      } else {
+        const dur = durationRef.current;
+        ratio = dur > 0 ? clamp(currentTimeRef.current / dur, 0, 1) : 0;
+        viewportOffsetX =
+          clientW > TRACK_LABEL_WIDTH_PX
+            ? TRACK_LABEL_WIDTH_PX + (clientW - TRACK_LABEL_WIDTH_PX) * 0.5
+            : TRACK_LABEL_WIDTH_PX;
+      }
+
+      pendingScrollAnchorRef.current = { ratio, viewportOffsetX };
+      setZoom(nextZoom);
+    };
+
+    scrollEl.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      scrollEl.removeEventListener("wheel", handleWheel);
+    };
+  }, []);
+
+  const applyPlayheadAnchoredZoom = (nextZoom: number) => {
+    const clampedZoom = clamp(nextZoom, MIN_ZOOM, MAX_ZOOM);
+    if (Math.abs(clampedZoom - zoom) < 1e-4) return;
+    const scrollEl = scrollRef.current;
+    if (scrollEl && durationS > 0) {
+      const clientW = scrollEl.clientWidth || scrollEl.getBoundingClientRect().width;
+      const ratio = clamp(currentTime / durationS, 0, 1);
+      const viewportOffsetX =
+        clientW > TRACK_LABEL_WIDTH_PX
+          ? TRACK_LABEL_WIDTH_PX + (clientW - TRACK_LABEL_WIDTH_PX) * 0.5
+          : TRACK_LABEL_WIDTH_PX;
+      pendingScrollAnchorRef.current = { ratio, viewportOffsetX };
+    }
+    setZoom(clampedZoom);
+  };
 
   const scheduleSeek = (tS: number) => {
     pendingSeekRef.current = tS;
@@ -279,6 +399,16 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
     onSelectSegment(seg.seg_id);
     onSelectStage(null);
 
+    // Freeze snap targets at drag start so scrub preview does not pull the playhead target along
+    const snapTargets: number[] = [currentTime];
+    for (const st of macroStages) {
+      snapTargets.push(st.t_start, st.t_end);
+    }
+    for (const other of qcSegments) {
+      if (other.seg_id === seg.seg_id) continue;
+      snapTargets.push(other.t_start, other.t_end);
+    }
+
     let latest: Extract<ActiveDrag, { kind: "segment" }> = {
       kind: "segment",
       segId: seg.seg_id,
@@ -287,21 +417,43 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
       tEnd: seg.t_end,
       origStart: seg.t_start,
       origEnd: seg.t_end,
+      snappedTime: null,
     };
     setActiveDrag(latest);
 
     const onMove = (ev: PointerEvent) => {
-      const t = clientXToTime(ev.clientX, qcLaneRef.current, durationS);
+      const rawT = clientXToTime(ev.clientX, qcLaneRef.current, durationS);
+      const allowSnap = snapEnabled && !ev.shiftKey && !ev.altKey;
       if (edge === "left") {
-        const nextStart = clamp(t, 0, Math.max(0, latest.origEnd - MIN_SPAN_S));
-        latest = { ...latest, tStart: nextStart, tEnd: latest.origEnd };
+        const minStart = 0;
+        const maxStart = Math.max(0, latest.origEnd - MIN_SPAN_S);
+        const clampedStart = clamp(rawT, minStart, maxStart);
+        const snapped = allowSnap
+          ? snapTimeToTargets(clampedStart, snapTargets, minStart, maxStart, MAGNETIC_SNAP_THRESHOLD_S)
+          : { value: clampedStart, snappedTo: null };
+        latest = {
+          ...latest,
+          tStart: snapped.value,
+          tEnd: latest.origEnd,
+          snappedTime: snapped.snappedTo,
+        };
         setActiveDrag({ ...latest });
-        scheduleSeek(nextStart);
+        scheduleSeek(snapped.value);
       } else {
-        const nextEnd = clamp(t, Math.min(durationS, latest.origStart + MIN_SPAN_S), durationS);
-        latest = { ...latest, tStart: latest.origStart, tEnd: nextEnd };
+        const minEnd = Math.min(durationS, latest.origStart + MIN_SPAN_S);
+        const maxEnd = durationS;
+        const clampedEnd = clamp(rawT, minEnd, maxEnd);
+        const snapped = allowSnap
+          ? snapTimeToTargets(clampedEnd, snapTargets, minEnd, maxEnd, MAGNETIC_SNAP_THRESHOLD_S)
+          : { value: clampedEnd, snappedTo: null };
+        latest = {
+          ...latest,
+          tStart: latest.origStart,
+          tEnd: snapped.value,
+          snappedTime: snapped.snappedTo,
+        };
         setActiveDrag({ ...latest });
-        scheduleSeek(nextEnd);
+        scheduleSeek(snapped.value);
       }
     };
 
@@ -386,8 +538,9 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
     setActiveDrag(latest);
 
     const onMove = (ev: PointerEvent) => {
-      const t = clientXToTime(ev.clientX, macroLaneRef.current, durationS);
+      const rawT = clientXToTime(ev.clientX, macroLaneRef.current, durationS);
       const linked = Boolean(latest.neighbor) && !ev.altKey;
+      const allowSnap = snapEnabled && !ev.altKey && !ev.shiftKey && qcSegments.length > 0;
 
       if (edge === "right") {
         const maxEnd =
@@ -395,11 +548,10 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
             ? Math.min(durationS, latest.neighbor.origEnd - MIN_SPAN_S)
             : durationS;
         const minEnd = Math.min(maxEnd, latest.origStart + MIN_SPAN_S);
-        const clampedEnd = clamp(t, minEnd, maxEnd);
-        const snapped =
-          !ev.altKey && qcSegments.length > 0
-            ? snapTimeToQcBoundary(clampedEnd, qcSegments, minEnd, maxEnd)
-            : { value: clampedEnd, snappedTo: null };
+        const clampedEnd = clamp(rawT, minEnd, maxEnd);
+        const snapped = allowSnap
+          ? snapTimeToQcBoundary(clampedEnd, qcSegments, minEnd, maxEnd)
+          : { value: clampedEnd, snappedTo: null };
         const nextEnd = snapped.value;
         latest = {
           ...latest,
@@ -421,11 +573,10 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
         const minStart =
           linked && latest.neighbor ? Math.max(0, latest.neighbor.origStart + MIN_SPAN_S) : 0;
         const maxStart = Math.max(minStart, latest.origEnd - MIN_SPAN_S);
-        const clampedStart = clamp(t, minStart, maxStart);
-        const snapped =
-          !ev.altKey && qcSegments.length > 0
-            ? snapTimeToQcBoundary(clampedStart, qcSegments, minStart, maxStart)
-            : { value: clampedStart, snappedTo: null };
+        const clampedStart = clamp(rawT, minStart, maxStart);
+        const snapped = allowSnap
+          ? snapTimeToQcBoundary(clampedStart, qcSegments, minStart, maxStart)
+          : { value: clampedStart, snappedTo: null };
         const nextStart = snapped.value;
         latest = {
           ...latest,
@@ -560,7 +711,9 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
     window.addEventListener("pointercancel", onUp);
   };
 
-  const getStageRenderBounds = (stage: MacroStage): { tStart: number; tEnd: number; dragging: boolean; magneticLinked: boolean } => {
+  const getStageRenderBounds = (
+    stage: MacroStage,
+  ): { tStart: number; tEnd: number; dragging: boolean; magneticLinked: boolean } => {
     if (activeDrag?.kind === "stage") {
       if (activeDrag.stageId === stage.stage_id) {
         return {
@@ -582,17 +735,36 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
     return { tStart: stage.t_start, tEnd: stage.t_end, dragging: false, magneticLinked: false };
   };
 
-  const getSegmentRenderBounds = (seg: QcSegment): { tStart: number; tEnd: number; dragging: boolean } => {
+  const getSegmentRenderBounds = (
+    seg: QcSegment,
+  ): { tStart: number; tEnd: number; dragging: boolean } => {
     if (activeDrag?.kind === "segment" && activeDrag.segId === seg.seg_id) {
       return { tStart: activeDrag.tStart, tEnd: activeDrag.tEnd, dragging: true };
     }
     return { tStart: seg.t_start, tEnd: seg.t_end, dragging: false };
   };
 
+  const activeSnapTime: number | null =
+    activeDrag?.kind === "stage" &&
+    activeDrag.snappedToQcTime !== null &&
+    activeDrag.snappedToQcTime !== undefined
+      ? activeDrag.snappedToQcTime
+      : activeDrag?.kind === "segment" &&
+          activeDrag.snappedTime !== null &&
+          activeDrag.snappedTime !== undefined
+        ? activeDrag.snappedTime
+        : null;
+
+  const isPresetZoom = ZOOM_PRESETS.some((z) => Math.abs(zoom - z) < 0.01);
   const playheadLeft = `${pct(currentTime, durationS)}%`;
 
   return (
-    <div className="four-track-timeline" data-testid="four-track-timeline">
+    <div
+      className={`four-track-timeline${compact ? " compact" : ""}`}
+      data-testid="four-track-timeline"
+      data-compact={compact ? "true" : "false"}
+      data-snap-enabled={snapEnabled ? "true" : "false"}
+    >
       <div className="timeline-toolbar">
         <div className="timeline-title">{t("timeline.title")}</div>
         <div className="timeline-actions">
@@ -657,23 +829,32 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
               </button>
             </>
           )}
-          <div className="zoom-group">
-            {[1, 2, 4].map((z) => (
+          <div className="zoom-group" title={t("studio.zoomTip")}>
+            {ZOOM_PRESETS.map((z) => (
               <button
                 key={z}
                 type="button"
-                className={`zoom-btn ${zoom === z ? "active" : ""}`}
-                onClick={() => setZoom(z)}
+                className={`zoom-btn tabular-nums ${Math.abs(zoom - z) < 0.01 ? "active" : ""}`}
+                onClick={() => applyPlayheadAnchoredZoom(z)}
               >
                 {z}x
               </button>
             ))}
+            {!isPresetZoom && (
+              <span className="zoom-readout-pill tabular-nums" data-testid="timeline-zoom-readout">
+                {zoom.toFixed(2)}x
+              </span>
+            )}
           </div>
         </div>
       </div>
 
-      <div className="timeline-scroll">
-        <div className="timeline-canvas" style={{ width: `${zoom * 100}%` }}>
+      <div className="timeline-scroll" ref={scrollRef} data-testid="timeline-scroll">
+        <div
+          className="timeline-canvas"
+          data-testid="timeline-canvas"
+          style={{ width: `${zoom * 100}%` }}
+        >
           {/* Time Ruler */}
           <div className="track-row ruler-row">
             <div className="track-label ruler-label">{t("timeline.rulerLabel")}</div>
@@ -690,7 +871,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
               {ticks.map((tick, idx) => (
                 <span
                   key={idx}
-                  className="ruler-tick"
+                  className="ruler-tick tabular-nums"
                   style={{ left: `${pct(tick, durationS)}%` }}
                 >
                   {tick.toFixed(1)}s
@@ -919,7 +1100,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
             </div>
           </div>
 
-          {/* Track 3: QC Segments (Editable + Edge Resize + Drag-to-Create Brush) */}
+          {/* Track 3: QC Segments (Editable + Edge Resize + Magnetic Snap + Drag-to-Create Brush) */}
           <div className="track-row" data-testid="track-qc-segments">
             <div className="track-label">
               <span>{t("timeline.track3Label")}</span>
@@ -939,7 +1120,7 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
             >
               {activeDrag?.kind === "brush" && activeDrag.tEnd - activeDrag.tStart >= 0.05 && (
                 <div
-                  className="qc-brush-preview"
+                  className="qc-brush-preview tabular-nums"
                   data-testid="qc-brush-preview"
                   style={{
                     left: `${pct(activeDrag.tStart, durationS)}%`,
@@ -996,7 +1177,9 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                       <span
                         className="guardrail-chip downgraded"
                         data-testid={`guardrail-downgraded-${seg.seg_id}`}
-                        title={seg.guardrail.downgrade_reason ?? t("timeline.downgradedDefaultTitle")}
+                        title={
+                          seg.guardrail.downgrade_reason ?? t("timeline.downgradedDefaultTitle")
+                        }
                       >
                         <ShieldAlert size={11} /> {t("timeline.downgradedBadge")}
                       </span>
@@ -1012,7 +1195,9 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
                     {seg.guardrail.guardrail_override && (
                       <span
                         className="guardrail-chip override"
-                        title={seg.guardrail.override_reason ?? t("timeline.guardrailOverrideTitle")}
+                        title={
+                          seg.guardrail.override_reason ?? t("timeline.guardrailOverrideTitle")
+                        }
                       >
                         <AlertTriangle size={11} />
                       </span>
@@ -1102,18 +1287,24 @@ export const FourTrackTimeline: React.FC<FourTrackTimelineProps> = ({
             </div>
           )}
 
-          {/* Cross-track QC magnetic snap indicator */}
-          {activeDrag?.kind === "stage" &&
-            activeDrag.snappedToQcTime !== null &&
-            activeDrag.snappedToQcTime !== undefined && (
-              <div className="timeline-snap-guide-overlay">
-                <div
-                  className="timeline-snap-guide"
-                  data-testid="qc-snap-guide"
-                  style={{ left: `${pct(activeDrag.snappedToQcTime, durationS)}%` }}
-                />
+          {/* Cross-track Magnetic Snap Guide Indicator */}
+          {activeSnapTime !== null && (
+            <div
+              className="timeline-snap-guide-overlay"
+              data-testid={activeDrag?.kind === "stage" ? "qc-snap-guide" : undefined}
+            >
+              <div
+                className="timeline-snap-guide"
+                data-testid="timeline-snap-guide"
+                data-snap-time={activeSnapTime.toFixed(2)}
+                style={{ left: `${pct(activeSnapTime, durationS)}%` }}
+              >
+                <span className="timeline-snap-readout tabular-nums">
+                  {activeSnapTime.toFixed(2)}s
+                </span>
               </div>
-            )}
+            </div>
+          )}
 
           {/* Synchronized Playhead aligned with .track-lane */}
           <div className="timeline-playhead-overlay">

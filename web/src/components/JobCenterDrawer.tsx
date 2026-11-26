@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Activity, AlertTriangle, Download, RefreshCw, Trash2, X, XCircle } from "lucide-react";
 import { exportDownloadUrl } from "../api/client";
 import type { JobClearScope, JobStatus } from "../api/types";
+import { formatTokenCount, formatUsdCost } from "./CostEstimatePopover";
 import { useAuth } from "../stores/authStore";
 import { useI18n } from "../stores/i18nStore";
 import { useJobs } from "../stores/jobStore";
@@ -256,7 +257,7 @@ export const JobCenterDrawer: React.FC = () => {
                   </div>
 
                   <div className="section-header-row small muted">
-                    <span>
+                    <span className="tabular-nums">
                       {t("jobs.progress", { done, total, pct })}
                     </span>
                     <div className="header-actions">
@@ -312,19 +313,62 @@ export const JobCenterDrawer: React.FC = () => {
                     </div>
                   </div>
 
+                  {job.job_type === "batch_vlm" &&
+                    (typeof job.summary?.tokens_total === "number" ||
+                      typeof job.summary?.estimated_cost_usd === "number") && (
+                      <div
+                        className="job-cost-strip tabular-nums"
+                        data-testid={`drawer-job-cost-${job.job_id}`}
+                      >
+                        <span className="badge-pill mono">
+                          {t("jobs.tokensCostSummary", {
+                            tokens: formatTokenCount(job.summary?.tokens_total ?? 0),
+                            cost: formatUsdCost(job.summary?.estimated_cost_usd ?? 0),
+                          })}
+                        </span>
+                        {typeof job.summary?.cached_tokens === "number" &&
+                          job.summary.cached_tokens > 0 &&
+                          (job.summary?.tokens_total ?? 0) > 0 && (
+                            <span className="badge-pill ok">
+                              {t("jobs.cachedPct", {
+                                pct: Math.min(
+                                  100,
+                                  Math.round(
+                                    (job.summary.cached_tokens / (job.summary.tokens_total ?? 1)) *
+                                      100,
+                                  ),
+                                ),
+                              })}
+                            </span>
+                          )}
+                      </div>
+                    )}
+
                   {job.summary?.error === "interrupted_by_server_restart" && (
                     <div className="small muted">{t("jobs.interruptedByRestart")}</div>
                   )}
 
                   {job.job_type === "ingest" &&
                     typeof job.summary?.discovered === "number" && (
-                      <div className="small muted mono">
+                      <div className="small muted mono tabular-nums">
                         {t("jobs.ingestSummary", {
                           discovered: job.summary.discovered,
                           inserted: job.summary.inserted ?? 0,
                           updated: job.summary.updated ?? 0,
                           skipped: job.summary.skipped ?? 0,
                         })}
+                      </div>
+                    )}
+
+                  {job.job_type === "ingest" &&
+                    isActive &&
+                    typeof job.summary?.current_episode_id === "string" &&
+                    job.summary.current_episode_id.trim() !== "" && (
+                      <div
+                        className="small muted mono tabular-nums"
+                        data-testid={`drawer-ingest-current-${job.job_id}`}
+                      >
+                        {t("jobs.ingestCurrent", { episodeId: job.summary.current_episode_id })}
                       </div>
                     )}
 

@@ -256,6 +256,26 @@ export interface ReviewWritePayload {
   flagged_reason?: string | null;
 }
 
+export interface StageUsage {
+  stage: string;
+  model: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens?: number;
+  total_tokens: number;
+  elapsed_s: number;
+  estimated_cost_usd: number;
+  cache_hit: boolean;
+}
+
+export interface UsageSummary {
+  stages: StageUsage[];
+  total_tokens: number;
+  total_cached_tokens?: number;
+  total_elapsed_s: number;
+  total_cost_usd: number;
+}
+
 export interface ResolvedEpisode {
   episode_id: string;
   meta: EpisodeMeta;
@@ -279,6 +299,7 @@ export interface ResolvedEpisode {
   selected_run_id?: string | null;
   is_historical_run_view?: boolean;
   guardrail_downgraded?: boolean;
+  usage?: UsageSummary | null;
 }
 
 export interface EpisodeListItem {
@@ -303,6 +324,9 @@ export interface EpisodeListItem {
   badcase_count: number | null;
   unknown_count: number | null;
   guardrail_downgraded?: boolean;
+  tokens_total?: number | null;
+  cached_tokens?: number | null;
+  estimated_cost_usd?: number | null;
   updated_at: number;
 }
 
@@ -484,7 +508,50 @@ export interface JobSummary {
   inserted?: number;
   updated?: number;
   skipped?: number;
+  tokens_total?: number;
+  cached_tokens?: number;
+  estimated_cost_usd?: number;
+  current_episode_id?: string;
   [key: string]: unknown;
+}
+
+export interface StageCostEstimate {
+  stage: string;
+  model: string;
+  estimated_calls: number;
+  estimated_images: number;
+  image_detail: string;
+  estimated_tokens: number;
+  estimated_cost_usd: number;
+  cached_episodes: number;
+}
+
+export interface TokenSavingActiveFlags {
+  low_detail_stages: boolean;
+  static_frame_dedup: boolean;
+  adaptive_s3_step: boolean;
+  short_episode_s1_merge: boolean;
+  s4b_dynamic_frames: boolean;
+}
+
+export interface JobEstimateRequest {
+  episode_ids: string[];
+  stage?: string | null;
+  fresh?: boolean;
+}
+
+export interface JobEstimateResponse {
+  episode_count: number;
+  total_duration_s: number;
+  stage: string;
+  fresh: boolean;
+  estimated_prompt_tokens: number;
+  estimated_completion_tokens: number;
+  estimated_total_tokens: number;
+  estimated_cost_usd: number;
+  estimated_cache_hits: number;
+  per_stage: StageCostEstimate[];
+  token_saving_active: TokenSavingActiveFlags;
 }
 
 export interface JobStatus {
@@ -918,6 +985,20 @@ export interface VlmPresetItem {
   description?: string;
 }
 
+export type VlmCostTierId = "fast" | "balanced" | "high_precision";
+
+export interface VlmCostTierPreset {
+  id: VlmCostTierId;
+  label: string;
+  description: string;
+  relative_cost_hint: string;
+  stage_models_by_provider: {
+    openai_compat: Record<string, string>;
+    gemini: Record<string, string>;
+    dashscope: Record<string, string>;
+  };
+}
+
 export interface VlmSettingsResponse {
   provider: VlmProvider;
   base_url: string;
@@ -927,6 +1008,7 @@ export interface VlmSettingsResponse {
   thinking_mode: VlmThinkingMode;
   stage_models: Record<string, string>;
   presets: VlmPresetItem[];
+  cost_tiers?: VlmCostTierPreset[];
 }
 
 export interface VlmSettingsUpdatePayload {
@@ -962,8 +1044,13 @@ export interface VlmRunSummary {
   label_version: string;
   few_shot_pack_id: string | null;
   tokens_total: number;
+  cached_tokens?: number;
+  estimated_cost_usd?: number;
+  elapsed_s?: number;
   is_eval_sandbox: boolean;
 }
+
+export type EpisodeRunItem = VlmRunSummary;
 
 export interface EpisodeRunsResponse {
   episode_id: string;

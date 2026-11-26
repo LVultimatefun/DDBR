@@ -1,0 +1,73 @@
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.small {
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.delta-pos {
+  color: var(--delta-pos);
+  font-weight: 600;
+}
+
+.delta-neg {
+  color: var(--delta-neg);
+  font-weight: 600;
+}
+
+.delta-neutral {
+  color: var(--muted);
+}
+
+.inline-warn {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 5px;
+  color: var(--warning);
+  vertical-align: middle;
+}
+
+.queue-row-focused {
+  background: var(--row-focus-bg) !important;
+  box-shadow: inset 3px 0 0 var(--row-focus-border);
+}
+
+.queue-keyboard-hint {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 2px;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+@media (max-width: 1080px) {
+  .hide-md {
+    display: none !important;
+  }
+}
+
+@media (max-width: 820px) {
+  .hide-sm {
+    display: none !important;
+  }
+}

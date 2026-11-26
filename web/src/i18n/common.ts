@@ -43,6 +43,29 @@ export const commonEn = {
   "nav.roleLead": "Lead",
   "nav.roleReviewer": "Reviewer",
   "nav.switchTokenRole": "Switch Token / Role",
+  "nav.commandPalette": "Search / Jump...",
+  "nav.commandPaletteAria": "Open command palette (Ctrl+K)",
+  "nav.commandPaletteShortcut": "⌘K",
+
+  // CommandPalette
+  "cmd.dialogAria": "Command Palette",
+  "cmd.placeholder": "Type a command or jump to an episode...",
+  "cmd.empty": "No matching commands or episodes",
+  "cmd.groupNavigation": "Navigation",
+  "cmd.groupEpisodes": "Episodes",
+  "cmd.groupActions": "Actions & Preferences",
+  "cmd.loadingEpisodes": "Loading episodes...",
+  "cmd.goQueue": "Go to Work Queue",
+  "cmd.goExport": "Go to Export Studio",
+  "cmd.goLab": "Go to VLM Lab",
+  "cmd.openVlmSettings": "Open VLM Model / API Settings",
+  "cmd.toggleJobDrawer": "Toggle Async Job Center",
+  "cmd.switchLocale": "Switch Language (EN / 中文)",
+  "cmd.toggleTheme": "Toggle Dark / Light Theme",
+  "cmd.openAuth": "Switch Token / Role",
+  "cmd.hintNavigate": "↑↓ navigate",
+  "cmd.hintSelect": "↵ select",
+  "cmd.hintClose": "Esc close",
 
   // AuthModal
   "auth.title": "Credentials & Role",
@@ -462,6 +485,77 @@ export const commonEn = {
   "jobs.deleteSafetyNote": "Only SQLite job history records are deleted. VLM annotations, human reviews, exported datasets, and eval reports on disk remain untouched.",
   "jobs.confirmDeleteBtn": "Confirm Delete",
   "jobs.interruptedByRestart": "Interrupted by server restart (episodes reverted safely).",
+  "jobs.tokensCostSummary": "{tokens} tok · {cost}",
+  "jobs.cachedPct": "{pct}% cached",
+  "jobs.ingestCurrent": "Scanning: {episodeId}",
+
+  // Queue cost / keyboard additions
+  "queue.colTokensCost": "Tokens / Cost",
+  "queue.costCachedBadge": "{pct}% cached",
+  "queue.estimateCostBtn": "Estimate Cost",
+  "queue.estimateCostTitle": "Preview estimated tokens and USD cost before dispatching Batch VLM",
+  "queue.keyboardHint": "Keys: J/K move · X select · ↵ open · / search",
+
+  // CostEstimatePopover
+  "estimate.title": "Pre-Dispatch VLM Cost Estimate",
+  "estimate.closeAria": "Close cost estimate popover",
+  "estimate.loading": "Calculating token & cost estimate...",
+  "estimate.errLoad": "Failed to estimate batch VLM cost",
+  "estimate.summaryEpisodes": "{count} episode(s) · {dur}s total",
+  "estimate.totalTokens": "Est. Tokens",
+  "estimate.totalCost": "Est. Cost",
+  "estimate.cacheHits": "Stage Cache Hits",
+  "estimate.colStage": "Stage",
+  "estimate.colModel": "Model",
+  "estimate.colDetail": "Detail",
+  "estimate.colTokens": "Tokens",
+  "estimate.colCost": "Cost",
+  "estimate.colCache": "Cache",
+  "estimate.savingHeading": "Active Token-Saving Optimizations",
+  "estimate.savingLowDetail": "Low-detail S1/S2",
+  "estimate.savingStaticDedup": "Static-frame dedup",
+  "estimate.savingAdaptiveS3": "Adaptive S3 step",
+  "estimate.savingShortS1Merge": "Short-ep S1 merge",
+  "estimate.savingDynamicS4b": "Dynamic S4B frames",
+  "estimate.confirmRunBtn": "Confirm & Run VLM",
+  "estimate.submitting": "Submitting...",
+
+  // VlmSettingsModal cost tiers
+  "vlmSettings.costTierHeading": "Cost / Accuracy Tier Presets",
+  "vlmSettings.costTierSub": "Applies recommended per-stage models for active provider ({provider})",
+  "vlmSettings.costTier.fast.label": "Fast",
+  "vlmSettings.costTier.fast.desc": "Lowest cost & latency for quick screening",
+  "vlmSettings.costTier.balanced.label": "Balanced",
+  "vlmSettings.costTier.balanced.desc": "Lightweight S1/S2/S5 with strong S3/S4 reasoning",
+  "vlmSettings.costTier.high_precision.label": "High Precision",
+  "vlmSettings.costTier.high_precision.desc": "Flagship vision model across all S1–S5 stages",
+
+  // OnboardingEmptyState
+  "onboarding.badge": "Zero-API-Key Quickstart",
+  "onboarding.title": "Your workspace has no episodes yet",
+  "onboarding.subtitle":
+    "Generate a realistic demo dataset with pre-annotated VLM runs to explore the full 4-track NLE Studio immediately, or ingest your own local robotics data.",
+  "onboarding.step1Title": "1. Generate Demo + Sample VLM Run",
+  "onboarding.step1Desc":
+    "Run this single command to populate synthetic multi-cam episodes with 2D tracks, QC segments, and cost telemetry:",
+  "onboarding.step2Title": "2. Ingest Local Robotics Data",
+  "onboarding.step2Desc":
+    "Scan HDF5, LeRobot, or MP4 directories read-only into SQLite without touching raw files.",
+  "onboarding.step3Title": "3. Configure VLM Provider & Cost Tier",
+  "onboarding.step3Desc":
+    "Connect OpenAI, Gemini, DashScope, or local vLLM and pick Fast / Balanced / High-Precision routing.",
+  "onboarding.copyCmdBtn": "Copy",
+  "onboarding.copiedBtn": "Copied",
+  "onboarding.copyAria": "Copy demo dataset command",
+  "onboarding.ingestBtn": "Ingest Local Data",
+  "onboarding.configureVlmBtn": "Configure VLM API",
+  "onboarding.reviewerHint":
+    "Ask a Lead engineer to ingest episodes or generate a demo dataset for this workspace.",
+
+  // SkeletonLoader
+  "skeleton.loadingPage": "Loading page...",
+  "skeleton.loadingTable": "Loading episodes...",
+  "skeleton.loadingStudio": "Loading Review Studio...",
 } as const;
 
 export const commonZh: Record<keyof typeof commonEn, string> = {
@@ -509,6 +603,29 @@ export const commonZh: Record<keyof typeof commonEn, string> = {
   "nav.roleLead": "组长",
   "nav.roleReviewer": "审核员",
   "nav.switchTokenRole": "切换令牌 / 角色",
+  "nav.commandPalette": "搜索 / 跳转...",
+  "nav.commandPaletteAria": "打开命令面板 (Ctrl+K)",
+  "nav.commandPaletteShortcut": "⌘K",
+
+  // CommandPalette
+  "cmd.dialogAria": "全局命令面板",
+  "cmd.placeholder": "输入命令或搜索片段 ID 快速跳转...",
+  "cmd.empty": "未找到匹配的命令或片段",
+  "cmd.groupNavigation": "页面导航",
+  "cmd.groupEpisodes": "片段快速跳转",
+  "cmd.groupActions": "快捷操作与偏好",
+  "cmd.loadingEpisodes": "正在加载片段列表...",
+  "cmd.goQueue": "前往工作队列",
+  "cmd.goExport": "前往导出中心",
+  "cmd.goLab": "前往 VLM 实验室",
+  "cmd.openVlmSettings": "打开 VLM 模型 / API 配置",
+  "cmd.toggleJobDrawer": "打开 / 关闭异步任务中心",
+  "cmd.switchLocale": "切换界面语言 (中文 / EN)",
+  "cmd.toggleTheme": "切换深色 / 浅色主题",
+  "cmd.openAuth": "切换令牌 / 角色",
+  "cmd.hintNavigate": "↑↓ 移动",
+  "cmd.hintSelect": "↵ 确认",
+  "cmd.hintClose": "Esc 关闭",
 
   // AuthModal
   "auth.title": "凭证与角色设置",
@@ -911,4 +1028,74 @@ export const commonZh: Record<keyof typeof commonEn, string> = {
   "jobs.deleteSafetyNote": "仅删除 SQLite 中的任务流水记录，不会删除磁盘上的 VLM 标注、人工审阅、导出数据包或评测报告。",
   "jobs.confirmDeleteBtn": "确认删除",
   "jobs.interruptedByRestart": "因服务重启中断（受影响的轨迹状态已安全回滚）。",
+  "jobs.tokensCostSummary": "{tokens} tok · {cost}",
+  "jobs.cachedPct": "{pct}% 缓存",
+  "jobs.ingestCurrent": "正在扫描：{episodeId}",
+
+  // Queue cost / keyboard additions
+  "queue.colTokensCost": "Token / 成本",
+  "queue.costCachedBadge": "{pct}% 缓存",
+  "queue.estimateCostBtn": "预估成本",
+  "queue.estimateCostTitle": "在派发批量 VLM 前预估 Token 消耗与美元成本",
+  "queue.keyboardHint": "快捷键：J/K 移动 · X 勾选 · ↵ 打开 · / 搜索",
+
+  // CostEstimatePopover
+  "estimate.title": "派发前 VLM 成本预估",
+  "estimate.closeAria": "关闭成本预估弹窗",
+  "estimate.loading": "正在计算 Token 与成本预估...",
+  "estimate.errLoad": "预估批量 VLM 成本失败",
+  "estimate.summaryEpisodes": "{count} 条片段 · 总时长 {dur}s",
+  "estimate.totalTokens": "预估 Token",
+  "estimate.totalCost": "预估成本",
+  "estimate.cacheHits": "阶段缓存命中",
+  "estimate.colStage": "阶段",
+  "estimate.colModel": "模型",
+  "estimate.colDetail": "精度",
+  "estimate.colTokens": "Token",
+  "estimate.colCost": "成本",
+  "estimate.colCache": "缓存",
+  "estimate.savingHeading": "已启用的省 Token 优化",
+  "estimate.savingLowDetail": "低精度 S1/S2",
+  "estimate.savingStaticDedup": "静止帧去重",
+  "estimate.savingAdaptiveS3": "S3 自适应步长",
+  "estimate.savingShortS1Merge": "短片段 S1 合并",
+  "estimate.savingDynamicS4b": "S4B 动态帧数",
+  "estimate.confirmRunBtn": "确认并运行 VLM",
+  "estimate.submitting": "提交中...",
+
+  // VlmSettingsModal cost tiers
+  "vlmSettings.costTierHeading": "成本 / 精度档位预设",
+  "vlmSettings.costTierSub": "按当前服务商 ({provider}) 一键填入推荐的分阶段模型路由",
+  "vlmSettings.costTier.fast.label": "极速低成本",
+  "vlmSettings.costTier.fast.desc": "最低成本与最快速度，适合快速初筛",
+  "vlmSettings.costTier.balanced.label": "均衡推荐",
+  "vlmSettings.costTier.balanced.desc": "S1/S2/S5 轻量模型 + S3/S4 强推理，性价比最佳",
+  "vlmSettings.costTier.high_precision.label": "高精度旗舰",
+  "vlmSettings.costTier.high_precision.desc": "S1–S5 全阶段使用旗舰多模态模型",
+
+  // OnboardingEmptyState
+  "onboarding.badge": "免 API Key 快速体验",
+  "onboarding.title": "当前工作区尚无轨迹数据",
+  "onboarding.subtitle":
+    "一键生成包含预标注 VLM 结果的演示数据集即可免 API Key 体验完整四轨工作台，或直接导入本地机器人数据集。",
+  "onboarding.step1Title": "1. 生成演示数据与预标注样本",
+  "onboarding.step1Desc":
+    "运行以下单条命令即可生成带 2D 追踪框、质检分段与成本统计的演示轨迹：",
+  "onboarding.step2Title": "2. 导入本地机器人数据集",
+  "onboarding.step2Desc":
+    "以只读方式扫描 HDF5、LeRobot 或 MP4 目录写入 SQLite，绝不改动原始文件。",
+  "onboarding.step3Title": "3. 配置 VLM 模型接口与成本档位",
+  "onboarding.step3Desc":
+    "接入 OpenAI、Gemini、百炼或本地 vLLM，并一键选择极速 / 均衡 / 高精度路由。",
+  "onboarding.copyCmdBtn": "复制",
+  "onboarding.copiedBtn": "已复制",
+  "onboarding.copyAria": "复制演示数据集生成命令",
+  "onboarding.ingestBtn": "导入本地数据",
+  "onboarding.configureVlmBtn": "配置 VLM API",
+  "onboarding.reviewerHint": "请联系组长工程师导入数据集或为当前工作区生成演示数据。",
+
+  // SkeletonLoader
+  "skeleton.loadingPage": "正在加载页面...",
+  "skeleton.loadingTable": "正在加载片段列表...",
+  "skeleton.loadingStudio": "正在加载审核工作台...",
 };
