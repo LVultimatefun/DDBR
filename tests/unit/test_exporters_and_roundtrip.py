@@ -48,7 +48,7 @@ def _make_synthetic_h5_raw_v3(ds_dir: Path, duration_s: float = 2.0) -> Path:
     t_norm = np.linspace(0.0, 1.0, T, dtype=np.float32)
     robot_state[:, 23] = 0.2 + 0.3 * t_norm
     robot_state[:, 30] = -0.2 - 0.3 * t_norm
-    q = Rotation.from_euler("z", t_norm * 0.8).as_quat()[:, [3, 0, 1, 2]].astype(np.float32)
+    q = Rotation.from_euler("z", (t_norm * 0.8)[:, None]).as_quat()[:, [3, 0, 1, 2]].astype(np.float32)
     robot_state[:, 26:30] = q
     robot_state[:, 33:37] = q
 

@@ -139,8 +139,8 @@ def _make_resolved_and_view(
         raw_state[:, 30] = -t_norm * 0.4
         raw_state[:, 2] = np.linspace(-3.0, 3.0, T, dtype=np.float32)
         angles = np.linspace(0.0, 1.2, T)
-        q_l = Rotation.from_euler("z", angles).as_quat()[:, [3, 0, 1, 2]].astype(np.float32)
-        q_r = Rotation.from_euler("x", angles * 0.8).as_quat()[:, [3, 0, 1, 2]].astype(np.float32)
+        q_l = Rotation.from_euler("z", angles[:, None]).as_quat()[:, [3, 0, 1, 2]].astype(np.float32)
+        q_r = Rotation.from_euler("x", (angles * 0.8)[:, None]).as_quat()[:, [3, 0, 1, 2]].astype(np.float32)
         raw_state[:, 26:30] = q_l
         raw_state[:, 33:37] = q_r
         raw_state[:, 37:81] = t_norm[:, None] * 0.25
