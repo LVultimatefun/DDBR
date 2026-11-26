@@ -133,10 +133,10 @@
 
 - **3-In 可插拔只读 I/O 内核（[`robo_vlm_qc/io/`](robo_vlm_qc/io/)）**：严格只读接入 `h5_raw_v3`（5 流 30 Hz 同步、Slerp、触觉断帧修复、SBS 立体裁切）、`lerobot`（v2/v3 Parquet + MP4，完整保留原生 `state_names` / `action_names`）及 `video_dir`（纯视频 `kinematics=None`，兼容人手第一视角视频），支持按相机角色自适应拼图（`wrist_2x2`、`torso_head_2x2`、`single_1x2`）。
 - **因果 VLM DAG、抗跳变 BAFT 2D 追踪与分割联动 Subtask（[`robo_vlm_qc/vlm/`](robo_vlm_qc/vlm/)、[`robo_vlm_qc/guardrail/`](robo_vlm_qc/guardrail/)）**：
-  - 基于 `httpx` 的多提供商 `VlmClient`（OpenAI 兼容接口、DashScope、Gemini、本地 vLLM），支持按阶段路由模型、动态时长 Token 预算、内容寻址 `StageCache`（`S1` 与下游缓存解耦，仅重跑 `S1` 完整保留 `S2`–`S5` 缓存）以及协作式中途 VLM 取消（~1 ms 主动中断在途连接 + 原子化状态回滚与 SSE 实时同步）。
-  - **S1 开放场景词表锁定与抗跳变 BAFT**：当任务未预设 `grounding_objects` 时，先经 Pass-0 抽帧提取 1~4 个被机械臂或人手实际交互的核心物体与目标容器词表，再下发全部并发 Batch 防止跨批换名或断轨；支持在审核页指定自定义物体重跑 S1；BAFT 升级光流一致性自适应锚点降权与中等幅度/连续双帧跳变剔除，显著抑制中小模型 2D 框周期性跳变。
-  - **Subtask 同步标注（S1→S2 注入 + 基于精准分割一键重判）**：DAG 自动将 S1 物体状态摘要注入 S2 并产出可用于 VLA 训练的 `MacroStage.instruction` 指令；审核页 Track 1 升级为 `Subtask Stages`，支持 `±0.08s` 跨轨磁吸对齐 QC 分割边界，并可一键调用 **基于当前 QC 分割重判 Subtasks**（`POST /api/episodes/{id}/infer-subtasks`，完整支持 `Ctrl+Z` 撤销/重做）。
-  - 轻量护栏（`hallucination`、`splice_gate`、`visual_gate`）不主动产生标签，仅在切段跳变超限时将不安全的 `cut_clean` 自动降级为 `mask_loss`。
+  - 基于 `httpx` 的多提供商 `VlmClient`（OpenAI 兼容接口、DashScope、原生 Gemini `/v1beta` 含 `MEDIA_RESOLUTION_HIGH` 高清视觉与盲节点 Token 密度重连守卫、本地 vLLM），内置 `VlmCircuitBreaker` 熔断器、日志/报错密钥自动脱敏、`(stage, model)` 精准成本统计、按提供商隔离的 `StageCache`（`S1` 与下游解耦，仅重跑 `S1` 完整保留 `S2`–`S5` 缓存）以及协作式中途 VLM 取消（~1 ms 主动中断在途连接 + 原子化状态回滚与 SSE 实时同步）。
+  - **S1 开放词表锁定、参考帧锚定与抗跳变 BAFT**：当 `grounding_objects` 为空时先经 Pass-0 抽帧锁定核心交互物体与容器词表；集成 7 帧 ORB+RANSAC 直接定/动机位判定、Batch-0 `ref_frame_0` 空间锚定 + 幻觉重跑与跨批静态容器共识、审核页自定义物体重跑 S1；BAFT 升级至 480px 细长目标追踪，结合局部 NCC 幻觉锚点剔除、单切换点单调 DP、光流一致性自适应锚点降权与中度/双帧跳变抑制。
+  - **Subtask 联动、运动学摘要与阶段短路加速（`S2`–`S5`）**：将 S1 物体状态摘要注入 S2 产出 VLA `MacroStage.instruction`，审核页 Track 1 支持 `±0.08s` 跨轨磁吸对齐 QC 边界与一键 **重判 Subtasks**（`POST /api/episodes/{id}/infer-subtasks`）；S3/S4B 自动注入客观 30 Hz 运动学摘要（纯视频 `video_dir` 优雅跳过）；S4A 单候选/远距短路与 S4B 运动学边沿静止直通大幅降低无效调用；S5 结合 `START_vs_END` 高清对比拼图与串行按需 `s5_control` 复核（失败/存疑样本节省一半 S5 调用）。
+  - 轻量护栏（分臂校验 `hallucination`、边沿精确吸附 `splice_gate`、`visual_gate`）不主动产生标签，仅在切段跳变超限时将不安全的 `cut_clean` 自动降级为 `mask_loss`。
 - **机械臂与人手通用提示词 & 11 个纯视觉标签（[`configs/labels.yaml`](configs/labels.yaml)）**：纯视觉语义分类与切段策略解耦，默认任务模板（[`configs/tasks/_default.yaml`](configs/tasks/_default.yaml)）与 S1–S5 提示词（[`configs/prompts/`](configs/prompts/)）全面兼容**机械臂/夹爪**与**人类双手/第一视角演示视频**。
 - **一键替换 VLM API / 模型 & 全站中英双语 Studio（`中 / EN`）**：Lead 可在顶部导航栏点击 **`Model / API`** 弹窗一键套用预设（OpenAI、DashScope、Gemini、本地 vLLM、自定义中转站）、配置 Base URL / 统一或 S1–S5 分阶段模型并实时执行 **测试连通性**（`GET/PUT /api/settings/vlm`、`POST /api/settings/vlm/test`），也可使用 `robo-vlm-qc config-vlm` 命令行一行完成切换；API Key 仅以 `0600` 权限安全写入 `<workspace>/.env`，不进 YAML 且绝不明文回传。Web Studio 全站支持顶部一键 **中 / 英双语切换**（`localStorage` 持久化）、重做后的 Layer 2 成败判据交互面板，以及审核页（单条 JSON 直下或跳往导出中心预填）与队列批量快捷导出入口。
 - **未识别 `_default` 轨迹人工干预 & AI 辅助 `TaskSpec` 新任务接入**：目录名或元数据未命中现有任务的轨迹自动归入 `_default`，并在队列页与审核页醒目标记，支持一键 **`未识别 (_default)`** 筛选胶囊与行内/批量重指定任务（`PATCH /api/episodes/{id}/task`、`POST /api/episodes/batch-task` 及 `ingest --task`）。Lead 可随时唤起可复用的 **「+ 新建任务 (AI)」向导**（`POST /api/lab/tasks/draft`），输入任意中/英文任务说明并自动附带样例轨迹均匀抽取的 4–6 帧关键画面，一键生成标准化英文 S1–S5 `TaskSpec`（含 `goal`、`steps`、`criteria`、`task_prompt`、`grounding_objects` 以及自动清洗非法序列号/设备词后的安全 `match`/`aliases`），人工微调保存后立即完成目标轨迹归类。
@@ -173,7 +173,7 @@ cd web && npm ci && npm run build && cd ..
 # 生成 2 条多相机 video_dir 演示轨迹 + 1 条含 81 维运动学的 LeRobot v3 轨迹
 python scripts/generate_demo_dataset.py --out ./demo_data
 
-# 以严格只读方式扫描并注册到本地工作区
+# 以严格只读方式扫描并注册到本地工作区（可附加 `--task <task_id>` 显式指定任务）
 robo-vlm-qc -w ./workspace ingest --data ./demo_data
 
 # 在本机 127.0.0.1:8000 启动双角色 Studio（本地免令牌开发模式）

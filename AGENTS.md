@@ -1,6 +1,6 @@
 # AGENTS.md — `robo_vlm_qc` Engineering & Contributor Rules
 
-> **Version**: `1.0` | **Last Synced**: `2026-11-23`  
+> **Version**: `2.0` | **Last Synced**: `2026-11-26`  
 > Authoritative architecture specification: [`docs/architecture.md`](docs/architecture.md) · Operations & API reference: [`docs/operations.md`](docs/operations.md)
 
 This document defines the repository structure, development toolchain, data-safety redlines, and Living Documentation rules for contributors and AI coding agents working on `robo_vlm_qc`.
@@ -12,25 +12,25 @@ This document defines the repository structure, development toolchain, data-safe
 `robo_vlm_qc` is a standalone, VLM-native embodied trajectory QC, dual-role human review, and multi-format robotics data platform:
 
 - **Configuration Center ([`configs/`](configs/))** — bundled into wheels as `robo_vlm_qc._bundled_configs` via [`pyproject.toml`](pyproject.toml):
-  - [`configs/default.yaml`](configs/default.yaml): Global OpenAI-compatible VLM defaults (`https://api.openai.com/v1`, `OPENAI_API_KEY`, `.env`, `gpt-4o`, `thinking: false`, `thinking_mode: auto`), stage model routing (`stage_models`), dynamic duration token budget (`5000 tokens/s`), S1–S5 sampling params, I/O defaults, guardrail thresholds (`splice_gate`, `hallucination`, `visual_gate`), review lease/coverage rules, and export settings (`export.robot_type: "bimanual_robot"`).
+  - [`configs/default.yaml`](configs/default.yaml): Global OpenAI-compatible VLM defaults (`https://api.openai.com/v1`, `OPENAI_API_KEY`, `.env`, `gpt-4o`, `thinking: false`, `thinking_mode: auto`), resilience guards (`circuit_breaker`, Gemini `mediaResolution` & blind-node token-density guard, `pricing`), stage model routing (`stage_models`), dynamic duration token budget (`5000 tokens/s`), S1–S5 sampling & BAFT tracking params (`batch_size: 4`, `track_width: 480`, `boundary_idle_kin_skip_s4b: true`, `start_end_compare: true`), I/O defaults, guardrail thresholds (`splice_gate`, `hallucination`, `visual_gate`), review lease/coverage rules, and export settings (`export.robot_type: "bimanual_robot"`).
   - [`configs/presets/`](configs/presets/): Ready-to-use provider overrides ([`openai.yaml`](configs/presets/openai.yaml), [`dashscope.yaml`](configs/presets/dashscope.yaml), [`gemini.yaml`](configs/presets/gemini.yaml), [`vllm.yaml`](configs/presets/vllm.yaml)).
   - [`configs/labels.yaml`](configs/labels.yaml): 11 pure-visual core labels (`version: 1`, 7 categories) using language-neutral `name` fields and decoupled from rule operators.
-  - [`configs/prompts/`](configs/prompts/): Stage-isolated YAML prompt templates (`s1_grounding.yaml`, `s2_macro.yaml`, `s3_discover.yaml`, `s4_verify.yaml`, `s5_success.yaml`).
+  - [`configs/prompts/`](configs/prompts/): Embodiment-agnostic (robot arms/grippers & human hands) stage-isolated YAML prompt templates (`s1_grounding.yaml`, `s2_macro.yaml`, `s3_discover.yaml`, `s4_verify.yaml`, `s5_success.yaml`).
   - [`configs/tasks/`](configs/tasks/): Generic `TaskSpec` definitions ([`_default.yaml`](configs/tasks/_default.yaml), [`pick_and_place.yaml`](configs/tasks/pick_and_place.yaml), [`bimanual_handover.yaml`](configs/tasks/bimanual_handover.yaml)).
 - **Python Backend ([`robo_vlm_qc/`](robo_vlm_qc/))**
-  - [`config.py`](robo_vlm_qc/config.py) & [`cli.py`](robo_vlm_qc/cli.py): Layered YAML loader (`ROBO_VLM_QC_CONFIG_DIR` → repo `configs/` → bundled `_bundled_configs` → `cwd/configs`, merged with `<workspace>/configs_override/`), stage-isolated SHA256 cache bases, and Click CLI (`ingest`, `run-vlm`, `render-mp4`, `export`, `serve`, `eval`).
-  - `models/`: Authoritative Pydantic v2 domain models (`episode.py`, `annotation.py`, `review.py`, `taxonomy.py`, `export.py`) with `extra="forbid"`, clean English fields (`name`, `title`, `label`) plus backward-compatible legacy alias normalization on input, and explicit rejection of abolished rule fields.
-  - `io/`: Read-only 3-In `InputAdapter` registry (`h5_raw_v3.py`, `lerobot.py`, `video_dir.py`), `base.py` (`MediaSource`, `KinematicsTrack`), and `media.py` (adaptive 2×2 / 1×2 tiler & `PreviewCache`).
-  - `vlm/`: `VlmClient` (`client.py`), content-addressed `StageCache` (`cache.py`), `PromptBuilder` (`prompt_builder.py`), stages (`stage1_grounding.py`, `stage2_macro.py`, `stage3_discover.py`, `stage4_verify.py`, `stage5_success.py`), and 3-level concurrent `VlmDag` (`dag.py`).
-  - `guardrail/`: Light post-processing gates (`splice_gate.py`, `hallucination.py`, `visual_gate.py`) — zero kinematic rule detectors.
-  - `store/`: SQLite WAL connection pool & 6-table schema (`db.py`), atomic JSON + `.history/` snapshots (`artifacts.py`), and domain `Repository` (`repository.py`).
-  - `lab/`: Pure In-Context `VLM Lab` engine (`diagnosis.py`, `few_shot.py`, `eval_runner.py`, `prompt_assist.py`).
-  - `export/`: Transactional `_staging → rename` base & `OutputExporter` registry (`base.py`), unified `PieceSlicer` (`slicer.py`), and 4 exporters (`lerobot_v3.py`, `h5_clean.py`, `zero_copy_index.py`, `viz_mp4.py`).
+  - [`config.py`](robo_vlm_qc/config.py) & [`cli.py`](robo_vlm_qc/cli.py): Layered YAML loader (`ROBO_VLM_QC_CONFIG_DIR` → repo `configs/` → bundled `_bundled_configs` → `cwd/configs`, merged with `<workspace>/configs_override/`), provider-isolated SHA256 cache bases, and Click CLI (`ingest` w/ `--task`, `run-vlm`, `render-mp4`, `export` w/ `--state-schema-mode` & `--split-by-subtask`, `serve`, `eval`, `config-vlm`).
+  - `models/`: Authoritative Pydantic v2 domain models (`episode.py`, `annotation.py`, `review.py`, `taxonomy.py`, `export.py`) with `extra="forbid"`, clean English fields (`name`, `title`, `label`, `instruction`) plus backward-compatible legacy alias normalization on input, and explicit rejection of abolished rule fields.
+  - `io/`: Read-only 3-In `InputAdapter` registry (`h5_raw_v3.py`, `lerobot.py`, `video_dir.py`), `base.py` (`MediaSource`, `KinematicsTrack`), and `media.py` (adaptive 2×2 / 1×2 tiler, widened `DEFAULT_MAIN_ZOOM`, `compose_start_end_compare`, and `PreviewCache`).
+  - `vlm/`: `VlmClient` (`client.py` — OpenAI-compat + native Gemini `/v1beta`, blind-node density guard, `VlmCircuitBreaker`, `redact_secrets`, cooperative `cancel()`), content-addressed `StageCache` (`cache.py`), `PromptBuilder` (`prompt_builder.py` — 30 Hz kinematics summaries, grounding & QC summaries), `tracker.py` (offline BAFT tracker w/ direct ORB+RANSAC camera-motion detection, hallucinated-anchor rejection, single-switchpoint DP, anti-jitter adaptive anchor weighting), stages (`stage1_grounding.py`, `stage2_macro.py`, `stage3_discover.py`, `stage4_verify.py`, `stage5_success.py`), and 3-level concurrent `VlmDag` (`dag.py`).
+  - `guardrail/`: Light post-processing gates (`splice_gate.py` w/ edge-exact `boundary_idle` snapping, arm-aware `hallucination.py`, `visual_gate.py`) — zero kinematic rule detectors.
+  - `store/`: SQLite WAL connection pool & 6-table schema (`db.py`), atomic JSON + `.history/` snapshots (`artifacts.py`), and domain `Repository` (`repository.py` — claim leases, non-destructive `task_id` reassignment, cancel rollback).
+  - `lab/`: Pure In-Context `VLM Lab` engine (`diagnosis.py`, `few_shot.py`, `eval_runner.py`, `prompt_assist.py`, `task_assist.py` multimodal advisory `TaskSpec` drafter).
+  - `export/`: Transactional `_staging → rename` base & `OutputExporter` registry (`base.py`), unified `PieceSlicer` (`slicer.py` w/ optional `split_by_subtask`), and 4 exporters (`lerobot_v3.py` w/ adaptive `state_schema_mode`, `h5_clean.py`, `zero_copy_index.py`, `viz_mp4.py`).
   - `api/`: FastAPI application (`app.py`), Reviewer/Lead RBAC (`auth.py`), shared `AppState` & SSE broadcaster (`state.py`), and 7 routers (`episodes.py`, `reviews.py`, `jobs.py`, `exports.py`, `lab.py`, `settings.py`, `ingest.py`).
-- **Unified Dual-Role Frontend ([`web/src/`](web/src/))**
+- **Unified Dual-Role Bilingual Frontend ([`web/src/`](web/src/))**
   - Pages: `QueuePage.tsx`, `ReviewStudioPage.tsx`, `ExportPage.tsx`, `VlmLabPage.tsx` (4 tabs: `diagnosis`, `few_shots`, `taxonomy`, `eval`).
-  - Shared Studio Components: `StudioPlayer.tsx` (2D Grounding canvas), `FourTrackTimeline.tsx`, `SegmentInspector.tsx`, `SuccessPanel.tsx`, `DiffOverlay.tsx`, `IngestModal.tsx`, `JobDrawer.tsx`.
-  - Typed API & State: `api/{client,types,sse}.ts`, `stores/{authStore,reviewHistoryStore}.tsx`, `constants/labels.ts`.
+  - Shared Studio Components: `StudioPlayer.tsx` (30fps rVFC 2D Grounding canvas + `utils/groundingProjection.ts`), `FourTrackTimeline.tsx`, `SegmentInspector.tsx`, `SuccessPanel.tsx`, `DiffOverlay.tsx`, `IngestModal.tsx`, `TaskDraftWizardModal.tsx`, `VlmSettingsModal.tsx`, `JobCenterDrawer.tsx`, `LabHistoryDrawer.tsx`, `ShortcutsModal.tsx`.
+  - Typed API, Bilingual i18n & State: `api/{client,types,sse}.ts`, `i18n/{common,studio,lab}.ts`, `stores/{authStore,i18nStore,jobStore,reviewHistoryStore}.tsx`, `constants/labels.ts`.
 - **Scripts & Tests ([`scripts/`](scripts/), [`tests/`](tests/))**
   - [`scripts/generate_demo_dataset.py`](scripts/generate_demo_dataset.py): Standalone synthetic `video_dir` + `lerobot` v3 demo data generator.
   - Semantic test suites organized under `tests/unit/`, `tests/api/`, and `tests/e2e/`.
