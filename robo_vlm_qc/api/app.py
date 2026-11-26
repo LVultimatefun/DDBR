@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import gzip
+import io
 import os
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +15,10 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ..config import ConfigManager
 from ..io import PreviewCache
 from ..store import Repository
 from .auth import AuthContext, get_app_state, require_auth
@@ -31,6 +36,171 @@ DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
     "http://127.0.0.1:8000",
     "http://localhost:8000",
 )
+
+_GZIP_BYPASS_CT_PREFIXES: tuple[str, ...] = (
+    "text/event-stream",
+    "video/",
+    "audio/",
+    "image/",
+    "application/zip",
+)
+
+
+class SSESafeGZipMiddleware:
+    """ASGI GZip middleware that never buffers SSE or already-compressed media streams."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        minimum_size: int = 1024,
+        compresslevel: int = 6,
+    ) -> None:
+        self.app = app
+        self.minimum_size = max(0, int(minimum_size))
+        self.compresslevel = int(compresslevel)
+
+    @staticmethod
+    def _is_sse_path(path: str) -> bool:
+        norm = path.rstrip("/")
+        return norm == "/api/events" or norm.endswith("/events")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = str(scope.get("path") or "")
+        headers = Headers(scope=scope)
+        accept_encoding = headers.get("accept-encoding", "")
+        accept = headers.get("accept", "")
+        if (
+            "gzip" not in accept_encoding.lower()
+            or self._is_sse_path(path)
+            or "text/event-stream" in accept.lower()
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        responder = _SSESafeGZipResponder(
+            self.app,
+            minimum_size=self.minimum_size,
+            compresslevel=self.compresslevel,
+        )
+        await responder(scope, receive, send)
+
+
+class _SSESafeGZipResponder:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        minimum_size: int,
+        compresslevel: int,
+    ) -> None:
+        self.app = app
+        self.minimum_size = minimum_size
+        self.compresslevel = compresslevel
+        self.initial_message: Message | None = None
+        self.started = False
+        self.passthrough = False
+        self.gzip_buffer: io.BytesIO | None = None
+        self.gzip_file: gzip.GzipFile | None = None
+        self.send: Send | None = None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self.send = send
+        await self.app(scope, receive, self.send_with_gzip)
+
+    @staticmethod
+    def _should_bypass_response(message: Message) -> bool:
+        status_code = int(message.get("status", 200))
+        if status_code < 200 or status_code in (204, 206, 304):
+            return True
+        resp_headers = Headers(raw=message.get("headers", []))
+        if "content-encoding" in resp_headers:
+            return True
+        ct = resp_headers.get("content-type", "").strip().lower()
+        return any(ct.startswith(prefix) for prefix in _GZIP_BYPASS_CT_PREFIXES)
+
+    async def send_with_gzip(self, message: Message) -> None:
+        assert self.send is not None
+        msg_type = message["type"]
+        if msg_type == "http.response.start":
+            if self._should_bypass_response(message):
+                self.passthrough = True
+                self.started = True
+                await self.send(message)
+            else:
+                self.initial_message = message
+            return
+
+        if msg_type != "http.response.body":
+            await self.send(message)
+            return
+
+        if self.passthrough:
+            await self.send(message)
+            return
+
+        body = message.get("body", b"")
+        more_body = bool(message.get("more_body", False))
+
+        if not self.started:
+            assert self.initial_message is not None
+            self.started = True
+            if not more_body:
+                if len(body) < self.minimum_size:
+                    self.passthrough = True
+                    await self.send(self.initial_message)
+                    await self.send(message)
+                    return
+                compressed = gzip.compress(body, compresslevel=self.compresslevel)
+                mut_headers = MutableHeaders(raw=self.initial_message["headers"])
+                mut_headers["Content-Encoding"] = "gzip"
+                mut_headers["Content-Length"] = str(len(compressed))
+                mut_headers.add_vary_header("Accept-Encoding")
+                await self.send(self.initial_message)
+                await self.send(
+                    {
+                        "type": "http.response.body",
+                        "body": compressed,
+                        "more_body": False,
+                    }
+                )
+                return
+
+            # Streaming compressible response
+            mut_headers = MutableHeaders(raw=self.initial_message["headers"])
+            mut_headers["Content-Encoding"] = "gzip"
+            mut_headers.add_vary_header("Accept-Encoding")
+            if "content-length" in mut_headers:
+                del mut_headers["content-length"]
+            self.gzip_buffer = io.BytesIO()
+            self.gzip_file = gzip.GzipFile(
+                mode="wb",
+                fileobj=self.gzip_buffer,
+                compresslevel=self.compresslevel,
+            )
+            await self.send(self.initial_message)
+
+        assert self.gzip_file is not None and self.gzip_buffer is not None
+        if body:
+            self.gzip_file.write(body)
+        if not more_body:
+            self.gzip_file.close()
+        else:
+            self.gzip_file.flush()
+        chunk = self.gzip_buffer.getvalue()
+        self.gzip_buffer.seek(0)
+        self.gzip_buffer.truncate()
+        await self.send(
+            {
+                "type": "http.response.body",
+                "body": chunk,
+                "more_body": more_body,
+            }
+        )
 
 
 def _resolve_cors_origins(cors_origins: Sequence[str] | None) -> list[str]:
@@ -88,7 +258,15 @@ def create_app(
     cfg_dir = resolve_default_config_dir(config_dir)
 
     repo = Repository(ws_path)
-    preview_cache = PreviewCache(ws_path, max_workers=2)
+    # Validate config eagerly on startup so misconfigured directories fail fast.
+    cfg_init = ConfigManager(config_dir=cfg_dir, workspace_dir=ws_path)
+    raw_max_gb = (
+        cfg_init.settings.get("io", {})
+        .get("preview_cache", {})
+        .get("max_cache_gb", 10.0)
+    )
+    max_cache_gb = float(raw_max_gb) if raw_max_gb is not None else None
+    preview_cache = PreviewCache(ws_path, max_workers=2, max_cache_gb=max_cache_gb)
     auth_cfg = _resolve_tokens(
         reviewer_token=reviewer_token,
         lead_token=lead_token,
@@ -113,7 +291,6 @@ def create_app(
         allowed_data_roots=norm_allowed_roots,
     )
 
-    # Validate config eagerly on startup so misconfigured directories fail fast.
     app_state.get_config()
 
     @contextlib.asynccontextmanager
@@ -137,6 +314,8 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.ctx = app_state
+
+    app.add_middleware(SSESafeGZipMiddleware, minimum_size=1024)
 
     origins = _resolve_cors_origins(cors_origins)
     app.add_middleware(

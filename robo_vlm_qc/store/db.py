@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS episodes (
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 CREATE INDEX IF NOT EXISTS idx_episodes_dataset_task ON episodes(dataset, task_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_claim ON episodes(claimed_by, claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_episodes_task_status_updated ON episodes(task_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_episodes_dataset_status ON episodes(dataset, status);
 
 CREATE TABLE IF NOT EXISTS vlm_runs (
     run_id             TEXT PRIMARY KEY,
@@ -57,6 +59,8 @@ CREATE TABLE IF NOT EXISTS vlm_runs (
     artifact_path      TEXT NOT NULL,
     status             TEXT NOT NULL,
     tokens_total       INTEGER DEFAULT 0,
+    cached_tokens      INTEGER DEFAULT 0,
+    cost_usd           REAL DEFAULT 0.0,
     elapsed_s          REAL DEFAULT 0,
     error_message      TEXT,
     created_at         REAL NOT NULL
@@ -106,6 +110,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at     REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_type_status_created ON jobs(job_type, status, created_at);
 """
 
 
@@ -160,8 +165,20 @@ class DatabasePool:
     def initialize(self) -> None:
         with self.transaction() as conn:
             conn.executescript(SCHEMA_DDL)
-            # executescript issues implicit COMMIT in sqlite3; re-open tx for migration row
+            # executescript issues implicit COMMIT in sqlite3; re-open tx for migrations
             conn.execute("BEGIN IMMEDIATE;")
+            existing_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(vlm_runs)").fetchall()
+            }
+            if "cached_tokens" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE vlm_runs ADD COLUMN cached_tokens INTEGER DEFAULT 0"
+                )
+            if "cost_usd" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE vlm_runs ADD COLUMN cost_usd REAL DEFAULT 0.0"
+                )
             row = conn.execute(
                 "SELECT version FROM schema_migrations WHERE version = ?",
                 (SCHEMA_VERSION,),

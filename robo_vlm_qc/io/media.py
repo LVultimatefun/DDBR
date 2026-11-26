@@ -5,12 +5,15 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import subprocess
 import threading
+import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -514,13 +517,32 @@ def _is_nvenc_available() -> bool:
 class PreviewCache:
     """Transcode and cache browser-friendly CFR H.264 MP4 previews under workspace."""
 
-    def __init__(self, workspace: Path, *, max_workers: int = 2) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        max_workers: int = 2,
+        max_cache_gb: float | None = 10.0,
+    ) -> None:
         self.workspace = Path(workspace).resolve()
         self.previews_root = self.workspace / "artifacts" / "previews"
         self.previews_root.mkdir(parents=True, exist_ok=True)
+        self.max_cache_gb: float | None = (
+            float(max_cache_gb) if max_cache_gb is not None else None
+        )
+        if self.max_cache_gb is not None and self.max_cache_gb < 0:
+            raise ValueError(f"max_cache_gb must be >= 0, got {max_cache_gb!r}")
+        self.max_cache_bytes: int | None = (
+            int(self.max_cache_gb * (1024**3))
+            if self.max_cache_gb is not None
+            else None
+        )
         self._sem = threading.Semaphore(max(1, max_workers))
         self._locks_guard = threading.Lock()
         self._path_locks: dict[str, threading.Lock] = {}
+        self._gc_lock = threading.Lock()
+        self._active_partials_guard = threading.Lock()
+        self._active_partials: set[Path] = set()
 
     def _lock_for(self, path: Path) -> threading.Lock:
         key = str(path)
@@ -535,6 +557,192 @@ class PreviewCache:
     def _even(n: int) -> int:
         v = max(2, int(round(n / 2.0)) * 2)
         return v
+
+    def touch_access(self, path: Path) -> None:
+        """Update file atime for LRU tracking while strictly preserving st_mtime."""
+        try:
+            st = path.stat()
+            os.utime(path, ns=(time.time_ns(), st.st_mtime_ns))
+        except OSError:
+            pass
+
+    @staticmethod
+    def _is_partial_file(path: Path) -> bool:
+        return path.name.endswith(".partial.mp4")
+
+    def cache_stats(self) -> dict[str, Any]:
+        """Return preview cache disk usage and file count statistics."""
+        preview_bytes = 0
+        partial_bytes = 0
+        file_count = 0
+        partial_count = 0
+        oldest_atime: float | None = None
+        newest_atime: float | None = None
+
+        if self.previews_root.is_dir():
+            for p in self.previews_root.rglob("*"):
+                if not p.is_file():
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if self._is_partial_file(p):
+                    partial_count += 1
+                    partial_bytes += st.st_size
+                else:
+                    file_count += 1
+                    preview_bytes += st.st_size
+                    if oldest_atime is None or st.st_atime < oldest_atime:
+                        oldest_atime = st.st_atime
+                    if newest_atime is None or st.st_atime > newest_atime:
+                        newest_atime = st.st_atime
+
+        total_bytes = preview_bytes + partial_bytes
+        return {
+            "cache_dir": str(self.previews_root),
+            "file_count": file_count,
+            "partial_count": partial_count,
+            "preview_bytes": preview_bytes,
+            "partial_bytes": partial_bytes,
+            "total_bytes": total_bytes,
+            "total_gb": round(total_bytes / float(1024**3), 6),
+            "max_cache_gb": self.max_cache_gb,
+            "max_cache_bytes": self.max_cache_bytes,
+            "oldest_atime": oldest_atime,
+            "newest_atime": newest_atime,
+        }
+
+    def evict_lru(
+        self,
+        max_bytes: int | None = None,
+        *,
+        dry_run: bool = False,
+        protect_paths: set[Path] | Sequence[Path] | None = None,
+    ) -> dict[str, Any]:
+        """Evict least-recently-accessed cached previews until total size <= max_bytes.
+
+        Also cleans stale `.partial.mp4` leftovers (excluding active in-flight encodes)
+        and prunes empty subdirectories under `previews_root`.
+        """
+        limit_bytes: int | None
+        if max_bytes is not None:
+            limit_bytes = max(0, int(max_bytes))
+        else:
+            limit_bytes = self.max_cache_bytes
+
+        protected: set[Path] = {Path(p).resolve() for p in (protect_paths or ())}
+
+        with self._gc_lock:
+            with self._active_partials_guard:
+                active_partials = set(self._active_partials)
+
+            preview_entries: list[tuple[int, int, int, Path]] = []
+            partial_entries: list[tuple[int, Path]] = []
+
+            if self.previews_root.is_dir():
+                for p in self.previews_root.rglob("*"):
+                    if not p.is_file():
+                        continue
+                    try:
+                        resolved = p.resolve()
+                        st = resolved.stat()
+                    except OSError:
+                        continue
+                    if self._is_partial_file(resolved):
+                        partial_entries.append((st.st_size, resolved))
+                    else:
+                        preview_entries.append(
+                            (st.st_atime_ns, st.st_mtime_ns, st.st_size, resolved)
+                        )
+
+            before_preview_bytes = sum(item[2] for item in preview_entries)
+            before_partial_bytes = sum(item[0] for item in partial_entries)
+            before_bytes = before_preview_bytes + before_partial_bytes
+            before_files = len(preview_entries)
+
+            removed_partials: list[str] = []
+            evicted_files: list[str] = []
+            freed_bytes = 0
+            planned_removals: set[Path] = set()
+
+            for sz, p_path in partial_entries:
+                if p_path in protected or p_path in active_partials:
+                    continue
+                planned_removals.add(p_path)
+                removed_partials.append(str(p_path))
+                freed_bytes += sz
+                if not dry_run:
+                    try:
+                        p_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            remaining_preview_bytes = before_preview_bytes
+            if limit_bytes is not None and remaining_preview_bytes > limit_bytes:
+                preview_entries.sort(key=lambda it: (it[0], it[1], str(it[3])))
+                for _atime_ns, _mtime_ns, sz, f_path in preview_entries:
+                    if remaining_preview_bytes <= limit_bytes:
+                        break
+                    if f_path in protected:
+                        continue
+                    planned_removals.add(f_path)
+                    evicted_files.append(str(f_path))
+                    remaining_preview_bytes -= sz
+                    freed_bytes += sz
+                    if not dry_run:
+                        try:
+                            f_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
+            empty_dirs_removed = 0
+            if self.previews_root.is_dir():
+                all_dirs = sorted(
+                    (d for d in self.previews_root.rglob("*") if d.is_dir()),
+                    key=lambda d: len(d.parts),
+                    reverse=True,
+                )
+                if dry_run:
+                    removed_dirs_sim: set[Path] = set()
+                    for d in all_dirs:
+                        d_res = d.resolve()
+                        try:
+                            children = [c.resolve() for c in d.iterdir()]
+                        except OSError:
+                            continue
+                        if all(
+                            c in planned_removals or c in removed_dirs_sim
+                            for c in children
+                        ):
+                            removed_dirs_sim.add(d_res)
+                            empty_dirs_removed += 1
+                else:
+                    for d in all_dirs:
+                        try:
+                            if not any(d.iterdir()):
+                                d.rmdir()
+                                empty_dirs_removed += 1
+                        except OSError:
+                            pass
+
+            after_bytes = max(0, before_bytes - freed_bytes)
+            after_files = max(0, before_files - len(evicted_files))
+            return {
+                "dry_run": bool(dry_run),
+                "cache_dir": str(self.previews_root),
+                "max_bytes": limit_bytes,
+                "before_bytes": before_bytes,
+                "after_bytes": after_bytes,
+                "freed_bytes": freed_bytes,
+                "before_files": before_files,
+                "after_files": after_files,
+                "evicted_count": len(evicted_files),
+                "evicted_files": evicted_files,
+                "stale_partials_removed": len(removed_partials),
+                "stale_partials": removed_partials,
+                "empty_dirs_removed": empty_dirs_removed,
+            }
 
     def preview_path(
         self, dataset: str, stem: str, camera: str, *, hd: bool = False
@@ -659,8 +867,10 @@ class PreviewCache:
         out_h = self._even(target_height)
         out_w = self._even(round(cam_spec.width * out_h / cam_spec.height))
 
+        built_new = False
         with self._lock_for(out_path):
             if out_path.is_file() and out_path.stat().st_mtime >= source_mtime:
+                self.touch_access(out_path)
                 return out_path
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -674,25 +884,36 @@ class PreviewCache:
             if min(out_w, out_h) >= 160 and _is_nvenc_available():
                 encoders = ["h264_nvenc", "libx264"]
 
+            tmp_resolved = tmp_path.resolve()
             with self._sem:
-                last_err: Exception | None = None
-                for enc in encoders:
-                    try:
-                        tmp_path.unlink(missing_ok=True)
-                        self._encode_stream(
-                            media, camera, out_w, out_h, fps, times_s, tmp_path, enc
-                        )
-                        tmp_path.replace(out_path)
-                        last_err = None
-                        break
-                    except Exception as exc:
-                        last_err = exc
-                        tmp_path.unlink(missing_ok=True)
-                        logger.warning(
-                            "Preview encode with %s failed (%s), trying fallback if available",
-                            enc,
-                            exc,
-                        )
-                if last_err is not None:
-                    raise last_err
-            return out_path
+                with self._active_partials_guard:
+                    self._active_partials.add(tmp_resolved)
+                try:
+                    last_err: Exception | None = None
+                    for enc in encoders:
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                            self._encode_stream(
+                                media, camera, out_w, out_h, fps, times_s, tmp_path, enc
+                            )
+                            tmp_path.replace(out_path)
+                            last_err = None
+                            built_new = True
+                            break
+                        except Exception as exc:
+                            last_err = exc
+                            tmp_path.unlink(missing_ok=True)
+                            logger.warning(
+                                "Preview encode with %s failed (%s), trying fallback if available",
+                                enc,
+                                exc,
+                            )
+                    if last_err is not None:
+                        raise last_err
+                finally:
+                    with self._active_partials_guard:
+                        self._active_partials.discard(tmp_resolved)
+
+        if built_new and self.max_cache_bytes is not None:
+            self.evict_lru(protect_paths={out_path})
+        return out_path

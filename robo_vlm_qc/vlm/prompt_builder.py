@@ -641,6 +641,48 @@ class PromptBuilder:
         )
         return render_template(sys_t, ctx), render_template(usr_t, ctx)
 
+    def build_s1_discover_and_ground(
+        self,
+        *,
+        task: TaskSpec | None = None,
+        task_spec: TaskSpec | None = None,
+        camera_roles: dict[str, str] | None = None,
+    ) -> tuple[str, str]:
+        t = task or task_spec
+        assert t is not None
+        tpl = self.prompts.s1_grounding
+        main_cam = (camera_roles or {}).get("main", "main")
+        ctx = {
+            "task_id": t.task_id,
+            "task_goal": t.goal or t.description or t.title or t.task_id,
+            "camera_layout_desc": f"Main HD camera frames (camera={main_cam})",
+            "task_prompt": t.task_prompt.strip()
+            or "Identify 1-4 primary physical objects manipulated by robot arms/grippers or human hands plus target receptacle, and ground each across every keyframe.",
+        }
+        sys_t = tpl.extra_templates.get("discover_and_ground_system") or (
+            "You are an embodied manipulation visual grounding expert "
+            "(2D Grounding canonical vocabulary discovery and batched keyframe grounding, "
+            "supporting both robot arms/grippers and human hands). "
+            "In a single pass over the chronological keyframes (labeled [t=XX.XXs | frame_i]), "
+            "first select 1 to 4 task-relevant physical objects (active manipulated objects + target container/receptacle; "
+            "exclude robot arms/grippers, human hands, and background clutter), AND immediately ground those exact object ids "
+            "in every frame using normalized [0, 1000] integer bounding boxes [x1, y1, x2, y2]. "
+            'Output strict JSON only: {"canonical_objects": [{"id": "snake_case_id", "name": str, "desc": str, "is_static": bool}], '
+            '"frames": [{"frame_index": 0, "time_s": 0.0, "objects": {obj_id: {"visible": bool, "bbox": [x1,y1,x2,y2], "state": str, "status_kind": "neutral|warn|error|good"}}}]}. '
+            "Keep target identity locked on the same physical object across all frames, fit actual visible pixels tightly, "
+            "and set visible=false with bbox=[0, 0, 0, 0] when occluded."
+        )
+        usr_t = tpl.extra_templates.get("discover_and_ground_user") or (
+            "Task: {{ task_id }} -- {{ task_goal }}\n"
+            "Camera view: {{ camera_layout_desc }}\n"
+            "Task guidance: {{ task_prompt }}\n"
+            "Identify 1-4 canonical physical objects and output their 2D bounding boxes and states in chronological order for every keyframe (frame_0..frame_N) in a single strict JSON object."
+        )
+        return (
+            _sanitize_inactive_labels(render_template(sys_t, ctx), self.labels),
+            render_template(usr_t, ctx),
+        )
+
     def build_s2(
         self,
         *,
@@ -753,6 +795,7 @@ class PromptBuilder:
         fs_text = format_few_shots_text(
             fs_list, task_id=t.task_id, top_k=top_k, max_tokens=max_tok
         )
+        labels_text = format_labels_desc(self.labels)
         ctx = {
             "task_id": t.task_id,
             "task_goal": (t.goal or "").strip(),
@@ -762,12 +805,30 @@ class PromptBuilder:
             "duration_s": round(float(duration_s), 2),
             "camera_layout_desc": describe_camera_layout(camera_roles),
             "macro_backbone_text": format_macro_backbone(macro_stages),
-            "labels_desc": format_labels_desc(self.labels),
+            "labels_desc": "(See [Active Pure-Visual QC Label Registry] in the system message above.)"
+            if labels_text
+            else "",
             "few_shot_text": fs_text,
             "kinematics_summary": kinematics_summary.strip(),
         }
+        sys_base = _sanitize_inactive_labels(
+            render_template(tpl.system_template, ctx), self.labels
+        )
+        static_parts = [f"Task: {t.task_id}"]
+        if ctx["task_goal"]:
+            static_parts.append(f"Goal: {ctx['task_goal']}")
+        if ctx["task_prompt"]:
+            static_parts.append(
+                f"[Task Context & False-Positive Guardrails]: {ctx['task_prompt']}"
+            )
+        static_parts.append(f"Camera layout: {ctx['camera_layout_desc']}")
+        if labels_text:
+            static_parts.append(
+                f"[Active Pure-Visual QC Label Registry]:\n{labels_text}"
+            )
+        sys_out = f"{sys_base}\n\n" + "\n".join(static_parts)
         return (
-            _sanitize_inactive_labels(render_template(tpl.system_template, ctx), self.labels),
+            sys_out,
             render_template(tpl.user_template, ctx),
         )
 
@@ -833,6 +894,7 @@ class PromptBuilder:
         fs_text = format_few_shots_text(
             few_shots, task_id=t.task_id, top_k=top_k, max_tokens=max_tok
         )
+        labels_text = format_labels_desc(self.labels)
         ctx = {
             "task_id": t.task_id,
             "task_goal": (t.goal or "").strip(),
@@ -845,12 +907,30 @@ class PromptBuilder:
             "window_end_s": round(float(window_end_s), 2),
             "camera_layout_desc": describe_camera_layout(camera_roles),
             "macro_backbone_text": format_macro_backbone(macro_stages),
-            "labels_desc": format_labels_desc(self.labels),
+            "labels_desc": "(See [Active Pure-Visual QC Label Registry] in the system message above.)"
+            if labels_text
+            else "",
             "few_shot_text": fs_text,
             "kinematics_summary": kinematics_summary.strip(),
         }
+        sys_base = _sanitize_inactive_labels(
+            render_template(tpl.system_template, ctx), self.labels
+        )
+        static_parts = [f"Task: {t.task_id}"]
+        if ctx["task_goal"]:
+            static_parts.append(f"Goal: {ctx['task_goal']}")
+        if ctx["task_prompt"]:
+            static_parts.append(
+                f"[Task Context & False-Positive Guardrails]: {ctx['task_prompt']}"
+            )
+        static_parts.append(f"Camera layout: {ctx['camera_layout_desc']}")
+        if labels_text:
+            static_parts.append(
+                f"[Active Pure-Visual QC Label Registry]:\n{labels_text}"
+            )
+        sys_out = f"{sys_base}\n\n" + "\n".join(static_parts)
         return (
-            _sanitize_inactive_labels(render_template(tpl.system_template, ctx), self.labels),
+            sys_out,
             render_template(tpl.user_template, ctx),
         )
 

@@ -5,6 +5,7 @@
 *_key.env
 *token*
 !/web/src/**/tokens*
+!/tests/test_token_optimizations.py
 .qc_dev_token
 .git_token
 *.pem

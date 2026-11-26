@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 from urllib.parse import quote, quote_plus, urlsplit
 
 import httpx
@@ -357,6 +357,65 @@ def count_gemini_payload_media(
     return n_images, est_text
 
 
+_VALID_IMAGE_DETAILS = frozenset({"auto", "low", "high"})
+LOW_DETAIL_VISION_MIN_TOKENS_PER_IMAGE = 60
+
+
+def normalize_image_detail(value: Any) -> Literal["auto", "low", "high"] | None:
+    """Normalize an optional image_detail setting ('auto' | 'low' | 'high' | None)."""
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if not raw or raw in {"none", "null"}:
+        return None
+    if raw not in _VALID_IMAGE_DETAILS:
+        raise ValueError(
+            f"Unsupported image_detail {value!r}; expected 'auto', 'low', 'high', or None"
+        )
+    return raw  # type: ignore[return-value]
+
+
+def _infer_messages_image_detail(
+    messages: Sequence[dict[str, Any]],
+) -> Literal["auto", "low", "high"] | None:
+    """Infer a uniform image_url.detail value from pre-built OpenAI-style messages."""
+    found: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not isinstance(blk, dict) or blk.get("type") != "image_url":
+                continue
+            img_obj = blk.get("image_url")
+            if isinstance(img_obj, dict) and img_obj.get("detail") is not None:
+                det = str(img_obj.get("detail") or "").strip().lower()
+                if det in _VALID_IMAGE_DETAILS:
+                    found.add(det)
+    if len(found) == 1:
+        return next(iter(found))  # type: ignore[return-value]
+    return None
+
+
+def effective_vision_min_tokens_per_image(
+    min_tokens_per_image: int,
+    *,
+    image_detail: str | None = None,
+    media_resolution: str | None = None,
+) -> int:
+    """Scale blind-node vision token density threshold down for low-detail requests."""
+    base = max(0, int(min_tokens_per_image or 0))
+    if base <= 0:
+        return 0
+    norm_det = normalize_image_detail(image_detail)
+    norm_mr = normalize_gemini_media_resolution(media_resolution)
+    if norm_det == "low" or norm_mr == "MEDIA_RESOLUTION_LOW":
+        return min(base, LOW_DETAIL_VISION_MIN_TOKENS_PER_IMAGE)
+    return base
+
+
 def evaluate_vision_token_density(
     *,
     n_images: int,
@@ -364,12 +423,19 @@ def evaluate_vision_token_density(
     exact_image_tokens: int | None,
     est_text_tokens: int,
     min_tokens_per_image: int,
+    image_detail: str | None = None,
+    media_resolution: str | None = None,
 ) -> tuple[bool, float | None, int, str]:
-    """Check whether a Gemini multimodal response indicates a blind/degraded vision node.
+    """Check whether a multimodal response indicates a blind/degraded vision node.
 
     Returns ``(is_blind, tok_per_image, effective_image_tokens, density_source)``.
     """
-    if n_images <= 0 or min_tokens_per_image <= 0 or prompt_tokens <= 0:
+    eff_min = effective_vision_min_tokens_per_image(
+        min_tokens_per_image,
+        image_detail=image_detail,
+        media_resolution=media_resolution,
+    )
+    if n_images <= 0 or eff_min <= 0 or prompt_tokens <= 0:
         return False, None, 0, "skipped"
     if exact_image_tokens is not None and exact_image_tokens > 0:
         eff_img = int(exact_image_tokens)
@@ -378,7 +444,7 @@ def evaluate_vision_token_density(
         eff_img = max(0, int(prompt_tokens) - max(0, int(est_text_tokens)))
         src = "prompt_tokens-est_text"
     tok_per_img = eff_img / float(n_images)
-    is_blind = eff_img < (n_images * int(min_tokens_per_image))
+    is_blind = eff_img < (n_images * int(eff_min))
     return is_blind, tok_per_img, eff_img, src
 
 
@@ -402,6 +468,7 @@ def estimate_stage_cost_usd(
     *,
     reasoning_tokens: int = 0,
     reasoning_included_in_completion: bool = False,
+    cached_tokens: int = 0,
 ) -> float:
     """Estimate USD cost for a call using vlm.pricing config and actual model name.
 
@@ -410,6 +477,9 @@ def estimate_stage_cost_usd(
     billed output tokens. When ``True`` (matching OpenAI-compat where
     ``completion_tokens`` already includes ``completion_tokens_details.reasoning_tokens``),
     output tokens are never double-counted.
+
+    Prompt tokens served from provider prefix cache (``cached_tokens``) are billed at
+    ``cached_input_per_1m_usd`` when configured, or 50% of ``input_per_1m_usd`` by default.
     """
     if not pricing:
         return 0.0
@@ -420,13 +490,25 @@ def estimate_stage_cost_usd(
     try:
         in_rate = float(entry.get("input_per_1m_usd", 0.0) or 0.0)
         out_rate = float(entry.get("output_per_1m_usd", 0.0) or 0.0)
+        raw_cached_rate = entry.get("cached_input_per_1m_usd")
+        cached_in_rate = (
+            float(raw_cached_rate)
+            if raw_cached_rate is not None
+            else (0.5 * in_rate)
+        )
     except (TypeError, ValueError):
         return 0.0
     p_tok = max(0, int(prompt_tokens))
+    cached_tok = max(0, min(p_tok, int(cached_tokens or 0)))
+    uncached_p_tok = p_tok - cached_tok
     c_tok = max(0, int(completion_tokens))
     r_tok = max(0, int(reasoning_tokens))
     billed_out = max(c_tok, r_tok) if reasoning_included_in_completion else (c_tok + r_tok)
-    cost = (p_tok * in_rate + billed_out * out_rate) / 1_000_000.0
+    cost = (
+        uncached_p_tok * in_rate
+        + cached_tok * cached_in_rate
+        + billed_out * out_rate
+    ) / 1_000_000.0
     return round(max(0.0, cost), 8)
 
 
@@ -780,12 +862,18 @@ def parse_gemini_response(
     c_tok = int(um.get("candidatesTokenCount") or 0)
     r_tok = int(um.get("thoughtsTokenCount") or 0)
     t_tok = int(um.get("totalTokenCount") or (p_tok + c_tok + r_tok))
+    raw_cached = um.get("cachedContentTokenCount")
+    cached_tok = max(0, int(raw_cached or 0))
+    if p_tok > 0:
+        cached_tok = min(p_tok, cached_tok)
     usage = {
         "prompt_tokens": p_tok,
         "completion_tokens": c_tok,
         "total_tokens": t_tok,
         "reasoning_tokens": r_tok,
     }
+    if raw_cached is not None:
+        usage["cached_tokens"] = cached_tok
 
     exact_img_tokens: int | None = None
     exact_txt_tokens: int | None = None
@@ -823,6 +911,7 @@ def parse_gemini_response(
         "model_version": data.get("modelVersion"),
         "image_prompt_tokens": exact_img_tokens,
         "text_prompt_tokens": exact_txt_tokens,
+        "cached_tokens": cached_tok,
         "reasoning_included_in_completion": bool(
             r_tok > 0 and t_tok == (p_tok + c_tok) and c_tok >= r_tok
         ),
@@ -902,8 +991,10 @@ def build_interleaved_messages(
     labels: Sequence[str] | None = None,
     jpeg_quality: int = 74,
     text_first: bool = False,
+    image_detail: Literal["auto", "low", "high"] | None = None,
 ) -> list[dict[str, Any]]:
     """Build OpenAI-compatible interleaved timestamped image + text messages."""
+    norm_detail = normalize_image_detail(image_detail)
     msgs: list[dict[str, Any]] = []
     if system_prompt:
         msgs.append({"role": "system", "content": system_prompt})
@@ -935,7 +1026,10 @@ def build_interleaved_messages(
             tag = f"[t={t_val:05.2f}s | {lbl}]" if lbl else f"[t={t_val:05.2f}s]"
         blocks.append({"type": "text", "text": tag})
         url = encode_jpeg_data_url(img, quality=jpeg_quality)
-        blocks.append({"type": "image_url", "image_url": {"url": url}})
+        img_obj: dict[str, Any] = {"url": url}
+        if norm_detail is not None:
+            img_obj["detail"] = norm_detail
+        blocks.append({"type": "image_url", "image_url": img_obj})
 
     if not text_first and user_prompt:
         blocks.append({"type": "text", "text": user_prompt})
@@ -951,6 +1045,7 @@ class _StageAccum:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cached_tokens: int = 0
     reasoning_tokens: int = 0
     elapsed_s: float = 0.0
     estimated_cost_usd: float = 0.0
@@ -981,6 +1076,7 @@ class BudgetTracker:
         self.tokens = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self.cached_tokens = 0
         self.reasoning_tokens = 0
         self.calls = 0
         self.cached_stages = 0
@@ -1041,6 +1137,7 @@ class BudgetTracker:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int | None = None,
+        cached_tokens: int = 0,
         reasoning_tokens: int = 0,
         reasoning_included_in_completion: bool | None = None,
         elapsed_s: float = 0.0,
@@ -1049,6 +1146,9 @@ class BudgetTracker:
         p_tok = max(0, int(prompt_tokens))
         c_tok = max(0, int(completion_tokens))
         r_tok = max(0, int(reasoning_tokens))
+        cached_tok = max(0, int(cached_tokens or 0))
+        if p_tok > 0:
+            cached_tok = min(p_tok, cached_tok)
 
         if reasoning_included_in_completion is None:
             if r_tok <= 0:
@@ -1075,6 +1175,7 @@ class BudgetTracker:
                 self.pricing,
                 reasoning_tokens=r_tok,
                 reasoning_included_in_completion=eff_included,
+                cached_tokens=cached_tok,
             )
         )
         stage_key = (stage, model)
@@ -1083,6 +1184,7 @@ class BudgetTracker:
                 self.calls += 1
                 self.prompt_tokens += p_tok
                 self.completion_tokens += c_tok
+                self.cached_tokens += cached_tok
                 self.reasoning_tokens += r_tok
                 self.tokens += tot
                 self.elapsed_s += float(elapsed_s)
@@ -1097,6 +1199,7 @@ class BudgetTracker:
             acc.prompt_tokens += p_tok
             acc.completion_tokens += c_tok
             acc.total_tokens += tot
+            acc.cached_tokens += cached_tok
             acc.reasoning_tokens += r_tok
             acc.elapsed_s += float(elapsed_s)
             acc.estimated_cost_usd += call_cost
@@ -1112,6 +1215,7 @@ class BudgetTracker:
                 prompt_tokens=p_tok,
                 completion_tokens=c_tok,
                 total_tokens=tot,
+                cached_tokens=cached_tok,
                 reasoning_tokens=r_tok,
                 reasoning_included_in_completion=eff_included,
                 elapsed_s=elapsed_s,
@@ -1127,6 +1231,7 @@ class BudgetTracker:
                     prompt_tokens=acc.prompt_tokens,
                     completion_tokens=acc.completion_tokens,
                     total_tokens=acc.total_tokens,
+                    cached_tokens=acc.cached_tokens,
                     elapsed_s=round(acc.elapsed_s, 4),
                     estimated_cost_usd=round(acc.estimated_cost_usd, 6),
                     cache_hit=(acc.calls == 0 and acc.cache_hits > 0),
@@ -1136,6 +1241,7 @@ class BudgetTracker:
             return UsageSummary(
                 stages=stages,
                 total_tokens=self.tokens,
+                total_cached_tokens=self.cached_tokens,
                 total_elapsed_s=round(self.elapsed_s, 4),
                 total_cost_usd=round(self.total_cost_usd, 6),
             )
@@ -1524,13 +1630,17 @@ class VlmClient:
         *,
         provider: str | None = None,
         base_url: str | None = None,
+        image_detail: str | None = None,
     ) -> str | None:
         eff_provider = (provider or self.provider).strip().lower()
-        if (
-            eff_provider != "gemini"
-            or n_images <= 0
-            or not is_gemini_hd_vision_model(model)
-        ):
+        if eff_provider != "gemini" or n_images <= 0:
+            return None
+        norm_det = normalize_image_detail(image_detail)
+        if norm_det == "low":
+            return "MEDIA_RESOLUTION_LOW"
+        if norm_det == "high":
+            return "MEDIA_RESOLUTION_HIGH"
+        if not is_gemini_hd_vision_model(model):
             return None
         if self.gemini_media_resolution:
             return self.gemini_media_resolution
@@ -1692,6 +1802,13 @@ class VlmClient:
         t_tok = int(usage.get("total_tokens") or (p_tok + c_tok))
         details = usage.get("completion_tokens_details") or {}
         r_tok = int(details.get("reasoning_tokens") or 0)
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        raw_cached = prompt_details.get("cached_tokens")
+        if raw_cached is None:
+            raw_cached = usage.get("prompt_cache_hit_tokens")
+        cached_tok = max(0, int(raw_cached or 0))
+        if p_tok > 0:
+            cached_tok = min(p_tok, cached_tok)
         return (
             text,
             {
@@ -1699,9 +1816,11 @@ class VlmClient:
                 "completion_tokens": c_tok,
                 "total_tokens": t_tok,
                 "reasoning_tokens": r_tok,
+                "cached_tokens": cached_tok,
             },
             {
                 "finish_reason": choices[0].get("finish_reason"),
+                "cached_tokens": cached_tok,
                 "reasoning_included_in_completion": not (
                     r_tok > 0 and t_tok >= (p_tok + c_tok + r_tok)
                 ),
@@ -1721,6 +1840,7 @@ class VlmClient:
         top_p: float | None = None,
         json_mode: bool = True,
         force_new_connection: bool = False,
+        image_detail: str | None = None,
         base_url_override: str | None = None,
         api_key_override: str | None = None,
     ) -> tuple[str, dict[str, int], dict[str, Any]]:
@@ -1737,7 +1857,11 @@ class VlmClient:
         sys_instruction, contents = messages_to_gemini_payload(messages)
         n_images, est_text_tokens = count_gemini_payload_media(sys_instruction, contents)
         eff_media_res = self._media_resolution_for_request(
-            model, n_images, provider="gemini", base_url=eff_base
+            model,
+            n_images,
+            provider="gemini",
+            base_url=eff_base,
+            image_detail=image_detail,
         )
         eff_thinking = bool(thinking) and self.thinking_mode != "disabled"
         eff_thinking_level = None if self.thinking_mode == "disabled" else thinking_level
@@ -1820,6 +1944,7 @@ class VlmClient:
         answer_text, usage, meta = parse_gemini_response(data, secret=api_key)
         meta["n_images"] = n_images
         meta["est_text_tokens"] = est_text_tokens
+        meta["media_resolution"] = eff_media_res
         return answer_text, usage, meta
 
     def _call_once_with_http_retries(
@@ -1835,6 +1960,7 @@ class VlmClient:
         top_p: float | None = None,
         json_mode: bool = True,
         force_new_connection: bool = False,
+        image_detail: str | None = None,
         provider_override: str | None = None,
         base_url_override: str | None = None,
         api_key_override: str | None = None,
@@ -1857,6 +1983,7 @@ class VlmClient:
                         top_p=top_p,
                         json_mode=json_mode,
                         force_new_connection=force_new_connection or (attempt > 0),
+                        image_detail=image_detail,
                         base_url_override=base_url_override,
                         api_key_override=api_key_override,
                     )
@@ -1987,6 +2114,7 @@ class VlmClient:
         eff_top_p: float | None,
         json_mode: bool,
         tracker: BudgetTracker,
+        image_detail: str | None = None,
         provider_override: str | None = None,
         base_url_override: str | None = None,
         api_key_override: str | None = None,
@@ -2017,6 +2145,7 @@ class VlmClient:
                         top_p=eff_top_p,
                         json_mode=json_mode,
                         force_new_connection=force_new_conn,
+                        image_detail=image_detail,
                         provider_override=eff_provider,
                         base_url_override=base_url_override,
                         api_key_override=api_key_override,
@@ -2025,12 +2154,16 @@ class VlmClient:
                 tracker.release()
             self._check_cancelled()
             elapsed = time.perf_counter() - t0
+            cached_tok = int(
+                usage.get("cached_tokens", meta.get("cached_tokens", 0)) or 0
+            )
             tracker.record(
                 stage=stage,
                 model=eff_model,
                 prompt_tokens=usage["prompt_tokens"],
                 completion_tokens=usage["completion_tokens"],
                 total_tokens=usage["total_tokens"],
+                cached_tokens=cached_tok,
                 reasoning_tokens=usage["reasoning_tokens"],
                 reasoning_included_in_completion=meta.get("reasoning_included_in_completion"),
                 elapsed_s=elapsed,
@@ -2044,13 +2177,18 @@ class VlmClient:
                 provider=eff_provider,
                 base_url=base_url_override or self.base_url,
             ):
+                eff_min_tpi = effective_vision_min_tokens_per_image(
+                    self.vision_min_tokens_per_image,
+                    image_detail=image_detail,
+                    media_resolution=meta.get("media_resolution"),
+                )
                 is_blind, tok_per_img, eff_img_toks, density_src = (
                     evaluate_vision_token_density(
                         n_images=n_images,
                         prompt_tokens=usage["prompt_tokens"],
                         exact_image_tokens=meta.get("image_prompt_tokens"),
                         est_text_tokens=int(meta.get("est_text_tokens") or 0),
-                        min_tokens_per_image=self.vision_min_tokens_per_image,
+                        min_tokens_per_image=eff_min_tpi,
                     )
                 )
                 if is_blind:
@@ -2065,7 +2203,7 @@ class VlmClient:
                         usage["prompt_tokens"],
                         eff_img_toks,
                         float(tok_per_img or 0.0),
-                        self.vision_min_tokens_per_image,
+                        eff_min_tpi,
                         density_src,
                         blind_retries_used,
                         max_blind,
@@ -2094,7 +2232,7 @@ class VlmClient:
                         f"prompt_tokens={usage['prompt_tokens']}, "
                         f"eff_img_tokens={eff_img_toks}, "
                         f"tok_per_img={float(tok_per_img or 0.0):.1f} < "
-                        f"{self.vision_min_tokens_per_image}, src={density_src})"
+                        f"{eff_min_tpi}, src={density_src})"
                     )
                     if self.vision_blind_node_on_exhaust == "warn":
                         logger.error(
@@ -2154,6 +2292,7 @@ class VlmClient:
         json_mode: bool = True,
         jpeg_quality: int = 74,
         text_first: bool = False,
+        image_detail: Literal["auto", "low", "high"] | None = None,
         budget: BudgetTracker | None = None,
     ) -> dict[str, Any]:
         """Call VLM endpoint and parse a JSON dict, with circuit breaker, retries, and opt-in fallback."""
@@ -2164,6 +2303,9 @@ class VlmClient:
         stage_cfg = self._stage_configs.get(norm_stage, {})
         eff_temp = temperature if temperature is not None else stage_cfg.get("temperature", self.temperature)
         eff_top_p = top_p if top_p is not None else stage_cfg.get("top_p", self.top_p)
+        eff_image_detail = normalize_image_detail(
+            image_detail if image_detail is not None else stage_cfg.get("image_detail")
+        )
         eff_thinking_level = (
             thinking_level
             if thinking_level is not None
@@ -2183,6 +2325,7 @@ class VlmClient:
                 labels=labels,
                 jpeg_quality=jpeg_quality,
                 text_first=text_first,
+                image_detail=eff_image_detail,
             )
         elif images:
             # Attach images to last user message if both messages & images passed
@@ -2200,6 +2343,7 @@ class VlmClient:
                 labels=labels,
                 jpeg_quality=jpeg_quality,
                 text_first=text_first,
+                image_detail=eff_image_detail,
             )
             replaced = False
             for i in range(len(eff_messages) - 1, -1, -1):
@@ -2211,6 +2355,8 @@ class VlmClient:
                 eff_messages.extend(built)
         else:
             eff_messages = messages
+            if eff_image_detail is None:
+                eff_image_detail = _infer_messages_image_detail(eff_messages)
 
         tracker = budget or self.budget
         can_fallback = bool(
@@ -2238,6 +2384,7 @@ class VlmClient:
                 eff_top_p=eff_top_p,
                 json_mode=json_mode,
                 tracker=tracker,
+                image_detail=eff_image_detail,
             )
             if self.circuit_breaker is not None:
                 self.circuit_breaker.record_success()
@@ -2277,6 +2424,7 @@ class VlmClient:
                 eff_top_p=eff_top_p,
                 json_mode=json_mode,
                 tracker=tracker,
+                image_detail=eff_image_detail,
                 provider_override=fb_provider,
                 base_url_override=fb_base,
                 api_key_override=fb_key,

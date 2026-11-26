@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import math
 from typing import Any, Sequence
 
 import numpy as np
@@ -547,6 +548,26 @@ def _resolve_overlaps(
     return non_overlap
 
 
+def _plan_s4b_frame_count(
+    win_start: float,
+    win_end: float,
+    *,
+    refine_step_s: float = 0.5,
+    refine_min_frames: int = 4,
+    refine_max_frames: int = 18,
+    dynamic_refine_frames: bool = True,
+) -> int:
+    """Compute Stage 4B dense refinement frame count, dynamically capped for short windows."""
+    hi = max(2, int(refine_max_frames))
+    if not dynamic_refine_frames:
+        return hi
+    lo = min(hi, max(2, int(refine_min_frames)))
+    span = max(0.05, float(win_end) - float(win_start))
+    step = max(0.1, float(refine_step_s))
+    needed = int(math.ceil(span / step)) + 1
+    return min(hi, max(lo, needed))
+
+
 def run_stage4b_verify(
     view: EpisodeView | None = None,
     *,
@@ -589,9 +610,12 @@ def run_stage4b_verify(
     margin_s = float(s4_cfg.get("refine_margin_s", 1.5))
     step_s = float(s4_cfg.get("refine_step_s", 0.5))
     max_frames = int(s4_cfg.get("refine_max_frames", 18))
+    min_frames = int(s4_cfg.get("refine_min_frames", 4))
+    dynamic_refine_frames = bool(s4_cfg.get("dynamic_refine_frames", True))
     cell_w = int(s4_cfg.get("cell_w", 384))
     cell_h = int(s4_cfg.get("cell_h", 216))
     quality = int(s4_cfg.get("quality", 76))
+    image_detail = s4_cfg.get("image_detail", "auto")
     thinking = bool(s4_cfg.get("thinking", False))
     refine_budget = int(s4_cfg.get("refine_thinking_budget", 1280))
     refine_max_tokens = int(s4_cfg.get("refine_max_tokens", 1536))
@@ -615,8 +639,14 @@ def run_stage4b_verify(
                 return kin_verified
         w0 = round(max(0.0, cand.t_start - margin_s), 3)
         w1 = round(min(dur, cand.t_end + margin_s), 3)
-        span = max(0.05, w1 - w0)
-        n_frames = min(max(2, max_frames), max(2, int(np.floor(span / max(0.1, step_s))) + 1))
+        n_frames = _plan_s4b_frame_count(
+            w0,
+            w1,
+            refine_step_s=step_s,
+            refine_min_frames=min_frames,
+            refine_max_frames=max_frames,
+            dynamic_refine_frames=dynamic_refine_frames,
+        )
         t_list = sorted({round(float(t), 3) for t in np.linspace(w0, w1, n_frames)})
         tiles: list[np.ndarray] = []
         for t in t_list:
@@ -660,6 +690,7 @@ def run_stage4b_verify(
                 "thinking_budget": refine_budget,
                 "max_tokens": refine_max_tokens,
                 "jpeg_quality": quality,
+                "image_detail": image_detail,
                 "budget": budget,
             }
             if model_override is not None:

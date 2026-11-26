@@ -367,6 +367,7 @@ class StageUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cached_tokens: int = 0
     elapsed_s: float = 0.0
     estimated_cost_usd: float = 0.0
     cache_hit: bool = False
@@ -377,6 +378,7 @@ class UsageSummary(BaseModel):
 
     stages: list[StageUsage] = Field(default_factory=list)
     total_tokens: int = 0
+    total_cached_tokens: int = 0
     total_elapsed_s: float = 0.0
     total_cost_usd: float = 0.0
 

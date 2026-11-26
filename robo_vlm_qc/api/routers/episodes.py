@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -69,6 +70,9 @@ def _format_episode_item(state: AppState, row: dict[str, Any]) -> dict[str, Any]
     except Exception:
         cam_roles = {}
     rp = row.get("resolved_passed")
+    raw_tok = row.get("tokens_total")
+    raw_cached = row.get("cached_tokens")
+    raw_cost = row.get("cost_usd")
     return {
         "episode_id": row["episode_id"],
         "dataset": row["dataset"],
@@ -91,6 +95,9 @@ def _format_episode_item(state: AppState, row: dict[str, Any]) -> dict[str, Any]
         "badcase_count": int(row["badcase_count"] or 0),
         "unknown_count": int(row["unknown_count"] or 0),
         "guardrail_downgraded": state.repo.episode_guardrail_downgraded(row),
+        "tokens_total": None if raw_tok is None else int(raw_tok),
+        "cached_tokens": None if raw_cached is None else int(raw_cached),
+        "estimated_cost_usd": None if raw_cost is None else float(raw_cost),
         "updated_at": float(row["updated_at"]),
     }
 
@@ -713,6 +720,9 @@ def list_episode_runs(
             "label_version": r["label_version"],
             "few_shot_pack_id": r["few_shot_pack_id"],
             "tokens_total": int(r["tokens_total"] or 0),
+            "cached_tokens": int(r.get("cached_tokens") or 0),
+            "estimated_cost_usd": float(r.get("cost_usd") or 0.0),
+            "elapsed_s": float(r.get("elapsed_s") or 0.0),
             "is_eval_sandbox": bool(r["is_eval_sandbox"]),
         }
         for r in runs_raw
@@ -722,6 +732,29 @@ def list_episode_runs(
         "active_run_id": row["active_run_id"],
         "runs": runs,
     }
+
+
+def _make_strong_etag(*parts: Any) -> str:
+    raw = "|".join(str(p) for p in parts).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:32]
+    return f'"{digest}"'
+
+
+def _etag_matches(if_none_match: str | None, etag: str) -> bool:
+    if not if_none_match:
+        return False
+    target = etag.strip()
+    if target.startswith("W/"):
+        target = target[2:].strip()
+    for candidate in if_none_match.split(","):
+        tok = candidate.strip()
+        if tok == "*":
+            return True
+        if tok.startswith("W/"):
+            tok = tok[2:].strip()
+        if tok == target:
+            return True
+    return False
 
 
 def _resolve_camera_name(meta: Any, camera: str | None) -> str:
@@ -738,11 +771,10 @@ def _resolve_camera_name(meta: Any, camera: str | None) -> str:
     )
 
 
-def _read_jpeg_frame_sync(state: AppState, ep_id: str, camera: str | None, t_s: float) -> bytes:
+def _decode_jpeg_frame_sync(
+    state: AppState, meta: Any, cam: str, t_clamped: float
+) -> bytes:
     cfg = state.get_config()
-    meta = state.repo.get_episode_meta(ep_id)
-    cam = _resolve_camera_name(meta, camera)
-    t_clamped = max(0.0, min(float(meta.duration_s), float(t_s)))
     with state.open_view(meta, cfg) as view:
         rgb = view.media.read_frame_rgb(cam, t_clamped)
     return encode_jpeg_bytes(rgb, quality=85)
@@ -751,6 +783,7 @@ def _read_jpeg_frame_sync(state: AppState, ep_id: str, camera: str | None, t_s: 
 @router.get("/{ep_id:path}/frame")
 async def get_episode_frame(
     ep_id: str,
+    request: Request,
     camera: str | None = Query(default=None),
     t_s: float = Query(...),
     auth: AuthContext = Depends(require_auth),
@@ -760,21 +793,39 @@ async def get_episode_frame(
     if not math.isfinite(t_s):
         raise HTTPException(status_code=400, detail="t_s must be finite")
     try:
-        jpeg_bytes = await run_in_threadpool(_read_jpeg_frame_sync, state, ep_id, camera, t_s)
+        meta = await run_in_threadpool(state.repo.get_episode_meta, ep_id)
     except (NotFoundError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return Response(content=jpeg_bytes, media_type="image/jpeg")
+    cam = _resolve_camera_name(meta, camera)
+    t_clamped = max(0.0, min(float(meta.duration_s), float(t_s)))
+    etag = _make_strong_etag("frame", ep_id, meta.source_mtime, cam, round(t_clamped, 4))
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "private, max-age=3600",
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    try:
+        jpeg_bytes = await run_in_threadpool(
+            _decode_jpeg_frame_sync, state, meta, cam, t_clamped
+        )
+    except (NotFoundError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(content=jpeg_bytes, media_type="image/jpeg", headers=headers)
 
 
-def _build_preview_sync(state: AppState, ep_id: str, camera: str | None, hd: bool) -> Any:
+def _build_preview_sync(
+    state: AppState, ep_id: str, camera: str | None, hd: bool
+) -> tuple[Any, Any, str]:
     cfg = state.get_config()
     meta = state.repo.get_episode_meta(ep_id)
     cam = _resolve_camera_name(meta, camera)
     cached = state.preview_cache.preview_path(meta.dataset, meta.stem, cam, hd=hd)
     if cached.is_file() and cached.stat().st_mtime >= meta.source_mtime:
-        return cached
+        state.preview_cache.touch_access(cached)
+        return cached, meta, cam
     with state.open_view(meta, cfg) as view:
-        return state.preview_cache.get_or_build(
+        mp4_path = state.preview_cache.get_or_build(
             view.media,
             dataset=meta.dataset,
             stem=meta.stem,
@@ -782,22 +833,47 @@ def _build_preview_sync(state: AppState, ep_id: str, camera: str | None, hd: boo
             source_mtime=meta.source_mtime,
             hd=hd,
         )
+    return mp4_path, meta, cam
 
 
 @router.get("/{ep_id:path}/preview")
 async def get_episode_preview(
     ep_id: str,
+    request: Request,
     camera: str | None = Query(default=None),
     hd: bool = Query(default=False),
     auth: AuthContext = Depends(require_auth),
     state: AppState = Depends(get_app_state),
-) -> FileResponse:
+) -> Response:
     _ = auth
     try:
-        mp4_path = await run_in_threadpool(_build_preview_sync, state, ep_id, camera, hd)
+        mp4_path, meta, cam = await run_in_threadpool(
+            _build_preview_sync, state, ep_id, camera, hd
+        )
+        st = mp4_path.stat()
     except (NotFoundError, FileNotFoundError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return FileResponse(path=mp4_path, media_type="video/mp4", filename=mp4_path.name)
+    etag = _make_strong_etag(
+        "preview",
+        ep_id,
+        meta.source_mtime,
+        cam,
+        bool(hd),
+        st.st_size,
+        int(st.st_mtime),
+    )
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "private, max-age=86400",
+    }
+    if _etag_matches(request.headers.get("if-none-match"), etag):
+        return Response(status_code=304, headers=headers)
+    return FileResponse(
+        path=mp4_path,
+        media_type="video/mp4",
+        filename=mp4_path.name,
+        headers=headers,
+    )
 
 
 @router.get("/{ep_id:path}")
@@ -841,4 +917,22 @@ def get_episode_detail(
         payload["guardrail_downgraded"] = state.repo.episode_guardrail_downgraded(row)
         payload["selected_run_id"] = row["active_run_id"]
         payload["is_historical_run_view"] = False
+
+    target_run_id = eff_run_id or row["active_run_id"]
+    usage_payload: dict[str, Any] | None = None
+    if target_run_id:
+        try:
+            run_art = state.repo.get_vlm_run(str(target_run_id))
+            usage_payload = run_art.usage.model_dump(mode="json")
+            if "total_cached_tokens" not in usage_payload:
+                usage_payload["total_cached_tokens"] = int(
+                    getattr(run_art.usage, "total_cached_tokens", 0)
+                    or sum(
+                        int(getattr(s, "cached_tokens", 0) or 0)
+                        for s in run_art.usage.stages
+                    )
+                )
+        except NotFoundError:
+            usage_payload = None
+    payload["usage"] = usage_payload
     return payload

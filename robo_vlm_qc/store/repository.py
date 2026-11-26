@@ -475,41 +475,43 @@ class Repository:
         has_unknown: bool | None = None,
         claimed_by: str | None = None,
         search: str | None = None,
+        table_alias: str = "",
     ) -> tuple[str, list[Any]]:
+        prefix = f"{table_alias}." if table_alias else ""
         clauses: list[str] = []
         params: list[Any] = []
         status_values = self._normalize_status_values(status)
         if status_values is not None:
             if len(status_values) == 1:
-                clauses.append("status = ?")
+                clauses.append(f"{prefix}status = ?")
                 params.append(status_values[0])
             else:
                 placeholders = ", ".join("?" for _ in status_values)
-                clauses.append(f"status IN ({placeholders})")
+                clauses.append(f"{prefix}status IN ({placeholders})")
                 params.extend(status_values)
         if dataset is not None:
-            clauses.append("dataset = ?")
+            clauses.append(f"{prefix}dataset = ?")
             params.append(dataset)
         if task_id is not None:
-            clauses.append("task_id = ?")
+            clauses.append(f"{prefix}task_id = ?")
             params.append(task_id)
         if adapter_type is not None:
-            clauses.append("adapter_type = ?")
+            clauses.append(f"{prefix}adapter_type = ?")
             params.append(adapter_type)
         if passed is not None:
-            clauses.append("resolved_passed = ?")
+            clauses.append(f"{prefix}resolved_passed = ?")
             params.append(1 if passed else 0)
         if has_unknown is True:
-            clauses.append("unknown_count > 0")
+            clauses.append(f"{prefix}unknown_count > 0")
         elif has_unknown is False:
-            clauses.append("unknown_count = 0")
+            clauses.append(f"{prefix}unknown_count = 0")
         if claimed_by is not None:
-            clauses.append("claimed_by = ?")
+            clauses.append(f"{prefix}claimed_by = ?")
             params.append(claimed_by)
         if search is not None:
             q = search.strip()
             if q:
-                clauses.append("episode_id LIKE ? ESCAPE '\\'")
+                clauses.append(f"{prefix}episode_id LIKE ? ESCAPE '\\'")
                 params.append(f"%{self._escape_like(q)}%")
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return where_sql, params
@@ -540,9 +542,10 @@ class Repository:
             has_unknown=has_unknown,
             claimed_by=claimed_by,
             search=search,
+            table_alias="e",
         )
         if sort_by is None:
-            order_sql = "ORDER BY dataset ASC, episode_id ASC"
+            order_sql = "ORDER BY e.dataset ASC, e.episode_id ASC"
         else:
             col = self._SORT_COLUMN_MAP.get(sort_by)
             if col is None:
@@ -551,19 +554,23 @@ class Repository:
             if dir_sql is None:
                 raise ValueError(f"Invalid sort_dir: {sort_dir!r}")
             if col == "episode_id":
-                order_sql = f"ORDER BY episode_id {dir_sql}"
+                order_sql = f"ORDER BY e.episode_id {dir_sql}"
             else:
                 order_sql = (
-                    f"ORDER BY CASE WHEN {col} IS NULL THEN 1 ELSE 0 END ASC, "
-                    f"{col} {dir_sql}, episode_id ASC"
+                    f"ORDER BY CASE WHEN e.{col} IS NULL THEN 1 ELSE 0 END ASC, "
+                    f"e.{col} {dir_sql}, e.episode_id ASC"
                 )
         base_sql = f"""
-            SELECT episode_id, dataset, task_id, adapter_type, source_uri,
-                   source_mtime, duration_s, fps, has_kinematics, camera_roles_json,
-                   status, active_run_id, active_rev_id, claimed_by, claim_expires_at,
-                   resolved_passed, cut_ratio, mask_ratio, badcase_count,
-                   unknown_count, updated_at
-              FROM episodes
+            SELECT e.episode_id, e.dataset, e.task_id, e.adapter_type, e.source_uri,
+                   e.source_mtime, e.duration_s, e.fps, e.has_kinematics, e.camera_roles_json,
+                   e.status, e.active_run_id, e.active_rev_id, e.claimed_by, e.claim_expires_at,
+                   e.resolved_passed, e.cut_ratio, e.mask_ratio, e.badcase_count,
+                   e.unknown_count, e.updated_at,
+                   r.tokens_total AS tokens_total,
+                   r.cached_tokens AS cached_tokens,
+                   r.cost_usd AS cost_usd
+              FROM episodes e
+              LEFT JOIN vlm_runs r ON e.active_run_id = r.run_id
               {where_sql}
              {order_sql}
         """
@@ -810,6 +817,20 @@ class Repository:
         total_tokens = artifact.usage.total_tokens or sum(
             s.total_tokens for s in artifact.usage.stages
         )
+        total_cached_tokens = int(
+            getattr(artifact.usage, "total_cached_tokens", 0)
+            or sum(
+                int(getattr(s, "cached_tokens", 0) or 0)
+                for s in artifact.usage.stages
+            )
+        )
+        total_cost_usd = float(
+            getattr(artifact.usage, "total_cost_usd", 0.0)
+            or sum(
+                float(getattr(s, "estimated_cost_usd", 0.0) or 0.0)
+                for s in artifact.usage.stages
+            )
+        )
         total_elapsed = artifact.usage.total_elapsed_s or sum(
             s.elapsed_s for s in artifact.usage.stages
         )
@@ -835,8 +856,8 @@ class Repository:
                     run_id, episode_id, is_eval_sandbox, model_routing_json,
                     prompt_version, label_version, task_spec_version,
                     few_shot_pack_id, artifact_path, status,
-                    tokens_total, elapsed_s, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tokens_total, cached_tokens, cost_usd, elapsed_s, error_message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact.run_id,
@@ -850,6 +871,8 @@ class Repository:
                     rel_path.as_posix(),
                     "completed",
                     total_tokens,
+                    total_cached_tokens,
+                    total_cost_usd,
                     total_elapsed,
                     None,
                     artifact.created_at,
@@ -901,8 +924,8 @@ class Repository:
                 """
                 SELECT run_id, episode_id, is_eval_sandbox, model_routing_json,
                        prompt_version, label_version, task_spec_version,
-                       few_shot_pack_id, status, tokens_total, elapsed_s,
-                       error_message, created_at
+                       few_shot_pack_id, status, tokens_total, cached_tokens,
+                       cost_usd, elapsed_s, error_message, created_at
                   FROM vlm_runs
                  WHERE episode_id = ?
                  ORDER BY created_at DESC, rowid DESC
@@ -916,6 +939,8 @@ class Repository:
             d = dict(r)
             d["is_eval_sandbox"] = bool(d.get("is_eval_sandbox"))
             d["tokens_total"] = int(d.get("tokens_total") or 0)
+            d["cached_tokens"] = int(d.get("cached_tokens") or 0)
+            d["cost_usd"] = float(d.get("cost_usd") or 0.0)
             d["elapsed_s"] = float(d.get("elapsed_s") or 0.0)
             d["created_at"] = float(d.get("created_at") or 0.0)
             out.append(d)

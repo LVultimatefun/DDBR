@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 import os
 import re
@@ -92,6 +93,101 @@ _PRESET_META: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+_COST_TIER_PRESETS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "fast",
+        "label": "Fast / Low Cost",
+        "description": "Lightweight vision models across all stages for fast triage and low-budget screening.",
+        "relative_cost_hint": "~0.15x",
+        "stage_models_by_provider": {
+            "openai_compat": {
+                "s1_grounding": "gpt-4o-mini",
+                "s2_macro": "gpt-4o-mini",
+                "s3_discover": "gpt-4o-mini",
+                "s4_verify": "gpt-4o-mini",
+                "s5_success": "gpt-4o-mini",
+            },
+            "gemini": {
+                "s1_grounding": "gemini-2.5-flash",
+                "s2_macro": "gemini-2.5-flash",
+                "s3_discover": "gemini-2.5-flash",
+                "s4_verify": "gemini-2.5-flash",
+                "s5_success": "gemini-2.5-flash",
+            },
+            "dashscope": {
+                "s1_grounding": "qwen-vl-plus",
+                "s2_macro": "qwen-vl-plus",
+                "s3_discover": "qwen-vl-plus",
+                "s4_verify": "qwen-vl-plus",
+                "s5_success": "qwen-vl-plus",
+            },
+        },
+    },
+    {
+        "id": "balanced",
+        "label": "Balanced (Recommended)",
+        "description": "Fast models for S1/S2/S5 and flagship models for S3 QC discovery and S4 verification.",
+        "relative_cost_hint": "~0.55x",
+        "stage_models_by_provider": {
+            "openai_compat": {
+                "s1_grounding": "gpt-4o-mini",
+                "s2_macro": "gpt-4o-mini",
+                "s3_discover": "gpt-4o",
+                "s4_verify": "gpt-4o",
+                "s5_success": "gpt-4o-mini",
+            },
+            "gemini": {
+                "s1_grounding": "gemini-2.5-flash",
+                "s2_macro": "gemini-2.5-flash",
+                "s3_discover": "gemini-2.5-pro",
+                "s4_verify": "gemini-2.5-pro",
+                "s5_success": "gemini-2.5-flash",
+            },
+            "dashscope": {
+                "s1_grounding": "qwen-vl-plus",
+                "s2_macro": "qwen-vl-plus",
+                "s3_discover": "qwen-vl-max",
+                "s4_verify": "qwen-vl-max",
+                "s5_success": "qwen-vl-plus",
+            },
+        },
+    },
+    {
+        "id": "high_precision",
+        "label": "High Precision",
+        "description": "Flagship vision models across all five stages for maximum boundary and verdict fidelity.",
+        "relative_cost_hint": "1.0x",
+        "stage_models_by_provider": {
+            "openai_compat": {
+                "s1_grounding": "gpt-4o",
+                "s2_macro": "gpt-4o",
+                "s3_discover": "gpt-4o",
+                "s4_verify": "gpt-4o",
+                "s5_success": "gpt-4o",
+            },
+            "gemini": {
+                "s1_grounding": "gemini-2.5-pro",
+                "s2_macro": "gemini-2.5-pro",
+                "s3_discover": "gemini-2.5-pro",
+                "s4_verify": "gemini-2.5-pro",
+                "s5_success": "gemini-2.5-pro",
+            },
+            "dashscope": {
+                "s1_grounding": "qwen-vl-max",
+                "s2_macro": "qwen-vl-max",
+                "s3_discover": "qwen-vl-max",
+                "s4_verify": "qwen-vl-max",
+                "s5_success": "qwen-vl-max",
+            },
+        },
+    },
+)
+
+
+def load_vlm_cost_tiers() -> list[dict[str, Any]]:
+    """Return cost/precision stage-routing preset tiers across supported providers."""
+    return copy.deepcopy(list(_COST_TIER_PRESETS))
 
 
 def mask_api_key(key: str | None) -> str:
@@ -358,6 +454,7 @@ def read_vlm_settings_dict(
         "thinking_mode": thinking_mode,
         "stage_models": stage_models,
         "presets": load_vlm_presets(config_dir),
+        "cost_tiers": load_vlm_cost_tiers(),
     }
 
 

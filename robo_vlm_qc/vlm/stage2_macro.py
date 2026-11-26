@@ -20,6 +20,7 @@ from ..models.annotation import (
 )
 from ..models.taxonomy import TaskSpec
 from .client import BudgetTracker, VlmClient, check_client_cancelled
+from .frame_dedup import deduplicate_frames, format_skipped_ranges_note
 from .prompt_builder import (
     PromptBuilder,
     format_grounding_summary,
@@ -271,6 +272,10 @@ def run_stage2_macro(
     cell_w = int(s2_cfg.get("cell_w", 320))
     cell_h = int(s2_cfg.get("cell_h", 180))
     quality = int(s2_cfg.get("quality", 70))
+    image_detail = s2_cfg.get("image_detail", "low")
+    dedup_enabled = bool(s2_cfg.get("static_dedup_enabled", True))
+    dedup_mad_thresh = float(s2_cfg.get("static_dedup_mad_thresh", 4.5))
+    dedup_max_gap_s = float(s2_cfg.get("static_dedup_max_gap_s", 6.0))
     thinking = bool(s2_cfg.get("thinking", False))
     thinking_budget = (
         int(thinking_budget_override)
@@ -293,6 +298,21 @@ def run_stage2_macro(
 
     check_client_cancelled(cl)
 
+    dedup_note = ""
+    if dedup_enabled and len(tiles) > 2:
+        dedup_res = deduplicate_frames(
+            tiles,
+            times_s,
+            mad_threshold=dedup_mad_thresh,
+            max_gap_s=dedup_max_gap_s,
+            min_keep=2,
+            crop_top_px=26,
+        )
+        if dedup_res.dropped_count > 0:
+            tiles = [tiles[i] for i in dedup_res.kept_indices]
+            times_s = [times_s[i] for i in dedup_res.kept_indices]
+            dedup_note = format_skipped_ranges_note(dedup_res.skipped_ranges)
+
     pb = prompt_builder or (PromptBuilder(cm) if cm is not None else None)
     if pb is not None:
         sys_p, usr_p = pb.build_s2(
@@ -310,6 +330,8 @@ def run_stage2_macro(
         usr_p = f"Task: {t_spec.task_id} (duration {ev.duration_s:.2f}s)"
         if g_txt:
             usr_p += f"\n[Stage 1 Grounding Object State Summary]:\n{g_txt}"
+    if dedup_note:
+        usr_p = f"{usr_p}\n{dedup_note}"
 
     chat_kwargs: dict[str, Any] = {
         "stage": "s2_macro",
@@ -321,6 +343,7 @@ def run_stage2_macro(
         "thinking_budget": thinking_budget,
         "max_tokens": max_tokens,
         "jpeg_quality": quality,
+        "image_detail": image_detail,
         "budget": budget,
     }
     if model_override is not None:
@@ -485,6 +508,7 @@ def infer_subtasks_from_segments(
         "thinking_budget": thinking_budget,
         "max_tokens": max_tokens,
         "jpeg_quality": quality,
+        "image_detail": s2_cfg.get("image_detail", "low"),
         "budget": budget,
     }
     if model_override is not None:

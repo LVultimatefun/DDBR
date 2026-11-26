@@ -10,14 +10,22 @@ from .client import (
     VlmCircuitOpenError,
     VlmClient,
     VlmError,
+    effective_vision_min_tokens_per_image,
     estimate_stage_cost_usd,
     extract_json,
+    normalize_image_detail,
     parse_json,
     redact_secrets,
     resolve_client_stage_model,
     resolve_stage_model,
 )
 from .dag import VlmDag
+from .estimator import estimate_batch_vlm_cost
+from .frame_dedup import (
+    FrameDedupResult,
+    deduplicate_frames,
+    format_skipped_ranges_note,
+)
 from .prompt_builder import PromptBuilder, describe_camera_layout
 from .stage1_grounding import run_stage1_grounding
 from .stage2_macro import run_stage2_macro
@@ -35,6 +43,7 @@ __all__ = [
     "BaftTrackingOutput",
     "BudgetExceeded",
     "BudgetTracker",
+    "FrameDedupResult",
     "PromptBuilder",
     "StageCache",
     "TrackingConfig",
@@ -45,9 +54,14 @@ __all__ = [
     "VlmClient",
     "VlmDag",
     "VlmError",
+    "deduplicate_frames",
     "describe_camera_layout",
+    "effective_vision_min_tokens_per_image",
+    "estimate_batch_vlm_cost",
     "estimate_stage_cost_usd",
     "extract_json",
+    "format_skipped_ranges_note",
+    "normalize_image_detail",
     "parse_json",
     "redact_secrets",
     "resolve_client_stage_model",

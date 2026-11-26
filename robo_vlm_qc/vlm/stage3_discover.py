@@ -28,6 +28,7 @@ from .client import (
     VlmClient,
     check_client_cancelled,
 )
+from .frame_dedup import deduplicate_frames, format_skipped_ranges_note
 from .prompt_builder import PromptBuilder, format_window_kinematics_summary
 
 _FORBIDDEN_LEGACY = {"long_pause", "back_and_forth"}
@@ -71,6 +72,68 @@ def _plan_window_times(w0: float, w1: float, step_s: float) -> list[float]:
     if span < step:
         n = 2
     return sorted({round(float(t), 3) for t in np.linspace(w0, w1, n)})
+
+
+def _plan_adaptive_window_times(
+    w0: float,
+    w1: float,
+    *,
+    fine_step_s: float,
+    idle_step_s: float,
+    duration_s: float,
+    macro_stages: Sequence[MacroStage] = (),
+    transition_margin_s: float = 2.0,
+    calm_stage_min_duration_s: float = 5.0,
+    min_frames: int = 4,
+) -> list[float]:
+    """Sample finely near macro stage transitions & episode boundaries, coarser in calm stage interiors."""
+    dur = max(0.05, float(duration_s))
+    fine = max(0.2, float(fine_step_s))
+    coarse = max(fine, float(idle_step_s))
+    margin = max(0.0, float(transition_margin_s))
+    min_calm = max(0.0, float(calm_stage_min_duration_s))
+    eff_min_frames = max(2, int(min_frames))
+
+    boundaries: list[float] = [0.0, dur]
+    for st in macro_stages:
+        boundaries.append(float(st.t_start))
+        boundaries.append(float(st.t_end))
+
+    def _is_calm_interior(t: float) -> bool:
+        if not macro_stages:
+            return False
+        for b in boundaries:
+            if abs(t - b) <= margin + 1e-6:
+                return False
+        for st in macro_stages:
+            if st.t_start - 1e-6 <= t <= st.t_end + 1e-6:
+                if (st.t_end - st.t_start) > min_calm + 1e-6:
+                    return True
+        return False
+
+    times: list[float] = [round(float(w0), 3)]
+    cur = float(w0)
+    end = float(w1)
+    while cur < end - 1e-4:
+        mid_probe = min(end, cur + 0.5 * coarse)
+        step = coarse if (_is_calm_interior(cur) and _is_calm_interior(mid_probe)) else fine
+        nxt = min(end, cur + step)
+        if nxt <= cur + 1e-4:
+            break
+        r_nxt = round(nxt, 3)
+        if r_nxt > times[-1] + 1e-4:
+            times.append(r_nxt)
+        cur = nxt
+
+    r_end = round(end, 3)
+    if r_end > times[-1] + 1e-4:
+        times.append(r_end)
+
+    if len(times) < eff_min_frames and (end - float(w0)) >= 0.05:
+        extra = [round(float(t), 3) for t in np.linspace(float(w0), end, eff_min_frames)]
+        times = sorted(set(times) | set(extra))
+
+    return times
 
 
 def normalize_triplet_fields(
@@ -180,9 +243,15 @@ def run_stage3_discover(
     window_s = float(s3_cfg.get("window_s", 16.0))
     stride_s = float(s3_cfg.get("window_stride_s", 12.0))
     step_s = float(s3_cfg.get("window_step_s", 0.8))
+    adaptive_step_enabled = bool(s3_cfg.get("adaptive_step_enabled", True))
+    idle_step_s = float(s3_cfg.get("idle_step_s", 1.4))
     cell_w = int(s3_cfg.get("cell_w", 420))
     cell_h = int(s3_cfg.get("cell_h", 236))
     quality = int(s3_cfg.get("quality", 76))
+    image_detail = s3_cfg.get("image_detail", "auto")
+    dedup_enabled = bool(s3_cfg.get("static_dedup_enabled", True))
+    dedup_mad_thresh = float(s3_cfg.get("static_dedup_mad_thresh", 3.5))
+    dedup_max_gap_s = float(s3_cfg.get("static_dedup_max_gap_s", 3.2))
     thinking = bool(s3_cfg.get("thinking", False))
     thinking_budget = (
         int(thinking_budget_override)
@@ -198,7 +267,18 @@ def run_stage3_discover(
 
     def _run_window(w_idx: int, w0: float, w1: float) -> tuple[int, list[dict[str, Any]], Exception | None]:
         check_client_cancelled(cl)
-        t_list = _plan_window_times(w0, w1, step_s)
+        if adaptive_step_enabled:
+            t_list = _plan_adaptive_window_times(
+                w0,
+                w1,
+                fine_step_s=step_s,
+                idle_step_s=idle_step_s,
+                duration_s=ev.duration_s,
+                macro_stages=macro_stages,
+                min_frames=4,
+            )
+        else:
+            t_list = _plan_window_times(w0, w1, step_s)
         tiles: list[np.ndarray] = []
         for t in t_list:
             check_client_cancelled(cl)
@@ -208,6 +288,22 @@ def run_stage3_discover(
                 )
             )
         check_client_cancelled(cl)
+
+        dedup_note = ""
+        if dedup_enabled and len(tiles) > 2:
+            dedup_res = deduplicate_frames(
+                tiles,
+                t_list,
+                mad_threshold=dedup_mad_thresh,
+                max_gap_s=dedup_max_gap_s,
+                min_keep=2,
+                crop_top_px=26,
+            )
+            if dedup_res.dropped_count > 0:
+                tiles = [tiles[i] for i in dedup_res.kept_indices]
+                t_list = [t_list[i] for i in dedup_res.kept_indices]
+                dedup_note = format_skipped_ranges_note(dedup_res.skipped_ranges)
+
         kin_summary = format_window_kinematics_summary(ev.kinematics, w0, w1)
         if pb is not None:
             sys_p, usr_p = pb.build_s3(
@@ -228,6 +324,8 @@ def run_stage3_discover(
             )
             if kin_summary:
                 usr_p += f"\n[Window 30Hz Objective Kinematics Telemetry]:\n{kin_summary}"
+        if dedup_note:
+            usr_p = f"{usr_p}\n{dedup_note}"
         try:
             chat_kwargs: dict[str, Any] = {
                 "stage": "s3_discover",
@@ -239,6 +337,7 @@ def run_stage3_discover(
                 "thinking_budget": thinking_budget,
                 "max_tokens": max_tokens,
                 "jpeg_quality": quality,
+                "image_detail": image_detail,
                 "budget": budget,
             }
             if model_override is not None:

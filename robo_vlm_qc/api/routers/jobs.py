@@ -96,6 +96,14 @@ def _normalize_ingest_task_override(raw_task_id: str | None) -> str | None:
     return cleaned
 
 
+class JobEstimatePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    episode_ids: list[str]
+    stage: str | None = None
+    fresh: bool = False
+
+
 class JobCreatePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -251,12 +259,15 @@ def _run_job_worker(
             progress_lock = threading.Lock()
             results_map: dict[int, dict[str, Any]] = {}
             errors_map: dict[int, dict[str, str]] = {}
+            running_tokens = 0
+            running_cached = 0
+            running_cost = 0.0
 
             def _on_ep_status(ep_id_cb: str, st_cb: EpisodeStatus) -> None:
                 _publish_episode_status(state, ep_id_cb, st_cb)
 
             def _batch_one(idx: int, ep_id: str) -> None:
-                nonlocal done
+                nonlocal done, running_tokens, running_cached, running_cost
                 try:
                     if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
                         cancel_event.set()
@@ -278,10 +289,36 @@ def _run_job_worker(
                                     job_id, eid
                                 ),
                             )
+                        art_tokens = int(
+                            art.usage.total_tokens
+                            or sum(s.total_tokens for s in art.usage.stages)
+                        )
+                        art_cached = int(
+                            getattr(art.usage, "total_cached_tokens", 0)
+                            or sum(
+                                int(getattr(s, "cached_tokens", 0) or 0)
+                                for s in art.usage.stages
+                            )
+                        )
+                        art_cost = float(
+                            getattr(art.usage, "total_cost_usd", 0.0)
+                            or sum(
+                                float(getattr(s, "estimated_cost_usd", 0.0) or 0.0)
+                                for s in art.usage.stages
+                            )
+                        )
+                        art_elapsed = float(
+                            art.usage.total_elapsed_s
+                            or sum(s.elapsed_s for s in art.usage.stages)
+                        )
                         item_res: dict[str, Any] | None = {
                             "episode_id": ep_id,
                             "run_id": art.run_id,
                             "verdict": art.success.verdict,
+                            "tokens_total": art_tokens,
+                            "cached_tokens": art_cached,
+                            "estimated_cost_usd": round(art_cost, 6),
+                            "elapsed_s": round(art_elapsed, 4),
                         }
                         item_err: dict[str, str] | None = None
                     except VlmCancelledError:
@@ -304,13 +341,25 @@ def _run_job_worker(
                     with progress_lock:
                         if item_res is not None:
                             results_map[idx] = item_res
+                            running_tokens += int(item_res["tokens_total"])
+                            running_cached += int(item_res["cached_tokens"])
+                            running_cost += float(item_res["estimated_cost_usd"])
                         if item_err is not None:
                             errors_map[idx] = item_err
                         done += 1
                         if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
                             cancel_event.set()
                             return
-                        upd = state.repo.update_job(job_id, progress_done=done)
+                        live_summary = {
+                            "tokens_total": running_tokens,
+                            "cached_tokens": running_cached,
+                            "estimated_cost_usd": round(running_cost, 6),
+                            "results": [results_map[i] for i in sorted(results_map)],
+                            "errors": [errors_map[i] for i in sorted(errors_map)],
+                        }
+                        upd = state.repo.update_job(
+                            job_id, progress_done=done, summary=live_summary
+                        )
                         if upd["status"] != "cancelled":
                             state.sse.publish({"type": "job_update", "job": upd})
                 finally:
@@ -336,6 +385,11 @@ def _run_job_worker(
                 return
             results = [results_map[i] for i in sorted(results_map)]
             errors = [errors_map[i] for i in sorted(errors_map)]
+            summary_extra = {
+                "tokens_total": running_tokens,
+                "cached_tokens": running_cached,
+                "estimated_cost_usd": round(running_cost, 6),
+            }
 
         elif payload.job_type == "render_mp4":
             for ep_id in payload.episode_ids:
@@ -502,7 +556,16 @@ def _run_job_worker(
                 all_handles.extend(handles)
 
             upd_total = state.repo.update_job(
-                job_id, progress_total=len(all_handles), progress_done=0
+                job_id,
+                progress_total=len(all_handles),
+                progress_done=0,
+                summary={
+                    "discovered": len(all_handles),
+                    "inserted": 0,
+                    "updated": 0,
+                    "skipped": 0,
+                    "current_episode_id": None,
+                },
             )
             if upd_total["status"] != "cancelled":
                 state.sse.publish({"type": "job_update", "job": upd_total})
@@ -510,10 +573,12 @@ def _run_job_worker(
             inserted = 0
             updated = 0
             skipped = 0
+            last_episode_id: str | None = None
             for handle in all_handles:
                 if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
                     cancel_event.set()
                     return
+                current_episode_id = handle.episode_id
                 try:
                     src_resolved = Path(handle.source_uri).resolve()
                     if not is_within_allowed_roots(src_resolved, state.allowed_data_roots):
@@ -541,6 +606,7 @@ def _run_job_worker(
                                     "task_id": resolved_task,
                                 }
                             )
+                        current_episode_id = meta.episode_id
                         _, outcome = state.repo.ingest_episode(meta)
                         if outcome == "inserted":
                             inserted += 1
@@ -559,8 +625,19 @@ def _run_job_worker(
                         )
                 except Exception as exc:
                     errors.append({"episode_id": handle.episode_id, "error": str(exc)})
+                last_episode_id = current_episode_id
                 done += 1
-                upd = state.repo.update_job(job_id, progress_done=done)
+                upd = state.repo.update_job(
+                    job_id,
+                    progress_done=done,
+                    summary={
+                        "discovered": len(all_handles),
+                        "inserted": inserted,
+                        "updated": updated,
+                        "skipped": skipped,
+                        "current_episode_id": current_episode_id,
+                    },
+                )
                 if upd["status"] != "cancelled":
                     state.sse.publish({"type": "job_update", "job": upd})
 
@@ -569,6 +646,7 @@ def _run_job_worker(
                 "inserted": inserted,
                 "updated": updated,
                 "skipped": skipped,
+                "current_episode_id": last_episode_id,
             }
 
         if cancel_event.is_set() or state.repo.get_job(job_id)["status"] == "cancelled":
@@ -855,6 +933,43 @@ def create_job(
         state.clear_job_control(job["job_id"])
         raise
     return job
+
+
+@router.post("/api/jobs/estimate")
+def estimate_job_cost(
+    payload: JobEstimatePayload,
+    auth: AuthContext = Depends(require_lead),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Estimate token usage and USD cost for a batch VLM job without calling VLM APIs."""
+    _ = auth
+    _resolve_stage_options(payload.stage, payload.fresh)
+    unique_ids = list(
+        dict.fromkeys(str(eid).strip() for eid in payload.episode_ids if str(eid).strip())
+    )
+    for eid in unique_ids:
+        try:
+            state.repo.get_episode_row(eid)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    from ...vlm.estimator import estimate_batch_vlm_cost
+
+    cfg = state.get_config()
+    eff_stage = payload.stage.strip() if payload.stage and payload.stage.strip() else "all"
+    try:
+        return estimate_batch_vlm_cost(
+            cfg,
+            state.repo,
+            state.workspace,
+            unique_ids,
+            stage=eff_stage,
+            fresh=bool(payload.fresh),
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/api/jobs/{job_id}/artifact")

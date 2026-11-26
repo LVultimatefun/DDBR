@@ -982,6 +982,9 @@ def run_stage1_grounding(
     batch_size = max(1, int(s1_cfg.get("batch_size", 4)))
     batch_concurrency = max(1, int(s1_cfg.get("batch_concurrency", 3)))
     reference_anchor_enabled = bool(s1_cfg.get("reference_anchor_enabled", True))
+    pass0_image_detail = s1_cfg.get("pass0_image_detail", "low")
+    s1_image_detail = s1_cfg.get("image_detail", "high")
+    merge_pass0_short_episode = bool(s1_cfg.get("merge_pass0_short_episode", True))
     static_min_frames = int(s1_cfg.get("static_container_min_frames", 5))
     jitter_tol_px = float(s1_cfg.get("static_jitter_tol_px_1280", 85.0)) * (ref_w / 1280.0)
 
@@ -1004,69 +1007,153 @@ def run_stage1_grounding(
         check_cancelled=_check_cancelled,
     )
 
+    def _has_any_grounding_box(parsed: dict[int, dict[str, Any]]) -> bool:
+        for objs in parsed.values():
+            if not isinstance(objs, dict):
+                continue
+            for entry in objs.values():
+                if isinstance(entry, dict) and (
+                    "bbox" in entry or "bbox_norm_1000" in entry or "visible" in entry
+                ):
+                    return True
+        return False
+
     # Lock canonical grounding object vocabulary:
     # 1) explicit custom_objects override, else
     # 2) preconfigured task.grounding_objects, else
-    # 3) Pass-0 lightweight canonical discovery on 4-6 evenly spaced overview frames
+    # 3) Short-episode merged Pass-0 + Batch-0 (when enabled and len(keyframes) <= batch_size), else
+    # 4) Pass-0 lightweight canonical discovery on 4-6 evenly spaced overview frames
     effective_task = t_spec
+    merged_short_objs: dict[int, dict[str, Any]] | None = None
     custom_specs = build_custom_grounding_objects(custom_objects)
-    if custom_specs:
-        effective_task = t_spec.model_copy(update={"grounding_objects": custom_specs})
-    elif (
-        not t_spec.grounding_objects
+    needs_pass0 = (
+        not custom_specs
+        and not t_spec.grounding_objects
         and len(resized_frames) > 1
         and bool(s1_cfg.get("canonical_discovery_enabled", True))
-    ):
-        disc_indices = _select_discovery_indices(
-            len(resized_frames),
-            max_frames=int(s1_cfg.get("canonical_discovery_frames", 5)),
+    )
+
+    if custom_specs:
+        effective_task = t_spec.model_copy(update={"grounding_objects": custom_specs})
+    elif needs_pass0:
+        can_merge_short = (
+            merge_pass0_short_episode
+            and batch_size > 1
+            and len(resized_frames) <= batch_size
         )
-        if disc_indices:
+        run_separate_pass0 = True
+        if can_merge_short:
             _check_cancelled()
             if pb is not None:
-                disc_sys, disc_usr = pb.build_s1_discovery(
+                comb_sys, comb_usr = pb.build_s1_discover_and_ground(
                     task=t_spec, camera_roles=ev.camera_roles
                 )
             else:
-                disc_sys = (
-                    "You are an embodied manipulation visual grounding expert (2D Grounding canonical vocabulary discovery). "
-                    "Inspect the overview keyframes and select 1 to 4 task-relevant physical objects prioritized by manipulator/hand interaction and target container/receptacle. "
-                    'Output strict JSON only: {"canonical_objects": [{"id": "snake_case_id", "name": str, "desc": str, "is_static": bool}]}.'
+                comb_sys = (
+                    "You are an embodied manipulation visual grounding expert "
+                    "(2D Grounding canonical vocabulary discovery and batched keyframe grounding, "
+                    "supporting both robot arms/grippers and human hands). "
+                    "Select 1 to 4 task-relevant physical objects and ground them in every frame with normalized [0, 1000] bboxes. "
+                    'Output strict JSON only: {"canonical_objects": [{"id": "snake_case_id", "name": str, "desc": str, "is_static": bool}], '
+                    '"frames": [{"frame_index": 0, "time_s": 0.0, "objects": {obj_id: {"visible": bool, "bbox": [x1,y1,x2,y2], "state": str, "status_kind": "neutral|warn|error|good"}}}]}.'
                 )
-                disc_usr = (
+                comb_usr = (
                     f"Task: {t_spec.task_id}\n"
-                    "Identify 1 to 4 canonical physical objects actively manipulated by robot arms/grippers or human hands plus target receptacle."
+                    "Identify 1 to 4 canonical physical objects and output their 2D bounding boxes for every keyframe in a single JSON response."
                 )
-            disc_frames = [resized_frames[i] for i in disc_indices]
-            disc_times = [times_s[i] for i in disc_indices]
+            short_batch = [
+                (i, float(times_s[i]), resized_frames[i])
+                for i in range(len(resized_frames))
+            ]
             try:
-                disc_resp = cl.chat_json(
+                comb_resp = cl.chat_json(
                     stage="s1_grounding",
-                    system_prompt=disc_sys,
-                    user_prompt=disc_usr,
-                    images=disc_frames,
-                    timestamps_s=disc_times,
-                    labels=[f"overview_{i}" for i in range(len(disc_frames))],
-                    thinking=False,
-                    thinking_budget=0,
-                    max_tokens=min(800, max_tokens),
+                    system_prompt=comb_sys,
+                    user_prompt=comb_usr,
+                    images=resized_frames,
+                    timestamps_s=times_s,
+                    labels=[f"frame_{i}" for i in range(len(resized_frames))],
+                    thinking=thinking,
+                    thinking_budget=thinking_budget,
+                    max_tokens=max(max_tokens, 280 * len(resized_frames) + 400),
                     jpeg_quality=jpeg_q,
+                    image_detail=s1_image_detail,
                     budget=budget,
                 )
                 _check_cancelled()
                 discovered_specs = _parse_canonical_objects_response(
-                    disc_resp,
+                    comb_resp,
                     max_objects=int(s1_cfg.get("canonical_discovery_max_objects", 4)),
                 )
                 if discovered_specs:
                     effective_task = t_spec.model_copy(
                         update={"grounding_objects": discovered_specs}
                     )
+                parsed_comb = _parse_batch_response(comb_resp, short_batch)
+                if _has_any_grounding_box(parsed_comb):
+                    merged_short_objs = parsed_comb
+                    run_separate_pass0 = False
+                elif discovered_specs:
+                    # Canonical objects discovered, boxes missing -> fall back directly to Batch-0 grounding
+                    run_separate_pass0 = False
             except (BudgetExceeded, VlmCancelledError):
                 raise
             except Exception:
-                # Fall back seamlessly to open-vocab grounding if Pass-0 returns unexpected/failed response
+                # Fall back seamlessly to separate Pass-0 + Batch-0
                 _check_cancelled()
+
+        if run_separate_pass0:
+            disc_indices = _select_discovery_indices(
+                len(resized_frames),
+                max_frames=int(s1_cfg.get("canonical_discovery_frames", 5)),
+            )
+            if disc_indices:
+                _check_cancelled()
+                if pb is not None:
+                    disc_sys, disc_usr = pb.build_s1_discovery(
+                        task=t_spec, camera_roles=ev.camera_roles
+                    )
+                else:
+                    disc_sys = (
+                        "You are an embodied manipulation visual grounding expert (2D Grounding canonical vocabulary discovery). "
+                        "Inspect the overview keyframes and select 1 to 4 task-relevant physical objects prioritized by manipulator/hand interaction and target container/receptacle. "
+                        'Output strict JSON only: {"canonical_objects": [{"id": "snake_case_id", "name": str, "desc": str, "is_static": bool}]}.'
+                    )
+                    disc_usr = (
+                        f"Task: {t_spec.task_id}\n"
+                        "Identify 1 to 4 canonical physical objects actively manipulated by robot arms/grippers or human hands plus target receptacle."
+                    )
+                disc_frames = [resized_frames[i] for i in disc_indices]
+                disc_times = [times_s[i] for i in disc_indices]
+                try:
+                    disc_resp = cl.chat_json(
+                        stage="s1_grounding",
+                        system_prompt=disc_sys,
+                        user_prompt=disc_usr,
+                        images=disc_frames,
+                        timestamps_s=disc_times,
+                        labels=[f"overview_{i}" for i in range(len(disc_frames))],
+                        thinking=False,
+                        thinking_budget=0,
+                        max_tokens=min(800, max_tokens),
+                        jpeg_quality=jpeg_q,
+                        image_detail=pass0_image_detail,
+                        budget=budget,
+                    )
+                    _check_cancelled()
+                    discovered_specs = _parse_canonical_objects_response(
+                        disc_resp,
+                        max_objects=int(s1_cfg.get("canonical_discovery_max_objects", 4)),
+                    )
+                    if discovered_specs:
+                        effective_task = t_spec.model_copy(
+                            update={"grounding_objects": discovered_specs}
+                        )
+                except (BudgetExceeded, VlmCancelledError):
+                    raise
+                except Exception:
+                    # Fall back seamlessly to open-vocab grounding if Pass-0 returns unexpected/failed response
+                    _check_cancelled()
 
     if pb is not None:
         sys_p, usr_p = pb.build_s1(task=effective_task, camera_roles=ev.camera_roles)
@@ -1118,6 +1205,7 @@ def run_stage1_grounding(
             "thinking_budget": thinking_budget,
             "max_tokens": eff_max_tokens,
             "jpeg_quality": jpeg_q,
+            "image_detail": s1_image_detail,
             "budget": budget,
         }
         if batch_size > 1:
@@ -1165,7 +1253,9 @@ def run_stage1_grounding(
     ref_t_val: float | None = None
     ref_hint_base = ""
 
-    if batch_size > 1 and len(batches) > 1 and reference_anchor_enabled:
+    if merged_short_objs is not None:
+        per_frame_objs.update(merged_short_objs)
+    elif batch_size > 1 and len(batches) > 1 and reference_anchor_enabled:
         # Phase 1: execute Batch 0 alone to extract soft spatial reference anchors
         b0 = batches[0]
         parsed_b0, err_b0 = _call_batch(b0)

@@ -150,6 +150,7 @@ def run_stage5_success(
     cell_w = int(s5_cfg.get("cell_w", 420))
     cell_h = int(s5_cfg.get("cell_h", 236))
     quality = int(s5_cfg.get("quality", 78))
+    image_detail = s5_cfg.get("image_detail", "auto")
     start_end_compare = bool(s5_cfg.get("start_end_compare", True))
     compare_panel_w = int(s5_cfg.get("compare_panel_w", 640))
     compare_panel_h = int(s5_cfg.get("compare_panel_h", 360))
@@ -231,6 +232,7 @@ def run_stage5_success(
         "thinking_budget": thinking_budget,
         "max_tokens": max_tokens,
         "jpeg_quality": quality,
+        "image_detail": image_detail,
         "budget": budget,
     }
     if model_override is not None:
@@ -303,6 +305,7 @@ def run_stage5_success(
             "thinking_budget": thinking_budget,
             "max_tokens": max_tokens,
             "jpeg_quality": quality,
+            "image_detail": image_detail,
             "budget": budget,
         }
         if model_override is not None:

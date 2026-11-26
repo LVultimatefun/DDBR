@@ -1112,5 +1112,454 @@ def config_vlm_cmd(
         sys.exit(1)
 
 
+@main.command("gc")
+@click.option(
+    "--max-cache-gb",
+    type=float,
+    default=None,
+    help="Target maximum preview cache size in GB (defaults to io.preview_cache.max_cache_gb).",
+)
+@click.option(
+    "--clear-all",
+    is_flag=True,
+    default=False,
+    help="Evict all cached preview MP4 files and stale partial files.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Report files that would be evicted without deleting anything.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print JSON summary.")
+@click.pass_context
+def gc_cmd(
+    ctx: click.Context,
+    max_cache_gb: float | None,
+    clear_all: bool,
+    dry_run: bool,
+    as_json: bool,
+) -> None:
+    """Run LRU garbage collection on workspace MP4 preview cache."""
+    if max_cache_gb is not None and max_cache_gb < 0:
+        raise click.BadParameter(
+            f"--max-cache-gb must be >= 0, got {max_cache_gb}",
+            param_hint="'--max-cache-gb'",
+        )
+
+    from .io.media import PreviewCache
+
+    workspace: Path = ctx.obj["workspace"]
+    config_dir: Path | None = ctx.obj["config_dir"]
+    cfg_ws = workspace if (workspace / "configs_override").is_dir() else None
+    cfg_mgr = ConfigManager(config_dir=config_dir, workspace_dir=cfg_ws)
+
+    raw_cfg_gb = (
+        cfg_mgr.settings.get("io", {})
+        .get("preview_cache", {})
+        .get("max_cache_gb", 10.0)
+    )
+    eff_max_gb = (
+        0.0
+        if clear_all
+        else (
+            float(max_cache_gb)
+            if max_cache_gb is not None
+            else (float(raw_cfg_gb) if raw_cfg_gb is not None else None)
+        )
+    )
+    target_bytes = int(eff_max_gb * (1024**3)) if eff_max_gb is not None else None
+
+    ws_resolved = Path(workspace).resolve()
+    previews_root = ws_resolved / "artifacts" / "previews"
+    if dry_run and not previews_root.is_dir():
+        result: dict[str, Any] = {
+            "dry_run": True,
+            "cache_dir": str(previews_root),
+            "max_bytes": target_bytes,
+            "before_bytes": 0,
+            "after_bytes": 0,
+            "freed_bytes": 0,
+            "before_files": 0,
+            "after_files": 0,
+            "evicted_count": 0,
+            "evicted_files": [],
+            "stale_partials_removed": 0,
+            "stale_partials": [],
+            "empty_dirs_removed": 0,
+        }
+    else:
+        cache = PreviewCache(ws_resolved, max_cache_gb=eff_max_gb)
+        result = cache.evict_lru(max_bytes=target_bytes, dry_run=dry_run)
+
+    report = {
+        "ok": True,
+        "workspace": str(ws_resolved),
+        "clear_all": bool(clear_all),
+        "max_cache_gb": eff_max_gb,
+        **result,
+    }
+    if as_json:
+        click.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        console = Console()
+        table = Table(
+            title=f"robo_vlm_qc preview cache GC ({'dry-run' if dry_run else 'applied'})"
+        )
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", justify="right", style="green")
+        table.add_row("Cache directory", str(report["cache_dir"]))
+        table.add_row("Files before -> after", f"{report['before_files']} -> {report['after_files']}")
+        table.add_row(
+            "Size before -> after (MB)",
+            f"{report['before_bytes'] / (1024 ** 2):.2f} -> {report['after_bytes'] / (1024 ** 2):.2f}",
+        )
+        table.add_row("Freed (MB)", f"{report['freed_bytes'] / (1024 ** 2):.2f}")
+        table.add_row("Evicted previews", str(report["evicted_count"]))
+        table.add_row("Stale partials removed", str(report["stale_partials_removed"]))
+        table.add_row("Empty dirs removed", str(report["empty_dirs_removed"]))
+        console.print(table)
+
+
+@main.command("doctor")
+@click.option("--json", "as_json", is_flag=True, help="Print JSON diagnostics report.")
+@click.pass_context
+def doctor_cmd(ctx: click.Context, as_json: bool) -> None:
+    """Run environment, media toolchain, workspace DB, web UI, and VLM config diagnostics."""
+    import os
+    import shutil
+    import sqlite3
+    import subprocess
+
+    from .api.routers.settings import read_vlm_settings_dict
+    from .api.state import resolve_default_web_dist
+    from .config import default_config_dir
+    from .io.media import _is_nvenc_available
+
+    workspace: Path = ctx.obj["workspace"]
+    config_dir: Path | None = ctx.obj["config_dir"]
+    ws_resolved = Path(workspace).resolve()
+    eff_cfg_dir = (
+        Path(config_dir).resolve() if config_dir is not None else default_config_dir()
+    )
+
+    checks: list[dict[str, Any]] = []
+
+    def _add_check(
+        name: str,
+        status: str,
+        detail: str,
+        *,
+        critical: bool,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        checks.append(
+            {
+                "name": name,
+                "status": status,
+                "critical": critical,
+                "detail": detail,
+                "meta": meta or {},
+            }
+        )
+
+    # 1. Python version
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    py_ok = sys.version_info >= (3, 10)
+    _add_check(
+        "python",
+        "ok" if py_ok else "fail",
+        f"Python {py_ver}" + ("" if py_ok else " (requires >= 3.10)"),
+        critical=True,
+        meta={"version": py_ver},
+    )
+
+    # 2. OpenCV
+    try:
+        import cv2
+
+        cv_ver = str(getattr(cv2, "__version__", "unknown"))
+        _add_check(
+            "opencv",
+            "ok",
+            f"OpenCV {cv_ver}",
+            critical=True,
+            meta={"version": cv_ver},
+        )
+    except Exception as exc:
+        _add_check(
+            "opencv",
+            "fail",
+            f"OpenCV unavailable: {exc}",
+            critical=True,
+        )
+
+    # 3 & 4. ffmpeg & ffprobe
+    for tool_name in ("ffmpeg", "ffprobe"):
+        bin_path = shutil.which(tool_name)
+        if not bin_path:
+            _add_check(
+                tool_name,
+                "fail",
+                f"{tool_name} not found in PATH",
+                critical=True,
+            )
+        else:
+            ver_line = ""
+            try:
+                proc = subprocess.run(
+                    [bin_path, "-version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    ver_line = proc.stdout.splitlines()[0].strip()
+            except Exception:
+                ver_line = ""
+            _add_check(
+                tool_name,
+                "ok",
+                ver_line or f"Found at {bin_path}",
+                critical=True,
+                meta={"path": bin_path, "version_line": ver_line},
+            )
+
+    # 5. NVENC hardware acceleration (optional)
+    nvenc_ok = bool(_is_nvenc_available())
+    _add_check(
+        "nvenc",
+        "ok" if nvenc_ok else "warn",
+        "h264_nvenc available" if nvenc_ok else "h264_nvenc unavailable (will use libx264 CPU fallback)",
+        critical=False,
+        meta={"available": nvenc_ok},
+    )
+
+    # 6. Workspace writability & free disk space
+    writable = False
+    free_disk_gb: float | None = None
+    ws_detail = ""
+    if ws_resolved.exists() and not ws_resolved.is_dir():
+        ws_detail = f"Workspace path is not a directory: {ws_resolved}"
+    else:
+        probe_dir = ws_resolved
+        if not probe_dir.exists():
+            cur = probe_dir
+            while not cur.exists() and cur != cur.parent:
+                cur = cur.parent
+            probe_dir = cur
+        if probe_dir.is_dir():
+            try:
+                usage = shutil.disk_usage(probe_dir)
+                free_disk_gb = round(usage.free / float(1024**3), 2)
+            except OSError:
+                free_disk_gb = None
+            if ws_resolved.is_dir():
+                probe_file = ws_resolved / f".doctor_write_probe_{os.getpid()}"
+                try:
+                    probe_file.write_text("ok", encoding="utf-8")
+                    writable = True
+                except OSError as exc:
+                    ws_detail = f"Workspace not writable: {exc}"
+                finally:
+                    with contextlib.suppress(OSError):
+                        probe_file.unlink()
+            else:
+                writable = os.access(probe_dir, os.W_OK)
+                if not writable:
+                    ws_detail = f"Parent directory not writable: {probe_dir}"
+        else:
+            ws_detail = f"Cannot resolve writable parent for {ws_resolved}"
+
+    if not writable:
+        _add_check(
+            "workspace",
+            "fail",
+            ws_detail or f"Workspace not writable: {ws_resolved}",
+            critical=True,
+            meta={
+                "path": str(ws_resolved),
+                "writable": False,
+                "free_disk_gb": free_disk_gb,
+            },
+        )
+    else:
+        low_disk = free_disk_gb is not None and free_disk_gb < 1.0
+        disk_str = f"{free_disk_gb:.2f} GB free" if free_disk_gb is not None else "disk usage unknown"
+        _add_check(
+            "workspace",
+            "warn" if low_disk else "ok",
+            f"Writable ({disk_str})",
+            critical=True,
+            meta={
+                "path": str(ws_resolved),
+                "writable": True,
+                "free_disk_gb": free_disk_gb,
+            },
+        )
+
+    # 7. SQLite WAL DB health & episode count
+    db_path = ws_resolved / "robo_vlm_qc.db"
+    db_exists = db_path.is_file()
+    journal_mode: str | None = None
+    episode_count: int | None = None
+    if not db_exists:
+        _add_check(
+            "sqlite_db",
+            "warn",
+            f"Database not initialized yet at {db_path}",
+            critical=False,
+            meta={"exists": False, "path": str(db_path), "episode_count": 0},
+        )
+    else:
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(str(db_path), timeout=5.0)
+            jm_row = conn.execute("PRAGMA journal_mode;").fetchone()
+            journal_mode = str(jm_row[0]).lower() if jm_row else None
+            qc_row = conn.execute("PRAGMA quick_check;").fetchone()
+            integrity_ok = bool(qc_row and str(qc_row[0]).lower() == "ok")
+            cnt_row = conn.execute("SELECT COUNT(*) FROM episodes;").fetchone()
+            episode_count = int(cnt_row[0]) if cnt_row else 0
+            if not integrity_ok:
+                _add_check(
+                    "sqlite_db",
+                    "fail",
+                    f"SQLite integrity check failed: {qc_row[0] if qc_row else 'unknown'}",
+                    critical=True,
+                    meta={
+                        "exists": True,
+                        "path": str(db_path),
+                        "journal_mode": journal_mode,
+                        "episode_count": episode_count,
+                    },
+                )
+            else:
+                is_wal = journal_mode == "wal"
+                _add_check(
+                    "sqlite_db",
+                    "ok" if is_wal else "warn",
+                    f"Healthy ({journal_mode or 'unknown'} mode, {episode_count} episodes)",
+                    critical=True,
+                    meta={
+                        "exists": True,
+                        "path": str(db_path),
+                        "journal_mode": journal_mode,
+                        "episode_count": episode_count,
+                    },
+                )
+        except Exception as exc:
+            _add_check(
+                "sqlite_db",
+                "fail",
+                f"SQLite database error: {exc}",
+                critical=True,
+                meta={"exists": True, "path": str(db_path)},
+            )
+        finally:
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
+
+    # 8. web/dist availability
+    web_dist = resolve_default_web_dist(None)
+    web_built = (web_dist / "index.html").is_file()
+    _add_check(
+        "web_dist",
+        "ok" if web_built else "warn",
+        f"Built SPA found at {web_dist}"
+        if web_built
+        else f"SPA bundle not found at {web_dist} (run npm run build in web/)",
+        critical=False,
+        meta={"path": str(web_dist), "available": web_built},
+    )
+
+    # 9. Configured VLM provider / base_url / masked API key presence (NEVER plaintext)
+    vlm_info: dict[str, Any] = {
+        "provider": None,
+        "base_url": None,
+        "api_key_env": None,
+        "api_key_configured": False,
+        "api_key_masked": "",
+    }
+    try:
+        cfg_ws = ws_resolved if (ws_resolved / "configs_override").is_dir() else None
+        cfg_mgr = ConfigManager(config_dir=eff_cfg_dir, workspace_dir=cfg_ws)
+        sanitized = read_vlm_settings_dict(
+            cfg_mgr,
+            workspace=ws_resolved,
+            config_dir=eff_cfg_dir,
+        )
+        vlm_info = {
+            "provider": sanitized["provider"],
+            "base_url": sanitized["base_url"],
+            "api_key_env": sanitized["api_key_env"],
+            "api_key_configured": bool(sanitized["api_key_configured"]),
+            "api_key_masked": str(sanitized["api_key_masked"]),
+        }
+        key_state = (
+            f"key={vlm_info['api_key_masked']}"
+            if vlm_info["api_key_configured"]
+            else f"{vlm_info['api_key_env']} not set"
+        )
+        _add_check(
+            "vlm_config",
+            "ok" if vlm_info["api_key_configured"] else "warn",
+            f"{vlm_info['provider']} @ {vlm_info['base_url']} ({key_state})",
+            critical=False,
+            meta=vlm_info,
+        )
+    except Exception as exc:
+        _add_check(
+            "vlm_config",
+            "fail",
+            f"Failed to load VLM configuration: {exc}",
+            critical=True,
+        )
+
+    ok_count = sum(1 for c in checks if c["status"] == "ok")
+    warn_count = sum(1 for c in checks if c["status"] == "warn")
+    fail_count = sum(1 for c in checks if c["status"] == "fail")
+    critical_ok = all(not (c["critical"] and c["status"] == "fail") for c in checks) and fail_count == 0
+
+    report: dict[str, Any] = {
+        "ok": critical_ok,
+        "workspace": str(ws_resolved),
+        "checks": checks,
+        "summary": {
+            "ok": ok_count,
+            "warn": warn_count,
+            "fail": fail_count,
+        },
+        "vlm": vlm_info,
+        "workspace_info": {
+            "writable": writable,
+            "free_disk_gb": free_disk_gb,
+            "db_exists": db_exists,
+            "journal_mode": journal_mode,
+            "episode_count": episode_count if episode_count is not None else 0,
+            "web_dist_available": web_built,
+        },
+    }
+
+    if as_json:
+        click.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        console = Console()
+        table = Table(title="robo_vlm_qc doctor diagnostics")
+        table.add_column("Check", style="cyan")
+        table.add_column("Status")
+        table.add_column("Detail")
+        for c in checks:
+            st = c["status"]
+            style = "green" if st == "ok" else ("yellow" if st == "warn" else "red")
+            table.add_row(c["name"], f"[{style}]{st.upper()}[/{style}]", c["detail"])
+        console.print(table)
+
+    if not critical_ok:
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()

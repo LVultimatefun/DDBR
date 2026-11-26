@@ -65,6 +65,9 @@ vlm:
     batch_size: 4
     batch_concurrency: 3
     reference_anchor_enabled: true
+    pass0_image_detail: "low"
+    image_detail: "high"
+    merge_pass0_short_episode: true
     interval_s: 2.5
     max_keyframes: 32
     hard_max_keyframes: 72
@@ -107,6 +110,10 @@ vlm:
     cell_w: 320
     cell_h: 180
     quality: 70
+    image_detail: "low"
+    static_dedup_enabled: true
+    static_dedup_mad_thresh: 4.5
+    static_dedup_max_gap_s: 6.0
     thinking: false
     thinking_budget: 1536
     max_tokens: 4096
@@ -115,9 +122,15 @@ vlm:
     window_s: 16.0
     window_stride_s: 12.0
     window_step_s: 0.8
+    adaptive_step_enabled: true
+    idle_step_s: 1.4
     cell_w: 420
     cell_h: 236
     quality: 76
+    image_detail: "auto"
+    static_dedup_enabled: true
+    static_dedup_mad_thresh: 3.5
+    static_dedup_max_gap_s: 3.2
     thinking: false
     thinking_budget: 1536
     max_tokens: 3200
@@ -129,10 +142,13 @@ vlm:
     merge_max_tokens: 6144
     refine_margin_s: 1.5
     refine_step_s: 0.5
+    refine_min_frames: 4
     refine_max_frames: 18
+    dynamic_refine_frames: true
     cell_w: 384
     cell_h: 216
     quality: 76
+    image_detail: "auto"
     thinking: false
     refine_thinking_budget: 1280
     refine_max_tokens: 1536
@@ -150,6 +166,7 @@ vlm:
     cell_w: 420
     cell_h: 236
     quality: 78
+    image_detail: "auto"
     start_end_compare: true
     compare_panel_w: 640
     compare_panel_h: 360
@@ -159,6 +176,8 @@ vlm:
 
 io:
   target_fps: 30.0
+  preview_cache:
+    max_cache_gb: 10.0
   h5:
     hand_mapping:
       left: "hand_a"
