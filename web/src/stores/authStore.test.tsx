@@ -399,9 +399,22 @@ describe("authStore", () => {
 
     await waitFor(() => expect(meCalls).toBe(1));
 
+    let jsonDone!: () => void;
+    const jsonDonePromise = new Promise<void>((resolve) => {
+      jsonDone = resolve;
+    });
+    const mockMeResponse = new Response(JSON.stringify({ role: "lead", user: "mount_lead" }), { status: 200 });
+    const origJson = mockMeResponse.json.bind(mockMeResponse);
+    mockMeResponse.json = async () => {
+      const data = await origJson();
+      jsonDone();
+      return data;
+    };
+
     await act(async () => {
-      resolveMe(new Response(JSON.stringify({ role: "lead", user: "mount_lead" }), { status: 200 }));
-      for (let i = 0; i < 10; i += 1) {
+      resolveMe(mockMeResponse);
+      await jsonDonePromise;
+      for (let i = 0; i < 5; i += 1) {
         await Promise.resolve();
       }
       await ctxRef!.setCredentials({ username: "renamed_lead" }, false);
