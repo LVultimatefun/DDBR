@@ -6,6 +6,7 @@
 *token*
 !/web/src/**/tokens*
 !/tests/test_token_optimizations.py
+!/docs/assets/*.png
 .qc_dev_token
 .git_token
 *.pem
