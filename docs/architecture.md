@@ -25,7 +25,7 @@
 ### 2.1 End-to-End 3-In × DAG × Store × Studio × Lab × 4-Out Pipeline
 
 <p align="center">
-  <img src="assets/architecture_overview.svg" alt="DDBR / robo_vlm_qc System Architecture Overview" width="100%" />
+  <img src="assets/architecture_overview.png" alt="DDBR / robo_vlm_qc System Architecture Overview" width="100%" />
 </p>
 
 <details>
@@ -97,7 +97,7 @@ flowchart TB
 ### 2.2 Causal VLM DAG Execution Topology & Guardrail Funnel
 
 <p align="center">
-  <img src="assets/vlm_dag_guardrail.svg" alt="Causal VLM DAG StageCache Isolation and Three-Policy Guardrail Funnel" width="100%" />
+  <img src="assets/vlm_dag_guardrail.png" alt="Causal VLM DAG StageCache Isolation and Three-Policy Guardrail Funnel" width="100%" />
 </p>
 
 <details>
