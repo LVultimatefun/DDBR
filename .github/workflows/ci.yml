@@ -10,12 +10,48 @@ permissions:
   contents: read
 
 jobs:
-  python:
-    name: Python 3.12 Tests & Packaging
+  frontend:
+    name: Frontend Node 22 Tests & Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies, test, and build
+        working-directory: web
+        run: |
+          npm ci
+          CI=true npm test
+          npm run build
+
+      - name: Upload built Web Studio bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  python:
+    name: Python 3.12 Tests & Packaging
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download built Web Studio bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -62,24 +98,3 @@ jobs:
         run: |
           python scripts/generate_demo_dataset.py --out /tmp/ci_demo_data
           robo-vlm-qc -w /tmp/ci_demo_ws ingest --data /tmp/ci_demo_data --json
-
-  frontend:
-    name: Frontend Node 22 Tests & Build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js 22
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
-      - name: Install dependencies, test, and build
-        working-directory: web
-        run: |
-          npm ci
-          CI=true npm test
-          npm run build
