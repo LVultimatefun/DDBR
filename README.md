@@ -16,19 +16,33 @@
   <a href="#live-demo-showcase">Live Demos</a> ·
   <a href="#web-studio-gallery">Web Studio</a> ·
   <a href="#system-architecture">Architecture</a> ·
-  <a href="#30-second-synthetic-demo-quickstart">Quickstart</a> ·
-  <a href="#docker-deployment">Docker</a>
+  <a href="#60-second-zero-api-key-demo-quickstart">Quickstart</a> ·
+  <a href="#docker-deployment">Docker</a> ·
+  <a href="#citation">Citation</a>
 </p>
 
 ---
 
-**DDBR (`robo_vlm_qc`)** — *Don't Describe Before Rule* — is a standalone, embodiment-agnostic quality-control and dataset-curation platform for robot manipulation trajectories and egocentric human-hand demonstration videos (e.g., Epic-Kitchens, Ego4D). Instead of brittle 30 Hz kinematic threshold heuristics, it runs a **causal multi-stage Vision-Language Model (VLM) DAG** paired with **lightweight splice-safety guardrails**, a **unified bilingual (`EN / 中`) Dual-Role NLE Web Studio (`Reviewer` & `Lead`)** with **one-click VLM API/model switching**, a **pure In-Context `VLM Lab`** improvement loop (**zero VLM SFT/DPO/LoRA fine-tuning export**), and a pluggable **3-In × 4-Out** robotics data kernel.
+**DDBR (`robo_vlm_qc`)** — *Don't Describe Before Rule* — is a standalone, embodiment-agnostic quality-control and dataset-curation platform for robot manipulation trajectories and egocentric human-hand demonstration videos (e.g., Epic-Kitchens, Ego4D). Instead of brittle 30 Hz kinematic threshold heuristics, it runs a **causal multi-stage Vision-Language Model (VLM) DAG** paired with **lightweight splice-safety guardrails**, a **unified bilingual (`EN / ZH`) Dual-Role NLE Web Studio (`Reviewer` & `Lead`)** with **one-click VLM API/model switching** and **AI-assisted `TaskSpec` onboarding**, a **pure In-Context `VLM Lab`** improvement loop (**zero VLM SFT/DPO/LoRA fine-tuning export**), and a pluggable **3-In × 4-Out** robotics data kernel.
 
 ---
 
 ## Live Demo Showcase
 
-Rendered directly by `robo-vlm-qc render-mp4` (`viz_mp4` 1080p@30fps Studio HUD) on open-source multi-camera bimanual ALOHA episodes from HuggingFace LeRobot ([`lerobot/aloha_static_cups_open`](https://huggingface.co/datasets/lerobot/aloha_static_cups_open) & [`lerobot/aloha_static_pro_pencil`](https://huggingface.co/datasets/lerobot/aloha_static_pro_pencil)).
+### 45-Second Full-Workflow Walkthrough (Bilingual Studio · 2D Grounding · AI Task Wizard · LeRobot v3 Export)
+
+<p align="center">
+  <a href="docs/assets/studio_walkthrough_45s.mp4">
+    <img src="docs/assets/studio_walkthrough_45s.gif" alt="DDBR 45-Second Full-Workflow Live Studio Walkthrough" width="100%" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/studio_walkthrough_45s.mp4"><strong>Watch / Download Full 720p@30fps Walkthrough MP4 (42s · 1.65 MB)</strong></a> ·
+  Live screen capture on open-source ALOHA data showing <strong>Dark NLE Studio</strong> (30fps BAFT 2D Grounding, PiP wrist cam, SSIM cut-safety &amp; <code>cut_clean → mask_loss</code> guardrail downgrade), instant <strong>bilingual <code>EN / ZH</code> switching + one-click <code>Model / API</code> modal</strong>, <strong>unrecognized <code>_default</code> triage → multimodal 5-frame AI TaskSpec Wizard</strong>, and <strong>transactional <code>lerobot_v3</code> export with <code>split_by_subtask</code></strong>.
+</p>
+
+Rendered directly by `robo-vlm-qc render-mp4` (`viz_mp4` 1080p@30fps Studio HUD) on open-source multi-camera bimanual ALOHA episodes from HuggingFace LeRobot ([`lerobot/aloha_static_cups_open`](https://huggingface.co/datasets/lerobot/aloha_static_cups_open) & [`lerobot/aloha_static_pro_pencil`](https://huggingface.co/datasets/lerobot/aloha_static_pro_pencil)):
 
 ### 1. Bimanual Cup Opening (`aloha_static_cups_open`) — `cut_clean` · `mask_loss` · `keep_positive`
 
@@ -60,7 +74,7 @@ Rendered directly by `robo-vlm-qc render-mp4` (`viz_mp4` 1080p@30fps Studio HUD)
 
 ## Web Studio Gallery
 
-Single FastAPI + React 19 + TypeScript + Vite SPA serving both `Reviewer` and `Lead` workflows with **Dark & Light themes**, **live English / Chinese (`EN / 中`) bilingual switching**, **one-click TopNav `Model / API` switching**, live SSE jobs, and strict 3-layer human editing (`qc_segments`, `success`, `macro_stages` / subtasks):
+Single FastAPI + React 19 + TypeScript + Vite SPA serving both `Reviewer` and `Lead` workflows with **Dark & Light themes**, **live English / Chinese (`EN / ZH`) bilingual switching**, **one-click TopNav `Model / API` switching**, live SSE jobs, and strict 3-layer human editing (`qc_segments`, `success`, `macro_stages` / subtasks):
 
 <table>
   <tr>
@@ -85,7 +99,7 @@ Single FastAPI + React 19 + TypeScript + Vite SPA serving both `Reviewer` and `L
         <img src="docs/assets/studio_queue_light.png" alt="Episode Review Queue (Light Theme)" width="100%" />
       </a>
       <br />
-      <strong>Episode Queue &amp; Batch Orchestration (Light)</strong> — Dark/Light &amp; <code>EN / 中</code> toggles, SQLite claim leases, cut/mask telemetry, batch <strong>Export Selected</strong> shortcut, faceted filters, and read-only directory ingest.
+      <strong>Episode Queue &amp; Batch Orchestration (Light)</strong> — Dark/Light &amp; <code>EN / ZH</code> toggles, SQLite claim leases, cut/mask telemetry, batch <strong>Export Selected</strong> shortcut, faceted filters, and read-only directory ingest.
     </td>
     <td width="50%" valign="top">
       <a href="docs/assets/studio_export.png">
@@ -124,16 +138,17 @@ See [`docs/architecture.md`](docs/architecture.md) for architectural decisions (
   - **Subtask Synchronous Annotation (`S1 → S2` & On-Demand Re-Inference)**: Injects S1 object state transitions into S2 to produce `MacroStage` spans with VLA training `instruction` strings; in Review Studio, reviewers can snap Track 1 `Subtask Stages` magnetically (`±0.08s`) to QC segment boundaries or click **Infer Subtasks** (`POST /api/episodes/{id}/infer-subtasks`) so the VLM re-aligns subtask stages & instructions directly against human-verified QC segments (fully Undo/Redo-able).
   - Lightweight guardrails (`hallucination`, `splice_gate`, `visual_gate`) never invent labels — they protect continuity by auto-downgrading unsafe `cut_clean` intervals to `mask_loss`.
 - **Embodiment-Agnostic Prompts & 11 Pure-Visual Labels ([`configs/labels.yaml`](configs/labels.yaml))**: Strictly visual taxonomy decoupled from splice policies, paired with Precision-First stage prompts ([`configs/prompts/`](configs/prompts/)) and task specs ([`configs/tasks/`](configs/tasks/)) compatible with both **robot arms/grippers** and **human hands / egocentric video**.
-- **One-Click VLM API / Model Switcher & Bilingual Web Studio (`EN / 中`)**: Switch presets (`OpenAI`, `DashScope`, `Gemini`, `Local vLLM`, `Custom`), Base URL, unified or S1–S5 per-stage models, and run live `Test Connection` latency probes right from the TopNav `Model / API` modal (`GET/PUT /api/settings/vlm`, `POST /api/settings/vlm/test`) or `robo-vlm-qc config-vlm` CLI — API keys are written exclusively to `<workspace>/.env` (`0600`), never persisted in YAML or echoed in plaintext. Full Web Studio supports instant **English / Chinese** switching (`localStorage`-persisted), redesigned Layer 2 `SuccessPanel` ergonomics, and quick export entry points from Review Studio (single-episode JSON download or pre-filtered Export Studio jump) and Queue batch selection.
+- **One-Click VLM API / Model Switcher & Bilingual Web Studio (`EN / ZH`)**: Switch presets (`OpenAI`, `DashScope`, `Gemini`, `Local vLLM`, `Custom`), Base URL, unified or S1–S5 per-stage models, and run live `Test Connection` latency probes right from the TopNav `Model / API` modal (`GET/PUT /api/settings/vlm`, `POST /api/settings/vlm/test`) or `robo-vlm-qc config-vlm` CLI — API keys are written exclusively to `<workspace>/.env` (`0600`), never persisted in YAML or echoed in plaintext. Full Web Studio supports instant **English / Chinese** switching (`localStorage`-persisted), redesigned Layer 2 `SuccessPanel` ergonomics, and quick export entry points from Review Studio (single-episode JSON download or pre-filtered Export Studio jump) and Queue batch selection.
+- **Manual `_default` Task Intervention & AI-Assisted `TaskSpec` Onboarding**: Episodes whose directory or metadata names do not match an existing task fall back to `_default` and are highlighted in Queue and Review Studio with a one-click `Unrecognized (_default)` filter chip and inline/batch reassignment (`PATCH /api/episodes/{id}/task`, `POST /api/episodes/batch-task`, and `ingest --task`). Leads can launch the reusable **"+ New Task (AI)" Wizard** (`POST /api/lab/tasks/draft`) with any Chinese or English description plus 4–6 uniformly sampled keyframes from a sample episode to draft a normalized English `TaskSpec` (`goal`, `steps`, `criteria`, `task_prompt`, `grounding_objects`, and deterministically scrubbed `match`/`aliases`), review/edit every field, save via `PUT /api/lab/tasks`, and immediately reassign target episodes.
 - **Single-Truth Store ([`robo_vlm_qc/store/`](robo_vlm_qc/store/))**: Authoritative Pydantic v2 schemas (`VlmRunArtifact`, `HumanReviewArtifact`, `ResolvedEpisode`) backed by SQLite WAL (`robo_vlm_qc.db`), immutable JSON artifacts (`artifacts/`), and `.history/` configuration snapshots.
 - **`VLM Lab` Pure In-Context Loop ([`robo_vlm_qc/lab/`](robo_vlm_qc/lab/))**: Automated 6-bucket error diagnosis (`VLM Raw vs Human GT`), 1-click 2×2 visual/text Few-Shot mistake book injected into S3/S4, unknown anomaly triage (`merge` / `promote`), `.history/` diff & 1-click rollback, advisory LLM prompt diffs (`prompt_assist`), and GT regression eval sandbox reusing S1/S2/S5 cache 100% (**strictly In-Context — zero VLM SFT/DPO/LoRA export**).
 - **4-Out Transactional Exporters ([`robo_vlm_qc/export/`](robo_vlm_qc/export/))**: Shared `PieceSlicer` (smoothstep + SO(3) geodesic tail smoothing, `is_tail`, `action_loss_mask`, `subtask_index`) and atomic `_staging → rename` exporters (`lerobot_v3`, `h5_clean`, `zero_copy_index`, `viz_mp4`) across 3 recipes (`bc_clean`, `recovery_plus`, `badcase_pairs`). `lerobot_v3` now supports adaptive **`state_schema_mode`** (`auto` preserves native dims/names for uniform LeRobot datasets like 14-D ALOHA or 7-D Franka, omits dummy 81-D zeros on pure-video `video_dir`, and unifies H5/heterogeneous mixes to canonical 81-D) plus dual subtask export (frame-level `subtask_index` + `meta/subtasks.parquet` with `instruction`, and optional **`split_by_subtask`** exporting each clean subtask span as an independent episode with `task` = subtask instruction).
 
 ---
 
-## 30-Second Synthetic Demo Quickstart
+## 60-Second Zero-API-Key Demo Quickstart
 
-Try `robo_vlm_qc` end-to-end with zero external datasets or API keys:
+> **Zero-API-Key Demo Mode**: Want to evaluate the full Dual-Role NLE Web Studio, multi-camera playback, Queue orchestration, and `lerobot_v3` Export Center **without any external dataset downloads or VLM API keys**? The three commands below synthesize both `video_dir` and 81-D `lerobot` v3 trajectories locally, ingest them strictly read-only, and boot the Studio in under 60 seconds.
 
 ### 1. Prerequisites & Install
 
@@ -208,7 +223,7 @@ cp configs/presets/gemini.yaml ./workspace/configs_override/default.yaml
 # 1. Run causal VLM DAG (S1 -> S2||S5 -> S3 -> S4A -> S4B) + light guardrails
 robo-vlm-qc -w ./workspace run-vlm --workers 4
 
-# 2. Launch authenticated Dual-Role Studio (EN / 中 switchable in top nav)
+# 2. Launch authenticated Dual-Role Studio (EN / ZH switchable in top nav)
 robo-vlm-qc -w ./workspace serve \
   --reviewer-token "$ROBO_VLM_QC_REVIEWER_TOKEN" \
   --lead-token "$ROBO_VLM_QC_LEAD_TOKEN" \
@@ -265,7 +280,7 @@ The Compose stack mounts `./workspace` (read-write) and `./data` (read-only, enf
 | **11 Pure-Visual Labels** | `boundary_idle`, `mid_idle_freeze`, `missed_grasp_retry`, `object_slip_recovery`, `placement_redo`, `hesitation_oscillation`, `collision_or_knock`, `precision_fine_adjust`, `bimanual_assist_hold`, `terminal_failure`, `unknown_anomaly`. |
 | **Example Tasks** | [`_default.yaml`](configs/tasks/_default.yaml) (embodiment-agnostic: robot arms/grippers & human hands), [`pick_and_place.yaml`](configs/tasks/pick_and_place.yaml), [`bimanual_handover.yaml`](configs/tasks/bimanual_handover.yaml). |
 | **Causal DAG & Cache** | `S1` (Pass-0 Canonical Object Discovery + Custom Objects + Temporal-Batched 2D Grounding + Anti-Jitter BAFT Tracking with flow-consistent adaptive anchor weighting) → `S2 ∥ S5` (Grounding-aware Subtask Stages w/ VLA `instruction` + L/R Timelines + on-demand `/infer-subtasks` from verified QC segments ∥ Dense-Tail Success + 30% Anti-FP Control) → `S3` (Sliding QC Discovery w/ S2 protection & Few-Shot) → `S4A/S4B` (Merge + 0.5s CoV Diff). `S1`-only reruns preserve `S2`–`S5` cache, updating S3/labels/few-shots reuses S1/S2/S5 `StageCache` 100%, and mid-flight VLM cancellation performs cooperative socket abort + atomic SSE status rollback. |
-| **Dual-Role Studio & i18n** | `Reviewer` and `Lead` share identical `ReviewStudioPage` rendering with Dark/Light themes, instant **English / Chinese (`EN / 中`)** switching, one-click `Model / API` switching (`0600` `.env` secret isolation), quick Studio/Queue export shortcuts, and strict 3-layer editing (`qc_segments`, `success`, `macro_stages`/subtasks; `grounding`, `arm_timelines`, and `raw_vlm_segments` remain read-only). |
+| **Dual-Role Studio & i18n** | `Reviewer` and `Lead` share identical `ReviewStudioPage` rendering with Dark/Light themes, instant **English / Chinese (`EN / ZH`)** switching, one-click `Model / API` switching (`0600` `.env` secret isolation), `_default` task intervention + AI `TaskSpec` onboarding wizard, quick Studio/Queue export shortcuts, and strict 3-layer editing (`qc_segments`, `success`, `macro_stages`/subtasks; `grounding`, `arm_timelines`, and `raw_vlm_segments` remain read-only). |
 | **`VLM Lab` In-Context Loop** | `GT Freeze` → `Diagnosis (6 buckets)` → `2×2 Visual Few-Shot` / `Unknown Triage` / `Versioned Taxonomy` → `GT Sandbox Eval` → `Promote` (with `.history/` backup). **Zero VLM SFT/DPO/LoRA export.** |
 
 ---
@@ -279,3 +294,19 @@ The Compose stack mounts `./workspace` (read-write) and `./data` (read-only, enf
 - **[`SECURITY.md`](SECURITY.md)** — Security policy and deployment hardening guidelines.
 - **[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)** — Community standards (Contributor Covenant v2.1).
 - **[`LICENSE`](LICENSE)** — Apache License 2.0.
+
+---
+
+## Citation
+
+If you find **DDBR (`robo_vlm_qc`)** useful in your robotics dataset curation, VLA training pipeline, or embodied AI research, please cite:
+
+```bibtex
+@software{ddbr_robo_vlm_qc_2026,
+  title        = {DDBR (robo\_vlm\_qc): Splice-Safe VLM Trajectory QC and NLE Studio for Embodied AI},
+  author       = {DDBR Contributors},
+  year         = {2026},
+  url          = {https://github.com/LVultimatefun/DDBR},
+  license      = {Apache-2.0}
+}
+```

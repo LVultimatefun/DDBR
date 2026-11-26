@@ -16,19 +16,33 @@
   <a href="#演示视频效果展示">演示视频</a> ·
   <a href="#web-studio-界面一览">Web Studio</a> ·
   <a href="#系统架构">系统架构</a> ·
-  <a href="#30-秒合成-demo-快速体验">快速体验</a> ·
-  <a href="#docker-一键部署">Docker 部署</a>
+  <a href="#60-秒免-api-key-零门槛快速体验">快速体验</a> ·
+  <a href="#docker-一键部署">Docker 部署</a> ·
+  <a href="#引用-citation">引用</a>
 </p>
 
 ---
 
-**DDBR（`robo_vlm_qc`）** — *Don't Describe Before Rule* — 是一个独立、跨构型的具身操作轨迹质检与训练数据策展平台，原生兼容**机械臂遥操作数据**与**人类双手第一视角操作视频**（如 Epic-Kitchens、Ego4D）。平台彻底摒弃脆弱的 30 Hz 运动学规则阈值检测器，采用**因果多阶段视觉语言模型（VLM）DAG** 结合**轻量级切段安全护栏**、**支持中英双语切换（`中 / EN`）与一键替换模型 API 的统一双角色 NLE Web Studio（`Reviewer` 与 `Lead`）**、**纯上下文（In-Context）`VLM Lab` 迭代闭环**（**不包含任何 VLM SFT/DPO/LoRA 微调导出**），以及可插拔的 **3-In × 4-Out** 数据 I/O 内核。
+**DDBR（`robo_vlm_qc`）** — *Don't Describe Before Rule* — 是一个独立、跨构型的具身操作轨迹质检与训练数据策展平台，原生兼容**机械臂遥操作数据**与**人类双手第一视角操作视频**（如 Epic-Kitchens、Ego4D）。平台彻底摒弃脆弱的 30 Hz 运动学规则阈值检测器，采用**因果多阶段视觉语言模型（VLM）DAG** 结合**轻量级切段安全护栏**、**支持中英双语切换（`中 / EN`）、一键替换模型 API 与 AI 辅助 `TaskSpec` 新任务接入的统一双角色 NLE Web Studio（`Reviewer` 与 `Lead`）**、**纯上下文（In-Context）`VLM Lab` 迭代闭环**（**不包含任何 VLM SFT/DPO/LoRA 微调导出**），以及可插拔的 **3-In × 4-Out** 数据 I/O 内核。
 
 ---
 
 ## 演示视频效果展示
 
-以下演示视频直接由本平台 `robo-vlm-qc render-mp4`（`viz_mp4` 1080p@30fps Studio HUD 渲染器）基于开源 HuggingFace LeRobot ALOHA 双臂多相机数据集（[`lerobot/aloha_static_cups_open`](https://huggingface.co/datasets/lerobot/aloha_static_cups_open) 与 [`lerobot/aloha_static_pro_pencil`](https://huggingface.co/datasets/lerobot/aloha_static_pro_pencil)）生成。
+### 45 秒全流程实操演示（双语 Studio · 2D Grounding · AI 新任务向导 · LeRobot v3 导出）
+
+<p align="center">
+  <a href="docs/assets/studio_walkthrough_45s.mp4">
+    <img src="docs/assets/studio_walkthrough_45s.gif" alt="DDBR 45 秒全流程 Web Studio 实操演示" width="100%" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="docs/assets/studio_walkthrough_45s.mp4"><strong>观看 / 下载完整 720p@30fps 实操演示 MP4（42s · 1.65 MB）</strong></a> ·
+  基于开源 ALOHA 多视角数据的端到端实录：涵盖<strong>深色 NLE 审核 Studio</strong>（30fps BAFT 2D 目标追踪、腕部画中画、SSIM 切段安全校验与 <code>cut_clean → mask_loss</code> 护栏自动降级）、<strong>中英双语一键切换与 <code>Model / API</code> 配置弹窗</strong>、<strong>未识别 <code>_default</code> 轨迹干预 → 多模态 5 帧 AI 新任务向导</strong>，以及<strong>原子事务型 <code>lerobot_v3</code> 按 Subtask 切分导出</strong>。
+</p>
+
+以下单条轨迹 HUD 演示直接由本平台 `robo-vlm-qc render-mp4`（`viz_mp4` 1080p@30fps Studio HUD 渲染器）基于开源 HuggingFace LeRobot ALOHA 双臂多相机数据集（[`lerobot/aloha_static_cups_open`](https://huggingface.co/datasets/lerobot/aloha_static_cups_open) 与 [`lerobot/aloha_static_pro_pencil`](https://huggingface.co/datasets/lerobot/aloha_static_pro_pencil)）生成：
 
 ### 1. 双臂协同开杯盖（`aloha_static_cups_open`）— `cut_clean` · `mask_loss` · `keep_positive`
 
@@ -125,15 +139,16 @@
   - 轻量护栏（`hallucination`、`splice_gate`、`visual_gate`）不主动产生标签，仅在切段跳变超限时将不安全的 `cut_clean` 自动降级为 `mask_loss`。
 - **机械臂与人手通用提示词 & 11 个纯视觉标签（[`configs/labels.yaml`](configs/labels.yaml)）**：纯视觉语义分类与切段策略解耦，默认任务模板（[`configs/tasks/_default.yaml`](configs/tasks/_default.yaml)）与 S1–S5 提示词（[`configs/prompts/`](configs/prompts/)）全面兼容**机械臂/夹爪**与**人类双手/第一视角演示视频**。
 - **一键替换 VLM API / 模型 & 全站中英双语 Studio（`中 / EN`）**：Lead 可在顶部导航栏点击 **`Model / API`** 弹窗一键套用预设（OpenAI、DashScope、Gemini、本地 vLLM、自定义中转站）、配置 Base URL / 统一或 S1–S5 分阶段模型并实时执行 **测试连通性**（`GET/PUT /api/settings/vlm`、`POST /api/settings/vlm/test`），也可使用 `robo-vlm-qc config-vlm` 命令行一行完成切换；API Key 仅以 `0600` 权限安全写入 `<workspace>/.env`，不进 YAML 且绝不明文回传。Web Studio 全站支持顶部一键 **中 / 英双语切换**（`localStorage` 持久化）、重做后的 Layer 2 成败判据交互面板，以及审核页（单条 JSON 直下或跳往导出中心预填）与队列批量快捷导出入口。
+- **未识别 `_default` 轨迹人工干预 & AI 辅助 `TaskSpec` 新任务接入**：目录名或元数据未命中现有任务的轨迹自动归入 `_default`，并在队列页与审核页醒目标记，支持一键 **`未识别 (_default)`** 筛选胶囊与行内/批量重指定任务（`PATCH /api/episodes/{id}/task`、`POST /api/episodes/batch-task` 及 `ingest --task`）。Lead 可随时唤起可复用的 **「+ 新建任务 (AI)」向导**（`POST /api/lab/tasks/draft`），输入任意中/英文任务说明并自动附带样例轨迹均匀抽取的 4–6 帧关键画面，一键生成标准化英文 S1–S5 `TaskSpec`（含 `goal`、`steps`、`criteria`、`task_prompt`、`grounding_objects` 以及自动清洗非法序列号/设备词后的安全 `match`/`aliases`），人工微调保存后立即完成目标轨迹归类。
 - **单一真相存储（[`robo_vlm_qc/store/`](robo_vlm_qc/store/)）**：由 Pydantic v2 强类型契约（`VlmRunArtifact`、`HumanReviewArtifact`、`ResolvedEpisode`）驱动，底层采用 SQLite WAL（`robo_vlm_qc.db`）、不可变 JSON 制品（`artifacts/`）以及 `.history/` 配置变更快照。
 - **`VLM Lab` 纯上下文迭代闭环（[`robo_vlm_qc/lab/`](robo_vlm_qc/lab/)）**：自动化 6 桶错因诊断（`VLM 原始输出 vs 人工 GT`）、一键 2×2 视觉/文本错题本 Few-Shot 注入 S3/S4、未知异常归类（`merge` / `promote`）、`.history/` 差异对比与一键回滚、辅助 Prompt 改写建议（`prompt_assist`），以及 100% 复用 S1/S2/S5 缓存的 GT 回归评测沙盒（**严格纯 In-Context，零 VLM SFT/DPO/LoRA 微调导出**）。
 - **4-Out 事务型导出器（[`robo_vlm_qc/export/`](robo_vlm_qc/export/)）**：共享 `PieceSlicer`（Smoothstep + SO(3) 测地线尾段平滑、`is_tail`、`action_loss_mask`、`subtask_index`）与原子 `_staging → rename` 导出器（`lerobot_v3`、`h5_clean`、`zero_copy_index`、`viz_mp4`），支持 3 种训练配方（`bc_clean`、`recovery_plus`、`badcase_pairs`）。`lerobot_v3` 新增自适应 **`state_schema_mode`**（默认 `auto`：同维度原生 LeRobot 数据如 ALOHA 14D/Franka 7D 自动保留原维度与特征名，纯视频 `video_dir` 不写 81 维假零向量，H5/异构混合自动归一 81 维）与双模式 Subtask 导出（帧级 `subtask_index` + 含 `instruction` 列的 `meta/subtasks.parquet`，以及可选 **`split_by_subtask`** 按子任务切分为独立 Episode，使 `task` 直接填入子任务指令）。
 
 ---
 
-## 30 秒合成 Demo 快速体验
+## 60 秒免 API Key 零门槛快速体验
 
-无需外部数据集或 API Key，即可在本地完整体验数据接入与双角色 Studio 界面：
+> **零 API Key 演示模式（Zero-API-Key Demo Mode）**：无需下载任何外部数据集，也无需配置 VLM API Key。下面三条命令即可在 60 秒内于本机生成多相机 `video_dir` 与 81 维 `lerobot` v3 合成轨迹、以严格只读方式完成入库，并启动完整双角色 NLE Web Studio、队列编排与 `lerobot_v3` 导出中心。
 
 ### 1. 环境准备与安装
 
@@ -263,7 +278,7 @@ docker compose up --build
 | **11 个纯视觉标签** | `boundary_idle`、`mid_idle_freeze`、`missed_grasp_retry`、`object_slip_recovery`、`placement_redo`、`hesitation_oscillation`、`collision_or_knock`、`precision_fine_adjust`、`bimanual_assist_hold`、`terminal_failure`、`unknown_anomaly`。 |
 | **内置示例任务** | [`_default.yaml`](configs/tasks/_default.yaml)（兼容机械臂与人类双手第一视角视频）、[`pick_and_place.yaml`](configs/tasks/pick_and_place.yaml)、[`bimanual_handover.yaml`](configs/tasks/bimanual_handover.yaml)。 |
 | **因果 DAG 与缓存** | `S1`（Pass-0 开放词表锁定 + 自定义物体 + 时序分批 2D 定位 + 抗跳变 BAFT 稠密追踪：光流一致性自适应锚点降权）→ `S2 ∥ S5`（注入 S1 物体状态的 Subtask 阶段与 VLA `instruction` + 审核页按需 `/infer-subtasks` 基于精准 QC 分割重判 ∥ 尾段稠密成败判定与 30% 反误报对照）→ `S3`（滑窗异常发现 + S2 保护 + Few-Shot）→ `S4A/S4B`（去重合并 + 0.5s 边界精修）。仅重跑 `S1` 完整保留 `S2`–`S5` 缓存，修改 S3/标签/Few-Shot 时 S1/S2/S5 `StageCache` 100% 命中，并支持中途 VLM 协作取消与原子 SSE 状态回滚。 |
-| **双角色 Studio 与双语** | `Reviewer` 与 `Lead` 共用同一 `ReviewStudioPage`，支持深浅双主题、实时**中英双语切换（`中 / EN`）**、TopNav 一键切换 `Model / API`（`0600` `.env` 密钥隔离）、审核页/队列快捷导出，以及严格三层编辑（`qc_segments`、`success`、`macro_stages` 子任务；`grounding`、`arm_timelines` 与 `raw_vlm_segments` 严格只读）。 |
+| **双角色 Studio 与双语** | `Reviewer` 与 `Lead` 共用同一 `ReviewStudioPage`，支持深浅双主题、实时**中英双语切换（`中 / EN`）**、TopNav 一键切换 `Model / API`（`0600` `.env` 密钥隔离）、`_default` 未识别任务干预与 AI `TaskSpec` 新任务向导、审核页/队列快捷导出，以及严格三层编辑（`qc_segments`、`success`、`macro_stages` 子任务；`grounding`、`arm_timelines` 与 `raw_vlm_segments` 严格只读）。 |
 | **`VLM Lab` 上下文闭环** | `GT 冻结` → `6 桶错因诊断` → `2×2 视觉 Few-Shot` / `未知异常归类` / `版本化配置` → `GT 沙盒回归` → `一键发布`（含 `.history/` 快照回滚）。**绝不包含 VLM SFT/DPO/LoRA 微调导出。** |
 
 ---
@@ -277,3 +292,19 @@ docker compose up --build
 - **[`SECURITY.md`](SECURITY.md)** — 安全漏洞报告流程与部署加固建议。
 - **[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)** — 社区行为准则（Contributor Covenant v2.1）。
 - **[`LICENSE`](LICENSE)** — Apache License 2.0。
+
+---
+
+## 引用 (Citation)
+
+如果 **DDBR（`robo_vlm_qc`）** 对您的机器人数据清洗、VLA 训练数据策展或具身智能研究有所帮助，欢迎引用：
+
+```bibtex
+@software{ddbr_robo_vlm_qc_2026,
+  title        = {DDBR (robo\_vlm\_qc): Splice-Safe VLM Trajectory QC and NLE Studio for Embodied AI},
+  author       = {DDBR Contributors},
+  year         = {2026},
+  url          = {https://github.com/LVultimatefun/DDBR},
+  license      = {Apache-2.0}
+}
+```
