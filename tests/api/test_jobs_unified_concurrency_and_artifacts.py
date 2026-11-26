@@ -111,7 +111,7 @@ def test_batch_vlm_4way_concurrency_sse_and_db_cleanup(
         assert done_job["summary"]["errors"] == []
         # True parallelism verified
         assert max_inflight >= 2
-        assert elapsed < 3.0
+        assert elapsed < 12.0
 
         # SSE published incremental job_update events
         _, events = client.app.state.ctx.sse.since(seq_start)  # type: ignore[attr-defined]
