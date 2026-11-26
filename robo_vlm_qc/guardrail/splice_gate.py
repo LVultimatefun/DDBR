@@ -110,21 +110,28 @@ def apply_splice_gate(
             out.append(seg)
             continue
 
-        # Boundary idle at trajectory edges passes directly
-        if seg.label_id == "boundary_idle" and (
-            seg.t_start <= edge_tol_s + 1e-6 or (seg.t_end + 1e-6) >= max(0.0, dur - edge_tol_s)
-        ):
+        # Boundary idle at trajectory edges passes directly and snaps to exact edge to avoid orphan slivers
+        touches_start = seg.t_start <= edge_tol_s + 1e-6
+        touches_end = (seg.t_end + 1e-6) >= max(0.0, dur - edge_tol_s)
+        if seg.label_id == "boundary_idle" and (touches_start or touches_end):
+            snap_t_start = 0.0 if touches_start else seg.t_start
+            snap_t_end = round(dur, 3) if touches_end else seg.t_end
+            if snap_t_end <= snap_t_start:
+                snap_t_start = seg.t_start
+                snap_t_end = seg.t_end
             out.append(
                 seg.model_copy(
                     update={
+                        "t_start": snap_t_start,
+                        "t_end": snap_t_end,
                         "guardrail": GuardrailReport(
                             gate_type="splice_gate",
                             passed=True,
                             downgraded=False,
                             metrics=seg.guardrail.metrics,
-                            opt_t_start=seg.t_start,
-                            opt_t_end=seg.t_end,
-                        )
+                            opt_t_start=snap_t_start,
+                            opt_t_end=snap_t_end,
+                        ),
                     }
                 )
             )

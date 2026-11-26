@@ -74,6 +74,14 @@ def main(ctx: click.Context, workspace: Path, config_dir: Path | None) -> None:
     default=None,
     help="Optional dataset name override for all ingested episodes.",
 )
+@click.option(
+    "--task",
+    "--task-id",
+    "task_override",
+    type=str,
+    default=None,
+    help="Optional explicit task_id override for all ingested episodes (or 'auto').",
+)
 @click.option("--dry-run", is_flag=True, help="Discover & validate without writing DB.")
 @click.option("--json", "as_json", is_flag=True, help="Print JSON summary.")
 @click.pass_context
@@ -82,6 +90,7 @@ def ingest_cmd(
     data_paths: tuple[Path, ...],
     adapter: str,
     dataset_override: str | None,
+    task_override: str | None,
     dry_run: bool,
     as_json: bool,
 ) -> None:
@@ -94,6 +103,34 @@ def ingest_cmd(
 
     cfg_ws = workspace if (workspace / "configs_override").is_dir() else None
     cfg_mgr = ConfigManager(config_dir=config_dir, workspace_dir=cfg_ws)
+    eff_task_override: str | None = None
+    if task_override is not None:
+        cleaned_task = task_override.strip()
+        if cleaned_task and cleaned_task.lower() != "auto":
+            if cleaned_task not in cfg_mgr.tasks:
+                msg = (
+                    f"Unknown --task {cleaned_task!r}. "
+                    f"Configured tasks: {', '.join(sorted(cfg_mgr.tasks))}"
+                )
+                if as_json:
+                    click.echo(
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "error": msg,
+                                "discovered": 0,
+                                "inserted": 0,
+                                "updated": 0,
+                                "skipped": 0,
+                                "errors": [],
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
+                else:
+                    click.echo(msg, err=True)
+                sys.exit(1)
+            eff_task_override = cleaned_task
     task_patterns = cfg_mgr.task_patterns()
 
     repo: Repository | None = None if dry_run else Repository(workspace)
@@ -142,12 +179,15 @@ def ingest_cmd(
                 with ad.open(handle) as view:
                     meta = view.meta
                     ds_name = dataset_override or meta.dataset
-                    h5_hint = meta.extra_meta.get("h5_task_name") or meta.extra_meta.get(
-                        "ep_task_str"
-                    )
-                    resolved_task = cfg_mgr.resolve_task(
-                        ds_name, str(h5_hint) if h5_hint else None
-                    ).task_id
+                    if eff_task_override is not None:
+                        resolved_task = eff_task_override
+                    else:
+                        h5_hint = meta.extra_meta.get("h5_task_name") or meta.extra_meta.get(
+                            "ep_task_str"
+                        )
+                        resolved_task = cfg_mgr.resolve_task(
+                            ds_name, str(h5_hint) if h5_hint else None
+                        ).task_id
                     if ds_name != meta.dataset or resolved_task != meta.task_id:
                         meta = meta.model_copy(
                             update={

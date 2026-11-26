@@ -84,6 +84,16 @@ class IngestParamsPayload(BaseModel):
     path: str | None = None
     adapter: Literal["auto", "h5_raw_v3", "lerobot", "video_dir"] = "auto"
     dataset: str | None = None
+    task_id: str | None = None
+
+
+def _normalize_ingest_task_override(raw_task_id: str | None) -> str | None:
+    if raw_task_id is None:
+        return None
+    cleaned = str(raw_task_id).strip()
+    if not cleaned or cleaned.lower() == "auto":
+        return None
+    return cleaned
 
 
 class JobCreatePayload(BaseModel):
@@ -475,6 +485,9 @@ def _run_job_worker(
                 if ing_payload.dataset and ing_payload.dataset.strip()
                 else None
             )
+            task_override = _normalize_ingest_task_override(ing_payload.task_id)
+            if task_override is not None and task_override not in cfg.tasks:
+                raise ValueError(f"Unknown task_id: {task_override!r}")
             resolved_roots = [
                 resolve_allowed_path(p, state.allowed_data_roots) for p in raw_paths
             ]
@@ -511,12 +524,15 @@ def _run_job_worker(
                     with ad.open(handle) as view:
                         meta = view.meta
                         ds_name = dataset_override or meta.dataset
-                        h5_hint = meta.extra_meta.get("h5_task_name") or meta.extra_meta.get(
-                            "ep_task_str"
-                        )
-                        resolved_task = cfg.resolve_task(
-                            ds_name, str(h5_hint) if h5_hint else None
-                        ).task_id
+                        if task_override is not None:
+                            resolved_task = task_override
+                        else:
+                            h5_hint = meta.extra_meta.get("h5_task_name") or meta.extra_meta.get(
+                                "ep_task_str"
+                            )
+                            resolved_task = cfg.resolve_task(
+                                ds_name, str(h5_hint) if h5_hint else None
+                            ).task_id
                         if ds_name != meta.dataset or resolved_task != meta.task_id:
                             meta = meta.model_copy(
                                 update={
@@ -713,6 +729,14 @@ def create_job(
                 validate_id_part(ing_payload.dataset.strip(), "dataset")
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
+        task_override = _normalize_ingest_task_override(ing_payload.task_id)
+        if task_override is not None:
+            cfg = state.get_config()
+            if task_override not in cfg.tasks:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unknown task_id: {task_override!r}",
+                )
         for rp in raw_paths:
             resolved_p = resolve_allowed_path(rp, state.allowed_data_roots)
             if not resolved_p.exists():

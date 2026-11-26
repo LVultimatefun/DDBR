@@ -170,6 +170,240 @@ def list_episodes(
     }
 
 
+class AssignTaskPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(min_length=1)
+    allow_frozen: bool = False
+
+
+class BatchAssignTaskPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    episode_ids: list[str]
+    task_id: str = Field(min_length=1)
+    allow_frozen: bool = False
+
+
+def _is_vlm_active(state: AppState, episode_id: str, row_status: str) -> bool:
+    if row_status in (
+        EpisodeStatus.VLM_QUEUED.value,
+        EpisodeStatus.VLM_RUNNING.value,
+    ):
+        return True
+    lock = getattr(state, "_jobs_lock", None)
+    active_map = getattr(state, "_active_vlm_episodes", None)
+    if lock is not None and isinstance(active_map, dict):
+        with lock:
+            return episode_id in active_map
+    return False
+
+
+@router.get("/tasks")
+def list_episode_tasks(
+    auth: AuthContext = Depends(require_auth),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    _ = auth
+    cfg = state.get_config()
+    ordered_ids = sorted(tid for tid in cfg.tasks if tid != "_default")
+    if "_default" in cfg.tasks:
+        ordered_ids.append("_default")
+    tasks = [
+        {
+            "task_id": spec.task_id,
+            "title": spec.title,
+            "description": spec.description,
+            "goal": spec.goal,
+            "match": list(spec.match),
+            "aliases": list(spec.aliases),
+            "grounding_objects_count": len(spec.grounding_objects),
+        }
+        for tid in ordered_ids
+        for spec in (cfg.tasks[tid],)
+    ]
+    return {"tasks": tasks, "total": len(tasks)}
+
+
+@router.post("/batch-task")
+def batch_assign_episode_task(
+    payload: BatchAssignTaskPayload,
+    auth: AuthContext = Depends(require_lead),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    _ = auth
+    new_tid = payload.task_id.strip()
+    cfg = state.get_config()
+    if new_tid not in cfg.tasks:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown task_id: {new_tid!r}",
+        )
+
+    unique_ids = list(
+        dict.fromkeys(str(eid).strip() for eid in payload.episode_ids if str(eid).strip())
+    )
+    if not unique_ids:
+        raise HTTPException(
+            status_code=422,
+            detail="episode_ids must contain at least one episode_id",
+        )
+
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for eid in unique_ids:
+        try:
+            rows_by_id[eid] = state.repo.get_episode_row(eid)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    active_vlm_ids = [
+        eid
+        for eid in unique_ids
+        if _is_vlm_active(state, eid, str(rows_by_id[eid]["status"]))
+    ]
+    if active_vlm_ids:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot reassign task_id while VLM is queued or running for episode(s): "
+                f"{', '.join(active_vlm_ids)}"
+            ),
+        )
+
+    if not payload.allow_frozen:
+        frozen_ids = [
+            eid
+            for eid in unique_ids
+            if str(rows_by_id[eid]["status"]) == EpisodeStatus.GT_FROZEN.value
+        ]
+        if frozen_ids:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Episode(s) are gt_frozen ({', '.join(frozen_ids)}); "
+                    "pass allow_frozen=true to confirm task_id reassignment"
+                ),
+            )
+
+    try:
+        updated_rows = state.repo.update_episodes_task_id(unique_ids, new_tid)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    updated_by_id = {str(r["episode_id"]): r for r in updated_rows}
+    has_active_runs = 0
+    re_run_recommended_ids: list[str] = []
+    for eid in unique_ids:
+        old_tid = str(rows_by_id[eid]["task_id"])
+        after_row = updated_by_id[eid]
+        has_run = bool(after_row.get("active_run_id"))
+        if has_run:
+            has_active_runs += 1
+        if old_tid != new_tid:
+            state.sse.publish(
+                {
+                    "type": "episode_updated",
+                    "episode_id": eid,
+                    "task_id": new_tid,
+                    "previous_task_id": old_tid,
+                    "status": str(after_row["status"]),
+                }
+            )
+            if has_run:
+                re_run_recommended_ids.append(eid)
+
+    return {
+        "task_id": new_tid,
+        "updated": len(updated_rows),
+        "episode_ids": unique_ids,
+        "has_active_runs": has_active_runs,
+        "re_run_recommended_ids": re_run_recommended_ids,
+    }
+
+
+@router.patch("/{ep_id:path}/task")
+def assign_episode_task(
+    ep_id: str,
+    payload: AssignTaskPayload,
+    auth: AuthContext = Depends(require_auth),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    new_tid = payload.task_id.strip()
+    cfg = state.get_config()
+    if new_tid not in cfg.tasks:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown task_id: {new_tid!r}",
+        )
+
+    try:
+        row = state.repo.get_episode_row(ep_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    ep_status = str(row["status"])
+    old_tid = str(row["task_id"])
+
+    if _is_vlm_active(state, ep_id, ep_status):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Episode {ep_id!r} has an active VLM job ({ep_status}); "
+                "wait or cancel before reassigning task_id"
+            ),
+        )
+
+    if auth.role == "reviewer":
+        if (
+            old_tid != "_default"
+            or ep_status == EpisodeStatus.GT_FROZEN.value
+            or new_tid == "_default"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Reviewers may only reassign non-frozen unrecognized (_default) episodes "
+                    "to an existing non-_default task"
+                ),
+            )
+    else:
+        if ep_status == EpisodeStatus.GT_FROZEN.value and not payload.allow_frozen:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Episode {ep_id!r} is gt_frozen; pass allow_frozen=true "
+                    "to confirm task_id reassignment"
+                ),
+            )
+
+    try:
+        updated_row = state.repo.update_episode_task_id(ep_id, new_tid)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    if old_tid != new_tid:
+        state.sse.publish(
+            {
+                "type": "episode_updated",
+                "episode_id": ep_id,
+                "task_id": new_tid,
+                "previous_task_id": old_tid,
+                "status": str(updated_row["status"]),
+            }
+        )
+
+    has_active_run = bool(updated_row.get("active_run_id"))
+    re_run_recommended = (old_tid != new_tid) and has_active_run
+    return {
+        "episode_id": ep_id,
+        "previous_task_id": old_tid,
+        "task_id": new_tid,
+        "status": str(updated_row["status"]),
+        "has_active_run": has_active_run,
+        "re_run_recommended": re_run_recommended,
+    }
+
+
 def _build_check_splice_metrics(
     gm: GuardrailMetrics | None = None,
     *,

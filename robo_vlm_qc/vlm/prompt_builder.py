@@ -6,7 +6,10 @@ import json
 import re
 from typing import Any, Sequence
 
+import numpy as np
+
 from ..config import ConfigManager
+from ..io.base import KinematicsTrack
 from ..io.media import select_tile_mode
 from ..models.annotation import GroundingResult, MacroStage, QcSegment
 from ..models.taxonomy import FewShotItem, LabelRegistry, PromptBundle, TaskSpec
@@ -247,28 +250,33 @@ def format_qc_segments_summary(
     return "\n".join(parts)
 
 
-def format_labels_desc(labels: LabelRegistry) -> str:
+def _sanitize_inactive_labels(text: str, labels: LabelRegistry) -> str:
     inactive_ids = {lbl.id for lbl in labels.labels if lbl.status != "active"}
+    if not inactive_ids:
+        return text
+    out = text
+    for bad_id in inactive_ids:
+        out = re.sub(rf"\(\s*{re.escape(bad_id)}\s*\)", "", out)
+        out = re.sub(rf"\b{re.escape(bad_id)}\b", "", out)
+    return out.strip()
 
-    def _sanitize_inactive(text: str) -> str:
-        out = text
-        for bad_id in inactive_ids:
-            out = re.sub(rf"\(\s*{re.escape(bad_id)}\s*\)", "", out)
-            out = re.sub(rf"\b{re.escape(bad_id)}\b", "", out)
-        return out.strip()
 
+def format_labels_desc(labels: LabelRegistry) -> str:
     lines: list[str] = []
     for lbl in labels.labels:
         if lbl.status != "active":
             continue
-        cues = "; ".join(_sanitize_inactive(c) for c in lbl.vlm_semantics.visual_cues[:2])
+        cues = "; ".join(
+            _sanitize_inactive_labels(c, labels) for c in lbl.vlm_semantics.visual_cues[:2]
+        )
         counter = "; ".join(
-            _sanitize_inactive(c) for c in lbl.vlm_semantics.counter_examples[:2]
+            _sanitize_inactive_labels(c, labels)
+            for c in lbl.vlm_semantics.counter_examples[:2]
         )
         line = (
             f"- {lbl.id} ({lbl.name} | category={lbl.category} | "
             f"default_role={lbl.default_training_role} | default_policy={lbl.default_splice_policy}): "
-            f"{_sanitize_inactive(lbl.vlm_semantics.definition)}"
+            f"{_sanitize_inactive_labels(lbl.vlm_semantics.definition, labels)}"
         )
         if cues:
             line += f" Visual cues: {cues}."
@@ -340,6 +348,189 @@ def format_few_shots_text(
         few_shots, task_id=task_id, top_k=top_k, max_tokens=max_tokens
     )
     return "\n".join(_format_single_few_shot(fs) for fs in chosen)
+
+
+def _compute_smoothed_velocities(
+    ts: np.ndarray,
+    pts: np.ndarray,
+    *,
+    smooth_s: float = 0.3,
+) -> np.ndarray:
+    """Compute ~0.3s time-averaged 3D velocity (m/s) per valid sample."""
+    n = len(ts)
+    if n < 2:
+        return np.zeros((n, 3), dtype=np.float64)
+    half_s = 0.5 * max(0.05, float(smooth_s))
+    lo_idx = np.clip(np.searchsorted(ts, ts - half_s, side="left"), 0, n - 1)
+    hi_idx = np.clip(np.searchsorted(ts, ts + half_s, side="right") - 1, 0, n - 1)
+    same = hi_idx <= lo_idx
+    if np.any(same):
+        hi_idx = np.where(same & (hi_idx < n - 1), hi_idx + 1, hi_idx)
+        same2 = hi_idx <= lo_idx
+        lo_idx = np.where(same2 & (lo_idx > 0), lo_idx - 1, lo_idx)
+    dt = ts[hi_idx] - ts[lo_idx]
+    vel = np.zeros((n, 3), dtype=np.float64)
+    good = dt > 1e-4
+    vel[good] = (pts[hi_idx[good]] - pts[lo_idx[good]]) / dt[good, None]
+    return vel
+
+
+def _summarize_arm_bucket(
+    t_b: np.ndarray,
+    pts_b: np.ndarray,
+    vel_b: np.ndarray,
+    *,
+    min_speed_cm_s: float = 1.5,
+    rev_dot_thresh: float = -0.25,
+    debounce_s: float = 0.25,
+) -> tuple[float, float, float, int, float, str]:
+    diffs = np.diff(pts_b, axis=0)
+    path_cm = float(np.sum(np.linalg.norm(diffs, axis=1))) * 100.0
+    net_cm = float(np.linalg.norm(pts_b[-1] - pts_b[0])) * 100.0
+    backtrack_ratio = path_cm / max(net_cm, 0.5)
+
+    speeds_cm_s = np.linalg.norm(vel_b, axis=1) * 100.0
+    low_speed_pct = float(np.mean(speeds_cm_s < min_speed_cm_s)) * 100.0
+
+    reversals = 0
+    ref_dir: np.ndarray | None = None
+    last_rev_t = -1e9
+    for idx in range(len(t_b)):
+        spd = float(speeds_cm_s[idx])
+        if spd < min_speed_cm_s:
+            continue
+        u = vel_b[idx] / (spd / 100.0)
+        if ref_dir is None:
+            ref_dir = u
+            continue
+        if float(np.dot(ref_dir, u)) < rev_dot_thresh and (
+            float(t_b[idx]) - last_rev_t
+        ) >= debounce_s:
+            reversals += 1
+            last_rev_t = float(t_b[idx])
+            ref_dir = u
+
+    # Purely descriptive kinematic tag (never a QC label or rule detector)
+    if path_cm < 1.5 and low_speed_pct >= 80.0:
+        tag = "[low-speed stall]"
+    elif (
+        (reversals >= 2 and backtrack_ratio >= 2.2)
+        or (path_cm >= 4.0 and backtrack_ratio >= 3.0)
+        or (reversals >= 3 and path_cm >= 3.0)
+    ):
+        tag = "[high-backtrack / low-net-progress]"
+    elif net_cm >= 3.0 and backtrack_ratio <= 1.6 and reversals == 0:
+        tag = "[steady unidirectional progress]"
+    elif low_speed_pct >= 75.0 and net_cm < 2.0:
+        tag = "[low-speed stall]"
+    else:
+        tag = "[slow fine-adjust / turn]"
+    return path_cm, net_cm, backtrack_ratio, reversals, low_speed_pct, tag
+
+
+def format_window_kinematics_summary(
+    kinematics: KinematicsTrack | None,
+    window_start_s: float,
+    window_end_s: float,
+    *,
+    slice_s: float = 2.0,
+) -> str:
+    """Format objective 30Hz EEF kinematics statistics per slice for VLM cross-verification.
+
+    Purely factual telemetry summary -- NEVER generates QC segments or rule detections.
+    Returns "" gracefully when kinematics is unavailable or has insufficient valid samples.
+    """
+    if kinematics is None:
+        return ""
+    eef_pos = getattr(kinematics, "eef_pos", None)
+    timestamps_s = getattr(kinematics, "timestamps_s", None)
+    if eef_pos is None or timestamps_s is None:
+        return ""
+
+    pos = np.asarray(eef_pos, dtype=np.float64)
+    ts = np.asarray(timestamps_s, dtype=np.float64)
+    if pos.ndim != 3 or ts.ndim != 1 or pos.shape[0] != len(ts) or pos.shape[0] < 2:
+        return ""
+    if pos.shape[1] < 1 or pos.shape[2] < 3:
+        return ""
+
+    w0 = float(window_start_s)
+    w1 = float(window_end_s)
+    if w1 <= w0 + 1e-6:
+        return ""
+
+    raw_valid = getattr(kinematics, "valid_mask", None)
+    if raw_valid is not None and len(raw_valid) == len(ts):
+        base_valid = np.asarray(raw_valid, dtype=bool) & np.isfinite(ts)
+    else:
+        base_valid = np.isfinite(ts)
+
+    n_arms = min(2, pos.shape[1])
+    arm_names = ("L", "R")[:n_arms]
+    pad_s = 0.35
+
+    # Precompute ~0.3s smoothed velocity per arm on valid local slice [w0-pad, w1+pad]
+    arm_series: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for arm_idx, arm_name in enumerate(arm_names):
+        arm_ok = base_valid & np.all(np.isfinite(pos[:, arm_idx, :3]), axis=1)
+        loc_mask = arm_ok & (ts >= w0 - pad_s) & (ts <= w1 + pad_s)
+        t_loc = ts[loc_mask]
+        if len(t_loc) < 2:
+            continue
+        p_loc = pos[loc_mask, arm_idx, :3]
+        if np.any(np.diff(t_loc) < 0.0):
+            order = np.argsort(t_loc, kind="mergesort")
+            t_loc = t_loc[order]
+            p_loc = p_loc[order]
+        v_loc = _compute_smoothed_velocities(t_loc, p_loc, smooth_s=0.3)
+        arm_series[arm_name] = (t_loc, p_loc, v_loc)
+
+    if not arm_series:
+        return ""
+
+    step = max(0.5, float(slice_s))
+    buckets: list[tuple[float, float]] = []
+    cur = w0
+    while cur < w1 - 1e-6:
+        nxt = min(w1, cur + step)
+        if buckets and (w1 - cur) < 0.5 and (w1 - w0) > step:
+            prev_s, _ = buckets[-1]
+            buckets[-1] = (prev_s, w1)
+            break
+        buckets.append((cur, nxt))
+        cur = nxt
+
+    lines: list[str] = []
+    for b0, b1 in buckets:
+        parts: list[str] = []
+        for arm_name in arm_names:
+            series = arm_series.get(arm_name)
+            if series is None:
+                continue
+            t_loc, p_loc, v_loc = series
+            b_mask = (t_loc >= b0 - 1e-6) & (t_loc <= b1 + 1e-6)
+            if int(np.sum(b_mask)) < 2:
+                continue
+            path_cm, net_cm, ratio, revs, low_pct, tag = _summarize_arm_bucket(
+                t_loc[b_mask], p_loc[b_mask], v_loc[b_mask]
+            )
+            parts.append(
+                f"{arm_name}: path={path_cm:.1f}cm, net={net_cm:.1f}cm, "
+                f"backtrack={ratio:.1f}x, reversals={revs}, low_speed={low_pct:.0f}% {tag}"
+            )
+        if parts:
+            lines.append(f"- [{b0:.2f}s..{b1:.2f}s] " + " | ".join(parts))
+
+    if not lines:
+        return ""
+
+    header = (
+        "Note: The following 30Hz objective end-effector kinematics telemetry is for cross-checking "
+        "with visual frames only; NEVER apply mechanically without visual confirmation. "
+        "Intentional cyclic task motions (such as wiping a whiteboard or stirring) are normal "
+        "even with a high backtrack ratio."
+    )
+    return "\n".join([header, *lines])
 
 
 class PromptBuilder:
@@ -415,7 +606,7 @@ class PromptBuilder:
             "task_prompt": t.task_prompt.strip() or "Ground all visibly active target objects and containers.",
         }
         return (
-            render_template(tpl.system_template, ctx),
+            _sanitize_inactive_labels(render_template(tpl.system_template, ctx), self.labels),
             render_template(tpl.user_template, ctx),
         )
 
@@ -550,6 +741,7 @@ class PromptBuilder:
         duration_s: float = 0.0,
         few_shots: Sequence[FewShotItem] | None = None,
         few_shot_items: Sequence[FewShotItem] | None = None,
+        kinematics_summary: str = "",
     ) -> tuple[str, str]:
         t = task or task_spec
         assert t is not None
@@ -563,6 +755,8 @@ class PromptBuilder:
         )
         ctx = {
             "task_id": t.task_id,
+            "task_goal": (t.goal or "").strip(),
+            "task_prompt": (t.task_prompt or "").strip(),
             "window_start_s": round(float(window_start_s), 2),
             "window_end_s": round(float(window_end_s), 2),
             "duration_s": round(float(duration_s), 2),
@@ -570,9 +764,10 @@ class PromptBuilder:
             "macro_backbone_text": format_macro_backbone(macro_stages),
             "labels_desc": format_labels_desc(self.labels),
             "few_shot_text": fs_text,
+            "kinematics_summary": kinematics_summary.strip(),
         }
         return (
-            render_template(tpl.system_template, ctx),
+            _sanitize_inactive_labels(render_template(tpl.system_template, ctx), self.labels),
             render_template(tpl.user_template, ctx),
         )
 
@@ -627,6 +822,7 @@ class PromptBuilder:
         window_start_s: float,
         window_end_s: float,
         few_shots: Sequence[FewShotItem] | None = None,
+        kinematics_summary: str = "",
     ) -> tuple[str, str]:
         t = task or task_spec
         assert t is not None
@@ -639,6 +835,8 @@ class PromptBuilder:
         )
         ctx = {
             "task_id": t.task_id,
+            "task_goal": (t.goal or "").strip(),
+            "task_prompt": (t.task_prompt or "").strip(),
             "seg_id": candidate.seg_id,
             "t_start": round(float(candidate.t_start), 2),
             "t_end": round(float(candidate.t_end), 2),
@@ -647,10 +845,12 @@ class PromptBuilder:
             "window_end_s": round(float(window_end_s), 2),
             "camera_layout_desc": describe_camera_layout(camera_roles),
             "macro_backbone_text": format_macro_backbone(macro_stages),
+            "labels_desc": format_labels_desc(self.labels),
             "few_shot_text": fs_text,
+            "kinematics_summary": kinematics_summary.strip(),
         }
         return (
-            render_template(tpl.system_template, ctx),
+            _sanitize_inactive_labels(render_template(tpl.system_template, ctx), self.labels),
             render_template(tpl.user_template, ctx),
         )
 
@@ -679,7 +879,7 @@ class PromptBuilder:
             "task_prompt": t.task_prompt.strip() or "Verify each completion criterion strictly from visual evidence.",
         }
         return (
-            render_template(tpl.system_template, ctx),
+            _sanitize_inactive_labels(render_template(tpl.system_template, ctx), self.labels),
             render_template(tpl.user_template, ctx),
         )
 
@@ -700,6 +900,8 @@ class PromptBuilder:
         )
         ctx = {
             "task_id": t.task_id,
+            "task_goal": (t.goal or "").strip(),
+            "task_prompt": (t.task_prompt or "").strip(),
             "cut_s": round(float(cut_s), 2),
             "criteria_list": criteria,
         }

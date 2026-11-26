@@ -30,7 +30,7 @@ class ZoomBox:
     y1: float
 
 
-DEFAULT_MAIN_ZOOM = ZoomBox(x0=0.25, y0=0.056, x1=0.875, y1=0.648)
+DEFAULT_MAIN_ZOOM = ZoomBox(x0=0.12, y0=0.10, x1=0.88, y1=0.86)
 DEFAULT_TORSO_ZOOM = ZoomBox(x0=0.20, y0=0.20, x1=0.80, y1=0.85)
 DEFAULT_SINGLE_ZOOM = ZoomBox(x0=0.20, y0=0.20, x1=0.80, y1=0.85)
 
@@ -385,6 +385,71 @@ def compose_2x2_tile(
             cv2.FONT_HERSHEY_SIMPLEX,
             0.52,
             (255, 255, 0),  # yellow in RGB
+            1,
+            cv2.LINE_AA,
+        )
+        canvas = np.vstack([bar, grid])
+    else:
+        canvas = grid
+    return np.ascontiguousarray(canvas, dtype=np.uint8)
+
+
+def compose_start_end_compare(
+    media: MediaSource,
+    camera_roles: dict[str, str],
+    t_start_s: float,
+    t_end_s: float,
+    *,
+    panel_w: int = 640,
+    panel_h: int = 360,
+    header_h: int = 30,
+    zoom_main: ZoomBox = DEFAULT_MAIN_ZOOM,
+    start_label: str | None = None,
+    end_label: str | None = None,
+) -> np.ndarray:
+    """Compose a high-res side-by-side MAIN-ZOOM START vs END RGB comparison tile."""
+    dur = max(0.0, float(media.duration_s))
+    t0 = max(0.0, min(dur, float(t_start_s)))
+    te = max(0.0, min(dur, float(t_end_s)))
+
+    main_cam = camera_roles.get("main")
+    if not main_cam and media.cameras:
+        main_cam = media.cameras[0].name
+
+    if main_cam:
+        f0 = media.read_frame_rgb(main_cam, t0)
+        fe = media.read_frame_rgb(main_cam, te)
+    else:
+        f0 = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+        fe = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
+
+    left = _crop_zoom(f0, zoom_main, panel_w, panel_h)
+    right = _crop_zoom(fe, zoom_main, panel_w, panel_h)
+    div_w = 4
+    div = np.full((panel_h, div_w, 3), (255, 40, 40), dtype=np.uint8)
+    grid = np.hstack([left, div, right])
+
+    if header_h > 0:
+        bar = np.zeros((header_h, grid.shape[1], 3), dtype=np.uint8)
+        lbl0 = start_label or f"START t={t0:05.2f}s (MAIN-ZOOM)"
+        lble = end_label or f"END t={te:05.2f}s (MAIN-ZOOM)"
+        cv2.putText(
+            bar,
+            lbl0,
+            (10, header_h - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (255, 255, 0),  # yellow in RGB
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            bar,
+            lble,
+            (panel_w + div_w + 10, header_h - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (80, 255, 140),  # green in RGB
             1,
             cv2.LINE_AA,
         )

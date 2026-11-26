@@ -31,6 +31,7 @@ from ...lab.eval_runner import (
 )
 from ...lab.few_shot import create_few_shot_example
 from ...lab.prompt_assist import suggest_prompt_updates
+from ...lab.task_assist import draft_task_spec
 from ...models.annotation import QcSegment
 from ...models.taxonomy import (
     DiagnosisErrorType,
@@ -137,6 +138,23 @@ class PromptAssistPayload(BaseModel):
     task_id: str | None = None
     episode_ids: list[str] | None = None
     top_n: int = Field(default=10, ge=1, le=200)
+
+
+class TaskDraftPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str = Field(min_length=1)
+    description: str = Field(min_length=3)
+    title: str | None = None
+    sample_episode_id: str | None = None
+    num_frames: int = Field(default=5, ge=4, le=6)
+
+    @field_validator("num_frames", mode="before")
+    @classmethod
+    def _reject_bool_num_frames(cls, v: Any) -> Any:
+        if isinstance(v, bool):
+            raise ValueError("num_frames must be an integer between 4 and 6")
+        return v
 
 
 def _unknown_triage_path(workspace: Path) -> Path:
@@ -357,6 +375,34 @@ def put_lab_tasks(
         "tasks": {tid: spec.model_dump(mode="json") for tid, spec in cfg_after.tasks.items()},
         "total": len(cfg_after.tasks),
     }
+
+
+@router.post("/tasks/draft")
+async def post_lab_tasks_draft(
+    payload: TaskDraftPayload,
+    auth: AuthContext = Depends(require_lead),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    _ = auth
+    cfg = state.get_config()
+    try:
+        return await run_in_threadpool(
+            draft_task_spec,
+            cfg,
+            task_id=payload.task_id,
+            description=payload.description,
+            title=payload.title,
+            sample_episode_id=payload.sample_episode_id,
+            num_frames=payload.num_frames,
+            workspace=state.workspace,
+            repo=state.repo,
+        )
+    except (NotFoundError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except VlmError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.get("/diagnosis")

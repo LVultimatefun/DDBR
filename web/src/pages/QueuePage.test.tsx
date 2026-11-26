@@ -258,6 +258,7 @@ describe("QueuePage", () => {
           path: "/data/demo_batch",
           adapter: "auto",
           dataset: "demo_new",
+          task_id: null,
         },
       }),
     );
@@ -673,5 +674,240 @@ describe("QueuePage", () => {
     expect(screen.getByTestId("lead-status-strip")).toHaveTextContent("待审核 (1)");
     expect(screen.getByTestId("batch-vlm-btn")).toHaveTextContent("批量运行 VLM");
     expect(screen.getByTestId("queue-export-selected-btn")).toHaveTextContent("导出已选 (0)");
+  });
+
+  it("highlights _default episodes, filters unrecognized, supports batch/inline assign with gt_frozen confirmation and Re-run VLM now", async () => {
+    const requestedUrls: string[] = [];
+    const patchCalls: Array<{ url: string; body: unknown }> = [];
+    const batchTaskCalls: unknown[] = [];
+    const jobBodies: unknown[] = [];
+
+    const items = [
+      makeEpisodeListItem({
+        episode_id: "ds/ep_unrec",
+        task_id: "_default",
+        status: "vlm_ready",
+      }),
+      makeEpisodeListItem({
+        episode_id: "ds/ep_frozen",
+        task_id: "_default",
+        status: "gt_frozen",
+      }),
+    ];
+
+    const taskCatalog = [
+      {
+        task_id: "pick_and_place",
+        title: "Pick and Place",
+        description: "Pick block",
+        goal: "Place block in bin",
+        match: ["*pick*"],
+        aliases: [],
+        grounding_objects_count: 2,
+      },
+      {
+        task_id: "_default",
+        title: "Default",
+        description: "",
+        goal: "",
+        match: [],
+        aliases: [],
+        grounding_objects_count: 0,
+      },
+    ];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        requestedUrls.push(`${method} ${url}`);
+
+        if (url === "/api/episodes/tasks" && method === "GET") {
+          return new Response(
+            JSON.stringify({ tasks: taskCatalog, total: taskCatalog.length }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith("/task") && method === "PATCH") {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          patchCalls.push({ url, body });
+          return new Response(
+            JSON.stringify({
+              episode_id: "ds/ep_unrec",
+              previous_task_id: "_default",
+              task_id: body.task_id,
+              status: "vlm_ready",
+              has_active_run: true,
+              re_run_recommended: true,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url === "/api/episodes/batch-task" && method === "POST") {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          batchTaskCalls.push(body);
+          return new Response(
+            JSON.stringify({
+              task_id: body.task_id,
+              updated: body.episode_ids.length,
+              episode_ids: body.episode_ids,
+              has_active_runs: 1,
+              re_run_recommended_ids: ["ds/ep_unrec"],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith("/api/jobs") && method === "POST") {
+          const body = JSON.parse(String(init?.body ?? "{}"));
+          jobBodies.push(body);
+          return new Response(
+            JSON.stringify(
+              makeJobStatus({
+                job_id: "job_rerun_after_task",
+                job_type: body.job_type,
+                status: "queued",
+                progress_done: 0,
+                progress_total: 1,
+              }),
+            ),
+            { status: 201 },
+          );
+        }
+        if (url.startsWith("/api/ingest/browse")) {
+          return new Response(
+            JSON.stringify({
+              current_path: "/data/new_set",
+              parent_path: "/data",
+              allowed_roots: ["/data"],
+              entries: [],
+              detected_adapters: [],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith("/api/lab/tasks") && method === "PUT") {
+          const spec = JSON.parse(String(init?.body ?? "{}"));
+          return new Response(
+            JSON.stringify({ tasks: { [spec.task_id]: spec }, total: 1 }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            items,
+            total: items.length,
+            status_counts: { vlm_ready: 1, gt_frozen: 1 },
+            facets: {
+              datasets: ["ds"],
+              task_ids: ["_default", "pick_and_place"],
+              adapter_types: ["h5_raw_v3"],
+            },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    render(
+      <AuthProvider initialAuth={{ token: "lead-tok", username: "lead_1", role: "lead" }}>
+        <MemoryRouter>
+          <QueuePage />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    // Warning badge shown on _default episodes
+    expect(await screen.findByTestId("default-task-badge-ds/ep_unrec")).toHaveTextContent(
+      "Unrecognized (_default)",
+    );
+
+    // Quick unrecognized filter chip toggles task_id=_default query param
+    fireEvent.click(screen.getByTestId("filter-unrecognized-chip"));
+    await waitFor(() =>
+      expect(requestedUrls.some((u) => u.includes("task_id=_default"))).toBe(true),
+    );
+
+    // Inline assign on ds/ep_unrec -> PATCH /api/episodes/ds/ep_unrec/task
+    fireEvent.click(screen.getByTestId("inline-assign-btn-ds/ep_unrec"));
+    await waitFor(() => expect(patchCalls).toHaveLength(1));
+    expect(patchCalls[0]).toEqual({
+      url: "/api/episodes/ds/ep_unrec/task",
+      body: { task_id: "pick_and_place" },
+    });
+
+    // Rerun VLM prompt banner appears and 1-click triggers fresh batch_vlm
+    expect(await screen.findByTestId("rerun-vlm-prompt-banner")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("rerun-vlm-now-btn"));
+    await waitFor(() =>
+      expect(jobBodies).toContainEqual({
+        job_type: "batch_vlm",
+        episode_ids: ["ds/ep_unrec"],
+        fresh: true,
+      }),
+    );
+
+    // Batch assign including gt_frozen episode requires explicit confirmation before allow_frozen: true
+    fireEvent.click(
+      screen.getByTestId("episode-row-ds/ep_frozen").querySelector("input[type='checkbox']")!,
+    );
+    fireEvent.click(screen.getByTestId("batch-assign-task-btn"));
+    expect(await screen.findByTestId("frozen-task-confirm-modal")).toBeInTheDocument();
+    expect(batchTaskCalls).toHaveLength(0);
+
+    fireEvent.click(screen.getByTestId("confirm-frozen-task-btn"));
+    await waitFor(() => expect(batchTaskCalls).toHaveLength(1));
+    expect(batchTaskCalls[0]).toEqual({
+      episode_ids: ["ds/ep_frozen"],
+      task_id: "pick_and_place",
+      allow_frozen: true,
+    });
+
+    // Inline "+ AI" on _default episode pre-fills initialSampleEpisodeId and assigns saved task
+    fireEvent.click(screen.getByTestId("inline-new-task-btn-ds/ep_unrec"));
+    expect(await screen.findByTestId("task-draft-wizard-modal")).toBeInTheDocument();
+    expect(
+      (screen.getByTestId("wizard-sample-episode-select") as HTMLSelectElement).value,
+    ).toBe("ds/ep_unrec");
+    fireEvent.change(screen.getByTestId("wizard-task-id-input"), {
+      target: { value: "fold_napkin" },
+    });
+    fireEvent.click(screen.getByTestId("wizard-blank-draft-btn"));
+    fireEvent.click(await screen.findByTestId("wizard-save-task-btn"));
+    await waitFor(() => expect(patchCalls).toHaveLength(2));
+    expect(patchCalls[1]).toEqual({
+      url: "/api/episodes/ds/ep_unrec/task",
+      body: { task_id: "fold_napkin" },
+    });
+
+    // IngestModal: create new task via AI wizard and auto-select it for ingest_params.task_id
+    fireEvent.click(screen.getByTestId("open-ingest-modal-btn"));
+    expect(await screen.findByTestId("ingest-task-select")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("ingest-new-task-btn"));
+    expect(await screen.findByTestId("task-draft-wizard-modal")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId("wizard-task-id-input"), {
+      target: { value: "sort_cups" },
+    });
+    fireEvent.click(screen.getByTestId("wizard-blank-draft-btn"));
+    fireEvent.click(await screen.findByTestId("wizard-save-task-btn"));
+
+    await waitFor(() =>
+      expect((screen.getByTestId("ingest-task-select") as HTMLSelectElement).value).toBe(
+        "sort_cups",
+      ),
+    );
+    fireEvent.click(screen.getByTestId("submit-ingest-btn"));
+    await waitFor(() =>
+      expect(jobBodies).toContainEqual({
+        job_type: "ingest",
+        ingest_params: {
+          path: "/data/new_set",
+          adapter: "auto",
+          dataset: null,
+          task_id: "sort_cups",
+        },
+      }),
+    );
   });
 });

@@ -16,6 +16,11 @@ from pydantic import BaseModel, Field
 
 from .models.taxonomy import LabelRegistry, PromptBundle, PromptTemplate, TaskSpec
 
+DEFAULT_VLM_PROVIDER = "openai_compat"
+DEFAULT_VLM_MODEL = "gpt-4o"
+DEFAULT_OPENAI_COMPAT_MODEL = "gpt-4o"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-pro"
+
 PROMPT_STAGE_FILES: dict[str, tuple[str, ...]] = {
     "s1_grounding": ("s1_grounding.yaml",),
     "s2_macro": ("s2_macro.yaml", "s2_macro_backbone.yaml"),
@@ -184,7 +189,9 @@ class ConfigManager:
             stage: canonical_sha256(getattr(self.prompts, stage).model_dump(mode="json"))
             for stage in PROMPT_STAGE_FILES
         }
-        model_routing_sha256 = canonical_sha256(stage_models)
+        model_routing_sha256 = canonical_sha256(
+            {"provider": self.vlm_provider(), "stage_models": stage_models}
+        )
         prompt_bundle_sha256 = canonical_sha256(stage_prompt_hashes)
         label_taxonomy_sha256 = canonical_sha256(self.labels.model_dump(mode="json"))
         task_spec_sha256 = canonical_sha256(
@@ -245,18 +252,34 @@ class ConfigManager:
 
         return self.tasks["_default"]
 
-    def stage_model(self, stage: str) -> str:
-        stage_models = self.settings.get("vlm", {}).get("stage_models", {})
-        return str(stage_models.get(stage, "gpt-4o"))
+    def vlm_provider(self) -> str:
+        return str(
+            self.settings.get("vlm", {}).get("provider", DEFAULT_VLM_PROVIDER)
+        ).strip().lower()
 
-    def s1_cache_basis(self, task_id: str) -> str:
+    def stage_model(self, stage: str) -> str:
+        vlm_cfg = self.settings.get("vlm", {})
+        stage_models = vlm_cfg.get("stage_models", {})
+        if stage in stage_models and stage_models[stage]:
+            return str(stage_models[stage])
+        prov = self.vlm_provider()
+        fallback = DEFAULT_GEMINI_MODEL if prov == "gemini" else DEFAULT_OPENAI_COMPAT_MODEL
+        return str(vlm_cfg.get("default_model") or fallback)
+
+    def s1_cache_basis(
+        self,
+        task_id: str,
+        *,
+        model_override: str | None = None,
+    ) -> str:
         """Isolated S1 basis: excludes labels, S3/S4/S5 prompts, and few-shots."""
         task = self.get_task(task_id)
         s1_cfg = self.settings.get("vlm", {}).get("s1_grounding", {})
         return canonical_sha256(
             {
                 "stage": "s1_grounding",
-                "model": self.stage_model("s1_grounding"),
+                "provider": self.vlm_provider(),
+                "model": model_override or self.stage_model("s1_grounding"),
                 "prompt": self.fingerprints.stage_prompt_hashes["s1_grounding"],
                 "task_id": task.task_id,
                 "grounding_objects": [
@@ -268,14 +291,20 @@ class ConfigManager:
             }
         )
 
-    def s2_cache_basis(self, task_id: str) -> str:
+    def s2_cache_basis(
+        self,
+        task_id: str,
+        *,
+        model_override: str | None = None,
+    ) -> str:
         """Isolated S2 basis: excludes labels, S3/S4/S5 prompts, and few-shots."""
         task = self.get_task(task_id)
         s2_cfg = self.settings.get("vlm", {}).get("s2_macro", {})
         return canonical_sha256(
             {
                 "stage": "s2_macro",
-                "model": self.stage_model("s2_macro"),
+                "provider": self.vlm_provider(),
+                "model": model_override or self.stage_model("s2_macro"),
                 "prompt": self.fingerprints.stage_prompt_hashes["s2_macro"],
                 "task_id": task.task_id,
                 "goal": task.goal,
@@ -285,14 +314,20 @@ class ConfigManager:
             }
         )
 
-    def s5_cache_basis(self, task_id: str) -> str:
-        """Isolated S5 basis: excludes labels, S3/S4 prompts, and few-shots."""
+    def s5_cache_basis(
+        self,
+        task_id: str,
+        *,
+        model_override: str | None = None,
+    ) -> str:
+        """Isolated S5 basis: excludes labels, S3/S4/S5 prompts, and few-shots."""
         task = self.get_task(task_id)
         s5_cfg = self.settings.get("vlm", {}).get("s5_success", {})
         return canonical_sha256(
             {
                 "stage": "s5_success",
-                "model": self.stage_model("s5_success"),
+                "provider": self.vlm_provider(),
+                "model": model_override or self.stage_model("s5_success"),
                 "prompt": self.fingerprints.stage_prompt_hashes["s5_success"],
                 "task_id": task.task_id,
                 "goal": task.goal,
@@ -302,13 +337,20 @@ class ConfigManager:
             }
         )
 
-    def s3_cache_basis(self, task_id: str, few_shot_hash: str = "") -> str:
+    def s3_cache_basis(
+        self,
+        task_id: str,
+        few_shot_hash: str = "",
+        *,
+        model_override: str | None = None,
+    ) -> str:
         task = self.get_task(task_id)
         s3_cfg = self.settings.get("vlm", {}).get("s3_discover", {})
         return canonical_sha256(
             {
                 "stage": "s3_discover",
-                "model": self.stage_model("s3_discover"),
+                "provider": self.vlm_provider(),
+                "model": model_override or self.stage_model("s3_discover"),
                 "prompt": self.fingerprints.stage_prompt_hashes["s3_discover"],
                 "labels": self.fingerprints.label_taxonomy_sha256,
                 "task": task.model_dump(mode="json"),
@@ -317,13 +359,20 @@ class ConfigManager:
             }
         )
 
-    def s4_cache_basis(self, task_id: str, few_shot_hash: str = "") -> str:
+    def s4_cache_basis(
+        self,
+        task_id: str,
+        few_shot_hash: str = "",
+        *,
+        model_override: str | None = None,
+    ) -> str:
         task = self.get_task(task_id)
         s4_cfg = self.settings.get("vlm", {}).get("s4_verify", {})
         return canonical_sha256(
             {
                 "stage": "s4_verify",
-                "model": self.stage_model("s4_verify"),
+                "provider": self.vlm_provider(),
+                "model": model_override or self.stage_model("s4_verify"),
                 "prompt": self.fingerprints.stage_prompt_hashes["s4_verify"],
                 "labels": self.fingerprints.label_taxonomy_sha256,
                 "task": task.model_dump(mode="json"),

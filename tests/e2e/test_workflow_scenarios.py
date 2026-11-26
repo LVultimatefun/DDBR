@@ -329,7 +329,17 @@ def test_scenario_02_causal_vlm_dag_splice_gate_and_1080p_mp4(
         "confidence": 0.89,
         "unknown_note": "",
     }
-    mock_vlm_server.set_stage_response("S3", {"segments": [unsafe_seg]})
+    unsafe_seg_a = {
+        **unsafe_seg,
+        "t_start": 1.2,
+        "t_end": 2.0,
+    }
+    unsafe_seg_b = {
+        **unsafe_seg,
+        "t_start": 2.1,
+        "t_end": 2.8,
+    }
+    mock_vlm_server.set_stage_response("S3", {"segments": [unsafe_seg_a, unsafe_seg_b]})
     mock_vlm_server.set_stage_response("S4A", {"merged_segments": [unsafe_seg]})
     mock_vlm_server.set_stage_response(
         "S4B",
@@ -456,7 +466,7 @@ def test_scenario_03_pure_video_dir_visual_gate_and_zero_copy(
 
     def _s4b_handler(req: dict[str, Any]) -> dict[str, Any]:
         txt = json.dumps(req["messages"], ensure_ascii=False)
-        if "boundary_idle" in txt:
+        if "initial label=boundary_idle" in txt:
             return {
                 "keep_segment": True,
                 "t_start": 0.0,
@@ -642,9 +652,9 @@ def test_scenario_04_lerobot_roundtrip_export_81d_and_subtasks(
 
     def _s4b_handler(req: dict[str, Any]) -> dict[str, Any]:
         txt = json.dumps(req["messages"], ensure_ascii=False)
-        if "boundary_idle" in txt:
+        if "initial label=boundary_idle" in txt:
             seg = cands[0]
-        elif "mid_idle_freeze" in txt:
+        elif "initial label=mid_idle_freeze" in txt:
             seg = cands[2]
         else:
             seg = cands[1]

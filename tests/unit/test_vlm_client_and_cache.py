@@ -18,8 +18,13 @@ from robo_vlm_qc.vlm.client import (
     BudgetTracker,
     VlmClient,
     VlmError,
+    build_interleaved_messages,
+    estimate_stage_cost_usd,
+    extract_json,
     parse_json,
     resolve_api_key,
+    resolve_client_stage_model,
+    resolve_stage_model,
 )
 
 
@@ -279,3 +284,58 @@ def test_budget_tracker_hierarchy_and_stage_cache(tmp_path: Path) -> None:
     cfg = ConfigManager()
     assert cfg.resolve_episode_budget_tokens(10.0) == 200000
     assert cfg.resolve_episode_budget_tokens(100.0) == 500000
+
+
+def test_interleaved_ascii_tags_with_none_timestamps_and_stage_model_helpers() -> None:
+    assert extract_json('{"k": 1}') == {"k": 1}
+
+    imgs = [np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(3)]
+    msgs = build_interleaved_messages(
+        system_prompt="sys",
+        user_prompt="usr",
+        images=imgs,
+        timestamps_s=[None, None, 2.5],
+        labels=["REF_START", "", "main"],
+    )
+    texts = [b["text"] for b in msgs[-1]["content"] if b.get("type") == "text"]
+    assert texts[0] == "[REF_START]"
+    assert texts[1] == "[Frame 2]"
+    assert texts[2] == "[t=02.50s | main]"
+    assert texts[3] == "usr"
+
+    client = VlmClient(
+        api_key="dummy",
+        stage_models={"s1_grounding": "gpt-4o-mini", "s3_discover": "gpt-4o"},
+    )
+    try:
+        assert client.resolve_stage_model("s1") == "gpt-4o-mini"
+        assert client.resolve_stage_model("s1", model_override="gpt-4o") == "gpt-4o"
+        assert resolve_client_stage_model(client, "s3") == "gpt-4o"
+        assert resolve_stage_model(client, "s3", model_override="gpt-4o-mini") == "gpt-4o-mini"
+    finally:
+        client.close()
+
+    cfg = ConfigManager()
+    assert resolve_stage_model(cfg, "s2_macro") == "gpt-4o"
+    assert resolve_stage_model(cfg, "s2_macro", model_override="gpt-4o-mini") == "gpt-4o-mini"
+
+    pricing = cfg.settings["vlm"]["pricing"]
+    assert estimate_stage_cost_usd("gpt-4o", 1_000_000, 1_000_000, pricing) == pytest.approx(12.5)
+    tracker = BudgetTracker(pricing=pricing)
+    tracker.record(
+        stage="s5_success",
+        model="gpt-4o-mini",
+        prompt_tokens=100_000,
+        completion_tokens=100_000,
+    )
+    tracker.record(
+        stage="s5_success",
+        model="gpt-4o",
+        prompt_tokens=100_000,
+        completion_tokens=100_000,
+    )
+    summary = tracker.to_usage_summary()
+    assert len(summary.stages) == 2
+    assert {s.model for s in summary.stages} == {"gpt-4o-mini", "gpt-4o"}
+    assert summary.total_cost_usd == pytest.approx(0.075 + 1.25, abs=1e-5)
+

@@ -1158,4 +1158,142 @@ describe("VlmLabPage", () => {
     expect(screen.getByTestId("eval-runner-controls")).toHaveTextContent("GT 回归评测沙箱");
     expect(screen.getByTestId("promote-btn")).toHaveTextContent("一键发布为生效配置");
   });
+
+  it("launches TaskDraftWizardModal from Tasks tab with workspace episodes, drafts via AI, saves TaskSpec, and refreshes tasks", async () => {
+    const fx = buildMockFixtures();
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    const tasksState: Record<string, Record<string, unknown>> = { ...fx.tasksDoc.tasks };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+        calls.push({ url, method, body });
+
+        if (url.startsWith("/api/lab/labels")) {
+          return new Response(JSON.stringify(fx.labelsDoc), { status: 200 });
+        }
+        if (url.startsWith("/api/lab/prompts")) {
+          return new Response(JSON.stringify(fx.promptsDoc), { status: 200 });
+        }
+        if (url.endsWith("/api/lab/tasks/draft") && method === "POST") {
+          return new Response(
+            JSON.stringify({
+              advisory_only: true,
+              task_spec: {
+                task_id: body.task_id,
+                version: "1.0.0",
+                match: ["*wipe_table*"],
+                aliases: [],
+                title: "Wipe Table",
+                description: "Wipe tabletop clean with sponge",
+                goal: "Remove spills from tabletop",
+                criteria: ["Tabletop is visibly clean"],
+                steps: ["Grasp sponge", "Wipe surface", "Set sponge down"],
+                task_prompt: "Evaluate tabletop wiping motion.",
+                grounding_objects: [
+                  {
+                    id: "sponge",
+                    name: "Yellow Sponge",
+                    desc: "Cleaning sponge",
+                    tag_pos: "top",
+                    is_static: false,
+                  },
+                ],
+                hand_mapping: null,
+                camera_roles_override: null,
+              },
+              used_sample_episode_id: body.sample_episode_id ?? null,
+              sampled_frames_count: body.sample_episode_id ? 5 : 0,
+              rationale: "Drafted wiping TaskSpec from sample episode.",
+              warnings: [],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/lab/tasks") && method === "PUT") {
+          const spec = body as Record<string, unknown>;
+          const tid = String(spec.task_id);
+          tasksState[tid] = spec;
+          return new Response(
+            JSON.stringify({ tasks: tasksState, total: Object.keys(tasksState).length }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/lab/tasks") && method === "GET") {
+          return new Response(
+            JSON.stringify({ tasks: tasksState, total: Object.keys(tasksState).length }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/episodes")) {
+          return new Response(
+            JSON.stringify({
+              items: [{ episode_id: "demo_ds/ep_wipe_1", dataset: "demo_ds", task_id: "_default" }],
+              total: 1,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/lab/diagnosis")) {
+          return new Response(JSON.stringify(fx.diagnosisDoc), { status: 200 });
+        }
+        if (url.startsWith("/api/lab/unknowns")) {
+          return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      }),
+    );
+
+    render(
+      <AuthProvider initialAuth={{ token: "lead-tok", username: "lead_1", role: "lead" }}>
+        <MemoryRouter>
+          <VlmLabPage />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    fireEvent.click(screen.getByTestId("tab-taxonomy"));
+    fireEvent.click(await screen.findByTestId("taxonomy-subtab-tasks"));
+    fireEvent.click(await screen.findByTestId("lab-new-task-ai-btn"));
+
+    expect(await screen.findByTestId("task-draft-wizard-modal")).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(
+        Array.from(
+          (screen.getByTestId("wizard-sample-episode-select") as HTMLSelectElement).options,
+        ).some((o) => o.value === "demo_ds/ep_wipe_1"),
+      ).toBe(true),
+    );
+
+    fireEvent.change(screen.getByTestId("wizard-task-id-input"), {
+      target: { value: "wipe_table" },
+    });
+    fireEvent.change(screen.getByTestId("wizard-description-input"), {
+      target: { value: "Use sponge to wipe table clean" },
+    });
+    fireEvent.change(screen.getByTestId("wizard-sample-episode-select"), {
+      target: { value: "demo_ds/ep_wipe_1" },
+    });
+    fireEvent.click(screen.getByTestId("wizard-generate-draft-btn"));
+
+    expect(await screen.findByTestId("wizard-sampled-frames-badge")).toHaveTextContent(
+      "Sampled 5 frames from demo_ds/ep_wipe_1",
+    );
+    fireEvent.click(screen.getByTestId("wizard-save-task-btn"));
+
+    await waitFor(() => expect(screen.queryByTestId("task-draft-wizard-modal")).toBeNull());
+    await waitFor(() =>
+      expect((screen.getByLabelText("Select TaskSpec") as HTMLSelectElement).value).toBe(
+        "wipe_table",
+      ),
+    );
+    expect(
+      calls.some((c) => c.url.endsWith("/api/lab/tasks/draft") && c.method === "POST"),
+    ).toBe(true);
+    expect(calls.some((c) => c.url.endsWith("/api/lab/tasks") && c.method === "PUT")).toBe(true);
+  });
 });

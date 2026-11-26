@@ -1,5 +1,9 @@
 import { normalizeSegmentTriplet } from "../constants/labels";
 import type {
+  AssignEpisodeTaskRequest,
+  AssignEpisodeTaskResponse,
+  BatchAssignEpisodeTaskRequest,
+  BatchAssignEpisodeTaskResponse,
   CheckSpliceRequest,
   CheckSpliceResponse,
   CreateJobRequest,
@@ -9,6 +13,8 @@ import type {
   EpisodeRunsResponse,
   EpisodeSortField,
   EpisodeStatus,
+  EpisodeTaskCatalogResponse,
+  EpisodeTaskSummary,
   EvalCompareResponse,
   EvalRunReport,
   EvalRunRequest,
@@ -43,6 +49,8 @@ import type {
   ReviewWritePayload,
   SortDir,
   SuccessVerdict,
+  TaskDraftRequest,
+  TaskDraftResponse,
   TaskListResponse,
   TaskSpec,
   UnknownAnomalyItem,
@@ -281,6 +289,47 @@ export async function getEpisode(epId: string, runId?: string): Promise<Resolved
   return apiFetch<ResolvedEpisode>(`/api/episodes/${encodeEpPath(epId)}${qs}`);
 }
 
+export async function listEpisodeTasks(): Promise<EpisodeTaskCatalogResponse> {
+  const data = await apiFetch<unknown>("/api/episodes/tasks");
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    const rec = data as Record<string, unknown>;
+    if (Array.isArray(rec.tasks)) {
+      const tasks = rec.tasks as EpisodeTaskSummary[];
+      const total = typeof rec.total === "number" ? rec.total : tasks.length;
+      return { tasks, total };
+    }
+  }
+  return { tasks: [], total: 0 };
+}
+
+export async function assignEpisodeTask(
+  epId: string,
+  body: AssignEpisodeTaskRequest,
+): Promise<AssignEpisodeTaskResponse> {
+  const payload: AssignEpisodeTaskRequest = {
+    task_id: body.task_id,
+    ...(body.allow_frozen !== undefined ? { allow_frozen: body.allow_frozen } : {}),
+  };
+  return apiFetch<AssignEpisodeTaskResponse>(`/api/episodes/${encodeEpPath(epId)}/task`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function batchAssignEpisodeTask(
+  body: BatchAssignEpisodeTaskRequest,
+): Promise<BatchAssignEpisodeTaskResponse> {
+  const payload: BatchAssignEpisodeTaskRequest = {
+    episode_ids: body.episode_ids,
+    task_id: body.task_id,
+    ...(body.allow_frozen !== undefined ? { allow_frozen: body.allow_frozen } : {}),
+  };
+  return apiFetch<BatchAssignEpisodeTaskResponse>("/api/episodes/batch-task", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function listEpisodeRuns(epId: string): Promise<EpisodeRunsResponse> {
   return apiFetch<EpisodeRunsResponse>(`/api/episodes/${encodeEpPath(epId)}/runs`);
 }
@@ -512,6 +561,13 @@ export async function putLabTasks(
   return apiFetch<TaskListResponse>("/api/lab/tasks", {
     method: "PUT",
     body: JSON.stringify(payload),
+  });
+}
+
+export async function draftLabTask(body: TaskDraftRequest): Promise<TaskDraftResponse> {
+  return apiFetch<TaskDraftResponse>("/api/lab/tasks/draft", {
+    method: "POST",
+    body: JSON.stringify(body),
   });
 }
 

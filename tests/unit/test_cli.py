@@ -331,3 +331,108 @@ def test_cli_config_vlm_preset_secret_env_and_probe(tmp_path: Path) -> None:
     )
     assert r_fail.exit_code == 1
     assert json.loads(r_fail.output)["test"]["ok"] is False
+
+
+def test_cli_ingest_task_override_and_unknown_task_validation(tmp_path: Path) -> None:
+    # Unrecognized dataset name that auto-resolves to _default without --task
+    unrec_dir = tmp_path / "episode_001389"
+    _make_mp4(unrec_dir / "ep_01.mp4", n_frames=12)
+    _make_mp4(unrec_dir / "ep_02.mp4", n_frames=12)
+
+    runner = CliRunner()
+
+    # Baseline without --task falls back to _default
+    ws_auto = tmp_path / "ws_auto"
+    r_auto = runner.invoke(
+        main,
+        ["-w", str(ws_auto), "ingest", "--data", str(unrec_dir), "--json"],
+    )
+    assert r_auto.exit_code == 0, r_auto.output
+    p_auto = json.loads(r_auto.output)
+    assert p_auto["inserted"] == 2
+    assert all(ep["task_id"] == "_default" for ep in p_auto["episodes"])
+
+    # --task pick_and_place cleanly overrides _default fallback
+    ws_override = tmp_path / "ws_override"
+    r_ov = runner.invoke(
+        main,
+        [
+            "-w",
+            str(ws_override),
+            "ingest",
+            "--data",
+            str(unrec_dir),
+            "--task",
+            "pick_and_place",
+            "--json",
+        ],
+    )
+    assert r_ov.exit_code == 0, r_ov.output
+    p_ov = json.loads(r_ov.output)
+    assert p_ov["inserted"] == 2
+    assert all(ep["task_id"] == "pick_and_place" for ep in p_ov["episodes"])
+
+    repo = Repository(ws_override)
+    try:
+        rows = repo.list_episodes()
+        assert len(rows) == 2
+        assert all(r["task_id"] == "pick_and_place" for r in rows)
+    finally:
+        repo.close()
+
+    # --task-id alias works identically to --task
+    ws_alias = tmp_path / "ws_alias"
+    r_alias = runner.invoke(
+        main,
+        [
+            "-w",
+            str(ws_alias),
+            "ingest",
+            "--data",
+            str(unrec_dir),
+            "--task-id",
+            "bimanual_handover",
+            "--json",
+        ],
+    )
+    assert r_alias.exit_code == 0, r_alias.output
+    p_alias = json.loads(r_alias.output)
+    assert all(ep["task_id"] == "bimanual_handover" for ep in p_alias["episodes"])
+
+    # --task auto behaves like default auto-resolve
+    ws_auto_flag = tmp_path / "ws_auto_flag"
+    r_auto_flag = runner.invoke(
+        main,
+        [
+            "-w",
+            str(ws_auto_flag),
+            "ingest",
+            "--data",
+            str(unrec_dir),
+            "--task",
+            "auto",
+            "--json",
+        ],
+    )
+    assert r_auto_flag.exit_code == 0, r_auto_flag.output
+    p_auto_flag = json.loads(r_auto_flag.output)
+    assert all(ep["task_id"] == "_default" for ep in p_auto_flag["episodes"])
+
+    # --task nonexistent_task exits non-zero cleanly without traceback
+    ws_bad = tmp_path / "ws_bad"
+    r_bad = runner.invoke(
+        main,
+        [
+            "-w",
+            str(ws_bad),
+            "ingest",
+            "--data",
+            str(unrec_dir),
+            "--task",
+            "nonexistent_task",
+        ],
+    )
+    assert r_bad.exit_code != 0
+    assert "Traceback" not in r_bad.output
+    assert "nonexistent_task" in r_bad.output
+    assert not (ws_bad / "robo_vlm_qc.db").exists()

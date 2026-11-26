@@ -416,6 +416,28 @@ export const studioEn = {
   "studio.rerunModeFull": "Full S1-S5 rerun",
   "studio.newSubtaskStageLabel": "New Subtask Stage",
   "studio.stageFallbackLabel": "Stage {index}",
+  "studio.taskUnrecognized": "Unrecognized (_default)",
+  "studio.taskBadgeLabel": "Task: {task}",
+  "studio.taskEditTitle": "Click to reassign episode task",
+  "studio.taskRunningDisabledTitle": "Cannot change task while VLM is running",
+  "studio.taskPopoverTitle": "Assign Episode Task",
+  "studio.taskSelectAria": "Select task for episode",
+  "studio.taskSelectPlaceholder": "Choose a task...",
+  "studio.taskReviewerHint": "Reviewers can classify unrecognized (_default) episodes to an existing task.",
+  "studio.taskSaveBtn": "Apply Task",
+  "studio.taskSaving": "Updating...",
+  "studio.taskNewAiBtn": "+ New Task (AI)",
+  "studio.taskUpdatedToast": "Task updated from \"{prev}\" to \"{next}\"",
+  "studio.taskErrAssign": "Failed to update episode task",
+  "studio.taskFrozenConfirmTitle": "Confirm Task Change on Frozen GT Episode",
+  "studio.taskFrozenConfirmDesc":
+    "This episode is gt_frozen. Reassigning task_id to \"{taskId}\" preserves frozen GT annotations and active runs.",
+  "studio.taskFrozenConfirmBtn": "Confirm & Reassign",
+  "studio.taskRerunPrompt":
+    "Task reassigned to \"{taskId}\" while preserving existing annotations. Re-run VLM now so S1–S5 use the new TaskSpec?",
+  "studio.taskRerunPromptReviewer":
+    "Task reassigned to \"{taskId}\" while preserving existing annotations. A Lead can re-run VLM if needed.",
+  "studio.taskRerunNowBtn": "Re-run VLM now",
 } as const;
 
 export const studioZh: Record<keyof typeof studioEn, string> = {
@@ -818,4 +840,26 @@ export const studioZh: Record<keyof typeof studioEn, string> = {
   "studio.rerunModeFull": "S1–S5 全流程重跑",
   "studio.newSubtaskStageLabel": "新建子任务阶段",
   "studio.stageFallbackLabel": "阶段 {index}",
+  "studio.taskUnrecognized": "未识别 (_default)",
+  "studio.taskBadgeLabel": "任务：{task}",
+  "studio.taskEditTitle": "点击修改当前片段任务分类",
+  "studio.taskRunningDisabledTitle": "VLM 运行期间禁止修改任务分类",
+  "studio.taskPopoverTitle": "分配片段任务",
+  "studio.taskSelectAria": "选择片段任务",
+  "studio.taskSelectPlaceholder": "请选择任务...",
+  "studio.taskReviewerHint": "审核员可将未识别 (_default) 片段归类到已有任务。",
+  "studio.taskSaveBtn": "应用任务",
+  "studio.taskSaving": "更新中...",
+  "studio.taskNewAiBtn": "+ 新建任务 (AI)",
+  "studio.taskUpdatedToast": "已将任务从“{prev}”修改为“{next}”",
+  "studio.taskErrAssign": "更新片段任务失败",
+  "studio.taskFrozenConfirmTitle": "确认修改 GT 基准冻结片段的任务",
+  "studio.taskFrozenConfirmDesc":
+    "当前片段处于 gt_frozen 冻结状态。将 task_id 修改为“{taskId}”将保留原有 GT 标注与运行记录。",
+  "studio.taskFrozenConfirmBtn": "确认修改任务",
+  "studio.taskRerunPrompt":
+    "已将任务修改为“{taskId}”（原有标注已保留）。是否立即重跑 VLM 以应用新的任务规范？",
+  "studio.taskRerunPromptReviewer":
+    "已将任务修改为“{taskId}”（原有标注已保留）。如需按新任务重新分析，可联系组长重跑 VLM。",
+  "studio.taskRerunNowBtn": "立即重跑 VLM",
 };

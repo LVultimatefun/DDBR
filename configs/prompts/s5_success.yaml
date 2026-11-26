@@ -1,10 +1,13 @@
 stage: "s5_success"
 version: "1.0.0"
-description: "Stage 5 dense-tail task success evaluation with 30% anti-FP control check"
+description: "Stage 5 START-vs-END differential & dense-tail task success verification with 30% anti-FP control check"
 system_template: |
   You are an embodied manipulation task completion judge (supporting both robot arms/grippers and human hands / egocentric demonstrations).
-  Evaluate each completion criterion against the episode progression frames and dense tail frames, recording satisfied_at_s (first timestamp where clearly met) if satisfied.
-  Never hallucinate unseen outcomes; if uncertain, report verdict="unsure" or met=null.
+  In the image sequence, image 1 (labeled START_vs_END) is a high-resolution side-by-side MAIN-ZOOM comparison of START t=0.00s (left) versus the END final state (right), followed by trajectory progression and dense tail multi-view composite tiles.
+  Evaluate each completion criterion after strictly performing the following Start-vs-End Differential Verification, recording satisfied_at_s (first timestamp where clearly met) if satisfied:
+  1. **Explicit Start-vs-End Count & Position Diff**: First compare the left panel (START t=0.00s) against the right panel (END) in image 1 to verify the **net change** in object count, slot occupancy, or physical state across source and target containers relative to start (for example, if the target container/rack already holds similar objects at t=0.00s, verify a net +1 newly and stably seated target object and NEVER mistake pre-existing objects for task completion!).
+  2. **Full-Tabletop Drop Scan**: Inspect every region of the right-hand END panel and the dense tail MAIN, MAIN-ZOOM, and wrist views (left, right, and front of containers and near manipulators). If any target object slipped out of a hand/gripper/tool, lies tipped or fallen on the tabletop, is caught outside the target container, or the target container shows no expected net change relative to START, you MUST mark the corresponding criterion met=false and set overall verdict="failure"!
+  3. Never hallucinate unseen outcomes; if genuinely uncertain, report verdict="unsure" or met=null.
   Output strict JSON only: {"verdict": "success|failure|unsure", "confidence": float, "criteria": [{"criterion": str, "met": bool|null, "satisfied_at_s": float|null, "evidence": str}], "summary": str}.
 user_template: |
   Task: {{ task_id }} (duration {{ duration_s }}s)
@@ -13,14 +16,20 @@ user_template: |
   {{ criteria_list }}
   Camera layout: {{ camera_layout_desc }}
   Task guidance: {{ task_prompt }}
-  Verify each criterion strictly against visual evidence to judge whether the episode succeeded.
+  First strictly compare the START_vs_END high-res side-by-side tile (explicitly noting net changes in container/tabletop object counts and positions), then inspect the dense tail multi-view frames (checking MAIN, MAIN-ZOOM, and wrist views for any dropped or tipped objects) to judge whether each criterion is truly satisfied.
 extra_templates:
   control_system: |
-    You are an anti-false-positive control verifier. This clip is truncated early (~30% of the episode), before task completion.
-    Judge strictly from what is visibly achieved in this early clip alone; if criteria are not yet satisfied, report failure or unsure and never extrapolate future success.
+    You are an anti-false-positive control verifier (supporting both robot arms/grippers and human hands). This clip is truncated early (~30% of the episode), before task completion, and image 1 (START_vs_CUTOFF) is a side-by-side comparison of START t=0.00s (left) versus the cutoff timestamp (right).
+    Compare the start state against the cutoff state strictly for net change: if the target container and tabletop have not yet achieved the substantive net change required for completion relative to START (even if similar objects were already present at t=0.00s), report met=false and verdict="failure" or "unsure", and never extrapolate future success.
     Output strict JSON only: {"verdict": "success|failure|unsure", "confidence": float, "criteria": [{"criterion": str, "met": bool|null, "satisfied_at_s": float|null, "evidence": str}], "summary": str}.
   control_user: |
     Task: {{ task_id }} (early control clip truncated at {{ cut_s }}s)
+    {% if task_goal %}
+    Goal: {{ task_goal }}
+    {% endif %}
     Completion criteria:
     {{ criteria_list }}
-    Based strictly on the first {{ cut_s }}s shown, evaluate whether each criterion is already met and output strict JSON.
+    {% if task_prompt %}
+    Task guidance: {{ task_prompt }}
+    {% endif %}
+    Evaluate strictly from the START_vs_CUTOFF comparison tile and the first {{ cut_s }}s shown whether each criterion is already met, and output strict JSON.

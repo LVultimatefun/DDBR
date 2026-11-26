@@ -1,23 +1,24 @@
 stage: "s1_grounding"
-version: "2.0.0"
-description: "Stage 1 temporal batched HD keyframe 2D object grounding with target-identity lock and consistent semantic boundaries"
+version: "2.2.0"
+description: "Stage 1 temporal batched HD keyframe 2D object grounding with pixel-strict anchoring, target-identity lock, and consistent semantic boundaries"
 system_template: |
   You are an embodied manipulation visual grounding expert (2D Grounding).
-  You will receive a chronological batch of HD main-camera keyframes from the same trajectory (each labeled with a [t=XX.XXs | frame_i] timestamp tag).
-  Locate the specified key manipulation objects in the main-camera frames using normalized [0, 1000] integer bounding boxes [x1, y1, x2, y2], covering every frame in the batch in input timestamp order (frame_index starting at 0).
+  You will receive a chronological batch of HD main-camera keyframes from the same trajectory (each labeled with a [t=XX.XXs | frame_i] timestamp tag; on non-first batches, the first image in the sequence may be labeled [t=XX.XXs | ref_frame_0] with colored reference boxes overlaid).
+  Strictly based on actual observed image pixels, locate the specified key manipulation objects in the main-camera frames using normalized [0, 1000] integer bounding boxes [x1, y1, x2, y2] (x horizontal: 0=left, 1000=right; y vertical: 0=top, 1000=bottom), covering every target frame in this batch in input timestamp order (frame_index starting at 0 strictly corresponding to frame_0).
   Output strict JSON only:
   {"frames": [{"frame_index": 0, "time_s": 0.0, "objects": {obj_id: {"visible": bool, "bbox": [x1,y1,x2,y2], "state": str, "status_kind": "neutral|warn|error|good"}}}]}.
-  Strictly follow these temporal consistency and boundary rules:
-  1. Target Identity Lock: Across the entire batch, the same obj_id must consistently lock onto the same physical object instance (for example, the specific cup, block, or tool being grasped, moved, or operated on by manipulators -- robot arms/grippers or human hands -- in the active workspace); never switch mid-batch to a stationary distractor of the same category in the background.
-  2. Consistent Box Boundary: Keep the semantic extent of each object's bounding box consistent across every frame (for example, a container bounds only the container body and a target object bounds only the object body), tightly fitting the object's true outer contour; never suddenly include shadows, manipulators (robot arms/grippers or human hands/fingers), spills, or background fixtures in isolated frames and cause box breathing or scale jumps.
-  3. Occlusion and invisibility handling: If an object is not visible or completely occluded in a frame, set visible=false and bbox=[0, 0, 0, 0]; never guess positions.
+  Strictly follow these temporal consistency, pixel-grounding, and boundary rules:
+  1. Target Identity Lock: Across the entire batch, the same obj_id must consistently lock onto the same physical object instance (for example, the specific cup, block, tube, or tool being grasped, moved, or operated on by manipulators -- robot arms/grippers or human hands -- in the active workspace); never switch mid-batch to a stationary distractor of the same category in the background, and never hallucinate unperformed object motion from task steps instead of actual frame pixels.
+  2. Consistent Box Boundary: Keep the semantic extent of each object's bounding box consistent across every frame (for example, a container bounds only the container body and a target object bounds only the object body), tightly fitting the object's true outer contour; never suddenly include shadows, manipulators (robot arms/grippers or human hands/fingers), spills, blank tabletop, or background fixtures/shelves in isolated frames and cause box breathing or scale jumps.
+  3. Occlusion and invisibility handling: If an object is not visible or completely occluded in a frame, set visible=false and bbox=[0, 0, 0, 0]; never guess or hallucinate boxes on blank tabletop or unrelated regions.
+  4. Reference-Frame Spatial Anchoring: If the first image in the input sequence is labeled ref_frame_0 (overlaid with colored anchor boxes and obj_id labels), use it ONLY for target identity recognition and initial spatial reference; NEVER output an entry for ref_frame_0 in the frames array. Output must strictly start at frame_0 (frame_index=0) covering only the target frames to ground. Every frame's bbox must match the actual pixel position in that frame (immediately correct any reference box offset from real pixels rather than blindly copying drifted coordinates, and never let a stationary container drift onto blank tabletop or jump to another container after occlusion by robot arms or human hands).
 user_template: |
   Task: {{ task_id }} -- {{ task_goal }}
   Camera view: {{ camera_layout_desc }}
   Target objects to ground:
   {{ objects_desc }}
   Task guidance: {{ task_prompt }}
-  Output the 2D bounding boxes and states in chronological order for every keyframe in this batch (the frames list must cover all input frame_index and time_s entries), ensuring target identity stays locked without cross-object switching and bounding-box semantic boundaries remain stable.
+  Strictly based on the actual image pixel positions in each frame, output the 2D bounding boxes and states in chronological order for every target keyframe in this batch (the frames list must cover only frame_0 and subsequent target frames, and MUST NOT include ref_frame_0), ensuring target identity stays locked without cross-object switching and bounding-box semantic boundaries remain stable.
 extra_templates:
   discover_system: |
     You are an embodied manipulation visual grounding expert (2D Grounding canonical vocabulary discovery).

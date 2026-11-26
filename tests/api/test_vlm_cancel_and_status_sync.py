@@ -147,7 +147,18 @@ def test_stage4_propagates_vlm_cancelled_error_without_fallback(tmp_path: Path) 
             mask_side="both",
             affected_arm="both",
             vlm_raw_policy="mask_loss",
-        )
+        ),
+        QcSegment(
+            seg_id="c2",
+            t_start=1.3,
+            t_end=1.9,
+            label_id="mid_idle_freeze",
+            training_role="badcase",
+            splice_policy="mask_loss",
+            mask_side="both",
+            affected_arm="both",
+            vlm_raw_policy="mask_loss",
+        ),
     ]
 
     class _CancelOnCallClient:

@@ -28,6 +28,7 @@ import {
   getLabPrompts,
   getLabTasks,
   getLabUnknowns,
+  listEpisodes,
   listFewShots,
   promoteLabConfig,
   putLabLabels,
@@ -41,6 +42,7 @@ import type {
   DiagnosisErrorItem,
   DiagnosisErrorType,
   DiagnosisReport,
+  EpisodeListItem,
   EvalCompareResponse,
   EvalRunReport,
   FewShotItem,
@@ -59,6 +61,7 @@ import type {
 } from "../api/types";
 import { useEventStream } from "../api/useEventStream";
 import { LabHistoryDrawer } from "../components/LabHistoryDrawer";
+import { TaskDraftWizardModal } from "../components/TaskDraftWizardModal";
 import { DEFAULT_VISUAL_LABELS } from "../constants/labels";
 import { useAuth } from "../stores/authStore";
 import { type TranslateFn, useI18n } from "../stores/i18nStore";
@@ -432,6 +435,8 @@ export const VlmLabPage: React.FC = () => {
 
   const [selectedTaskId, setSelectedTaskId] = useState<string>("_default");
   const [savingConfig, setSavingConfig] = useState(false);
+  const [taskWizardOpen, setTaskWizardOpen] = useState(false);
+  const [wizardEpisodes, setWizardEpisodes] = useState<EpisodeListItem[]>([]);
 
   // Tab 4: GT Eval Sandbox & Promote
   const [evalDataset, setEvalDataset] = useState("");
@@ -2458,15 +2463,30 @@ export const VlmLabPage: React.FC = () => {
                     </select>
                   </label>
                 </div>
-                <button
-                  type="button"
-                  className="primary-btn compact"
-                  data-testid="save-task-btn"
-                  disabled={savingConfig || !activeTaskSpec}
-                  onClick={() => void handleSaveTaskSpec()}
-                >
-                  {savingConfig ? t("lab.common.saving") : t("lab.tasks.saveBtn")}
-                </button>
+                <div className="header-actions">
+                  <button
+                    type="button"
+                    className="accent-btn compact"
+                    data-testid="lab-new-task-ai-btn"
+                    onClick={() => {
+                      setTaskWizardOpen(true);
+                      void listEpisodes({ limit: 100 })
+                        .then((res) => setWizardEpisodes(res.items ?? []))
+                        .catch(() => {});
+                    }}
+                  >
+                    <Sparkles size={13} /> {t("lab.tasks.newTaskAiBtn")}
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-btn compact"
+                    data-testid="save-task-btn"
+                    disabled={savingConfig || !activeTaskSpec}
+                    onClick={() => void handleSaveTaskSpec()}
+                  >
+                    {savingConfig ? t("lab.common.saving") : t("lab.tasks.saveBtn")}
+                  </button>
+                </div>
               </div>
 
               {activeTaskSpec ? (
@@ -2886,6 +2906,24 @@ export const VlmLabPage: React.FC = () => {
           </div>
         </div>
       )}
+
+      <TaskDraftWizardModal
+        open={taskWizardOpen}
+        onClose={() => setTaskWizardOpen(false)}
+        sampleEpisodes={wizardEpisodes}
+        onTaskSaved={async (savedSpec) => {
+          setTasksMap((prev) => ({ ...prev, [savedSpec.task_id]: savedSpec }));
+          setSelectedTaskId(savedSpec.task_id);
+          void loadTasks().catch(() => {});
+          showLabInfo(
+            t("lab.toast.taskSaved", {
+              taskId: savedSpec.task_id,
+              version: savedSpec.version,
+            }),
+            "success",
+          );
+        }}
+      />
 
       <LabHistoryDrawer
         open={historyOpen}

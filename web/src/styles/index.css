@@ -1874,3 +1874,135 @@ a:focus-visible {
   padding-top: 4px;
   border-top: 1px solid var(--border);
 }
+
+/* Task Draft Wizard & Manual Task Intervention */
+.modal-backdrop-top {
+  z-index: 75;
+}
+
+.modal-card-xl {
+  width: min(780px, 95vw);
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.wizard-step-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.wizard-step-chip {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: var(--muted);
+}
+
+.wizard-step-chip.active {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+  color: var(--text);
+}
+
+.wizard-objects-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.wizard-object-row {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wizard-object-row-head {
+  display: grid;
+  grid-template-columns: 1fr 1fr 110px auto;
+  gap: 6px;
+  align-items: end;
+}
+
+@media (max-width: 680px) {
+  .wizard-object-row-head {
+    grid-template-columns: 1fr;
+  }
+}
+
+.task-badge-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--badge-info-bg);
+  color: var(--badge-info-text);
+  border: 1px solid var(--badge-info-border);
+}
+
+.task-badge-btn:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.task-badge-btn.warn {
+  background: var(--badge-warn-bg);
+  color: var(--badge-warn-text);
+  border-color: var(--badge-warn-border);
+}
+
+.task-popover-anchor {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.task-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  width: 320px;
+  max-width: 92vw;
+  background: var(--popover-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  box-shadow: var(--shadow-elevated);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.inline-task-assign {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.inline-task-assign select {
+  padding: 2px 6px;
+  font-size: 11px;
+  max-width: 155px;
+}
+
+.batch-task-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--border);
+  margin: 0 2px;
+}

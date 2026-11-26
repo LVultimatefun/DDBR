@@ -113,15 +113,15 @@ labels:
     default_splice_policy: mask_loss
     collector_ui:
       title: Hesitation or Aimless Oscillation
-      hint: Repeated back-and-forth probing, circling, or jitter without monotonic progress toward the subtask.
+      hint: Repeated approach-and-retreat reversals (>=2 clear direction reversals), aimless circling, or >5s probing hover without visible progress.
     vlm_semantics:
-      definition: Arm or hand oscillates repeatedly, hovers in circles, or probes back and forth without making substantive forward progress on the current subtask.
+      definition: Manipulator (robot arm/gripper or human hand) repeatedly approaches and retreats (>=2 clear direction reversals), hovers or circles in place, or probes for >5s without visible progress in target object state; this is a redundant process badcase even if the grasp or overall task eventually succeeds.
       counter_examples:
-        - Intentional repetitive task motions such as wiping a surface or stirring
-        - Small monotonic micro-adjustments directly before insertion
+        - Intentional repetitive task motions required by the task itself (such as wiping a whiteboard back and forth or stirring)
+        - Brief (<=4-5s), monotonically converging fine alignment that steadily makes positional progress (precision_fine_adjust)
       visual_cues:
-        - End-effector repeatedly approaches and retreats or sways while object state makes no progress
-        - Clearly distinct from task-required periodic motions
+        - End-effector or hand repeatedly approaches and retreats (>=2 clear direction reversals), hovers/circles in place, or probes for >5s without substantive progress in object position or grasp state
+        - Clearly distinct from task-required periodic motions; even if the action eventually succeeds, the extended hovering or oscillation span must still be flagged as a badcase
 
   - id: collision_or_knock
     name: Collision or Knock
@@ -150,14 +150,14 @@ labels:
     default_splice_policy: keep_positive
     collector_ui:
       title: Precision Fine Adjustment (Positive Skill)
-      hint: Slow, careful, monotonically converging alignment for tight insertions, small objects, or delicate mating.
+      hint: Brief (<=4-5s), slow, monotonically converging alignment with continuous visible progress for tight insertions, small objects, or delicate mating.
     vlm_semantics:
-      definition: Slow, cautious, yet effective and monotonically converging fine-alignment phase for tight insertions, small-object grasping, or delicate assembly; a high-value positive skill.
+      definition: Brief (typically <=4-5s), slow, cautious, yet monotonically converging fine-alignment phase that steadily makes visible positional progress for tight insertions, small-object grasping, or delicate assembly; a high-value positive skill.
       counter_examples:
         - Clear withdrawal and retry after a failed attempt (placement_redo)
-        - Aimless swaying without convergence (hesitation_oscillation)
+        - Repeated approach-and-retreat reversals (>=2 direction reversals), aimless circling, or >5s probing hover without visible progress (hesitation_oscillation)
       visual_cues:
-        - Motion is slow but directionally consistent as the object converges onto the target pose
+        - Short duration (<=4-5s), slow but directionally consistent monotonic convergence as the object steadily enters the target pose without repeated reversals or aimless hovering
 
   - id: bimanual_assist_hold
     name: Bimanual Assist Hold

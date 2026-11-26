@@ -6,6 +6,7 @@ import {
   CheckCircle,
   ChevronDown,
   Download,
+  Edit3,
   ExternalLink,
   Eye,
   FileJson,
@@ -13,11 +14,13 @@ import {
   History,
   Keyboard,
   Lock,
+  Play,
   Redo2,
   RefreshCw,
   Save,
   ShieldCheck,
   Sparkles,
+  Tag,
   Undo2,
   Unlock,
   Video,
@@ -26,6 +29,7 @@ import {
 } from "lucide-react";
 import {
   ApiError,
+  assignEpisodeTask,
   buildReviewWritePayload,
   cancelJob as apiCancelJob,
   claimEpisode,
@@ -39,12 +43,14 @@ import {
   inferSubtasks,
   listEpisodeRuns,
   listEpisodes,
+  listEpisodeTasks,
   listReviews,
   releaseClaim,
   renewClaim,
   submitReview,
 } from "../api/client";
 import type {
+  EpisodeTaskSummary,
   HumanReviewArtifact,
   JobStatus,
   MacroStage,
@@ -52,6 +58,7 @@ import type {
   ReviewAction,
   SplicePolicy,
   SuccessVerdict,
+  TaskSpec,
   VisualLabelDef,
   VlmRunSummary,
   WatchCoverage,
@@ -62,6 +69,7 @@ import { SegmentInspector } from "../components/SegmentInspector";
 import { ShortcutsModal } from "../components/ShortcutsModal";
 import { StudioPlayer, type StudioPlayerHandle } from "../components/StudioPlayer";
 import { SuccessPanel } from "../components/SuccessPanel";
+import { TaskDraftWizardModal } from "../components/TaskDraftWizardModal";
 import {
   createDefaultSegment,
   DEFAULT_VISUAL_LABELS,
@@ -154,6 +162,14 @@ export const ReviewStudioPage: React.FC = () => {
   const [labels, setLabels] = useState<VisualLabelDef[]>(DEFAULT_VISUAL_LABELS);
   const [minWatchCoverage, setMinWatchCoverage] = useState<number>(MIN_WATCH_COVERAGE);
 
+  const [taskCatalog, setTaskCatalog] = useState<EpisodeTaskSummary[]>([]);
+  const [taskPopoverOpen, setTaskPopoverOpen] = useState(false);
+  const [pendingTaskId, setPendingTaskId] = useState("");
+  const [updatingTask, setUpdatingTask] = useState(false);
+  const [taskWizardOpen, setTaskWizardOpen] = useState(false);
+  const [frozenTaskConfirmId, setFrozenTaskConfirmId] = useState<string | null>(null);
+  const [taskRerunPrompt, setTaskRerunPrompt] = useState<{ taskId: string } | null>(null);
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -201,6 +217,7 @@ export const ReviewStudioPage: React.FC = () => {
   const appliedDeepLinkKeyRef = useRef<string>("");
   const rerunMenuWrapRef = useRef<HTMLDivElement | null>(null);
   const exportMenuWrapRef = useRef<HTMLDivElement | null>(null);
+  const taskPopoverWrapRef = useRef<HTMLDivElement | null>(null);
 
   const history = useReviewHistory({
     qc_segments: [],
@@ -266,6 +283,20 @@ export const ReviewStudioPage: React.FC = () => {
   useEffect(() => {
     void loadRunsCatalog();
   }, [loadRunsCatalog, token]);
+
+  const loadTaskCatalog = useCallback(async () => {
+    if (authProbing) return;
+    try {
+      const res = await listEpisodeTasks();
+      setTaskCatalog(res.tasks ?? []);
+    } catch {
+      // Optional task catalog
+    }
+  }, [authProbing]);
+
+  useEffect(() => {
+    void loadTaskCatalog();
+  }, [loadTaskCatalog, token]);
 
   const loadSeqRef = useRef(0);
   const selectedRunIdRef = useRef(selectedRunId);
@@ -397,6 +428,10 @@ export const ReviewStudioPage: React.FC = () => {
     setCustomObjectsModalOpen(false);
     setCustomObjectsInput("");
     setInferringSubtasks(false);
+    setTaskPopoverOpen(false);
+    setTaskWizardOpen(false);
+    setFrozenTaskConfirmId(null);
+    setTaskRerunPrompt(null);
   }, [episodeId, isLead, deepLinkRunId]);
 
   useEffect(() => {
@@ -560,6 +595,18 @@ export const ReviewStudioPage: React.FC = () => {
     document.addEventListener("mousedown", onDocClick);
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [exportMenuOpen]);
+
+  // Close task popover when clicking outside
+  useEffect(() => {
+    if (!taskPopoverOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (taskPopoverWrapRef.current && !taskPopoverWrapRef.current.contains(e.target as Node)) {
+        setTaskPopoverOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, [taskPopoverOpen]);
 
   // Load label catalog separately so role probe updates do not discard unsaved edits / undo history
   useEffect(() => {
@@ -1155,6 +1202,153 @@ export const ReviewStudioPage: React.FC = () => {
     }
   };
 
+  const studioTaskOptions = useMemo(() => {
+    const list: EpisodeTaskSummary[] = [];
+    const seen = new Set<string>();
+    for (const item of taskCatalog) {
+      if (!item.task_id || seen.has(item.task_id)) continue;
+      if (!isLead && item.task_id === "_default") continue;
+      seen.add(item.task_id);
+      list.push(item);
+    }
+    if (isLead && episode?.meta.task_id && !seen.has(episode.meta.task_id)) {
+      list.push({
+        task_id: episode.meta.task_id,
+        title: "",
+        description: "",
+        goal: "",
+        match: [],
+        aliases: [],
+        grounding_objects_count: 0,
+      });
+    }
+    return list;
+  }, [taskCatalog, isLead, episode?.meta.task_id]);
+
+  const handleOpenTaskPopover = () => {
+    if (!episode) return;
+    if (taskPopoverOpen) {
+      setTaskPopoverOpen(false);
+      return;
+    }
+    if (isLead) {
+      setPendingTaskId(episode.meta.task_id);
+    } else {
+      setPendingTaskId(studioTaskOptions[0]?.task_id ?? "");
+    }
+    setTaskPopoverOpen(true);
+  };
+
+  const handleApplyEpisodeTask = async (nextTaskId: string, allowFrozen = false) => {
+    if (!episode) return;
+    const trimmed = nextTaskId.trim();
+    if (!trimmed || trimmed === episode.meta.task_id) return;
+    if (!isLead && (episode.meta.task_id !== "_default" || isGtFrozen || trimmed === "_default")) {
+      return;
+    }
+    if (isLead && isGtFrozen && !allowFrozen) {
+      setTaskPopoverOpen(false);
+      setFrozenTaskConfirmId(trimmed);
+      return;
+    }
+
+    setUpdatingTask(true);
+    setError(null);
+    try {
+      const res = await assignEpisodeTask(episode.episode_id, {
+        task_id: trimmed,
+        ...(isLead && allowFrozen ? { allow_frozen: true } : {}),
+      });
+      setEpisode((prev) =>
+        prev
+          ? {
+              ...prev,
+              meta: {
+                ...prev.meta,
+                task_id: res.task_id,
+              },
+            }
+          : prev,
+      );
+      setTaskPopoverOpen(false);
+      setFrozenTaskConfirmId(null);
+      notify(
+        t("studio.taskUpdatedToast", {
+          prev: res.previous_task_id,
+          next: res.task_id,
+        }),
+        "success",
+      );
+      if (res.re_run_recommended) {
+        setTaskRerunPrompt({ taskId: res.task_id });
+      }
+    } catch (err) {
+      if (
+        isLead &&
+        err instanceof ApiError &&
+        err.status === 409 &&
+        !allowFrozen &&
+        /gt_frozen|allow_frozen/i.test(err.detail)
+      ) {
+        setTaskPopoverOpen(false);
+        setFrozenTaskConfirmId(trimmed);
+        return;
+      }
+      setError(err instanceof Error ? err.message : t("studio.taskErrAssign"));
+    } finally {
+      setUpdatingTask(false);
+    }
+  };
+
+  const handleStudioWizardTaskSaved = async (savedSpec: TaskSpec) => {
+    const summary: EpisodeTaskSummary = {
+      task_id: savedSpec.task_id,
+      title: savedSpec.title,
+      description: savedSpec.description,
+      goal: savedSpec.goal,
+      match: savedSpec.match ?? [],
+      aliases: savedSpec.aliases ?? [],
+      grounding_objects_count: (savedSpec.grounding_objects ?? []).length,
+    };
+    setTaskCatalog((prev) => [
+      summary,
+      ...prev.filter((item) => item.task_id !== summary.task_id),
+    ]);
+    void loadTaskCatalog();
+    await handleApplyEpisodeTask(savedSpec.task_id, false);
+  };
+
+  const handleRerunVlmAfterTaskChange = async () => {
+    if (!episode || !isLead || rerunning) return;
+    setTaskRerunPrompt(null);
+    setRerunning(true);
+    setRerunCompletedReady(false);
+    setRerunCompletedRunId(null);
+    setError(null);
+    try {
+      const job = await createJob({
+        job_type: "batch_vlm",
+        episode_ids: [episode.episode_id],
+        fresh: true,
+      });
+      setLocalRerunJobId(job.job_id);
+      jobStore.trackJob(job);
+      notify(
+        t("studio.toastRerunSubmitted", {
+          label: t("studio.rerunModeFull"),
+          jobId: job.job_id,
+        }),
+        "info",
+      );
+      if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+        handleRerunTerminalJob(job);
+      }
+    } catch (err) {
+      setRerunning(false);
+      setError(err instanceof Error ? err.message : t("studio.errRerunVlm"));
+    }
+  };
+
   // Draggable 6px vertical split resizer (50%–75%, persisted in localStorage)
   const startSplitDrag = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0 || !splitGridRef.current) return;
@@ -1206,6 +1400,19 @@ export const ReviewStudioPage: React.FC = () => {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        if (taskWizardOpen) {
+          return;
+        }
+        if (frozenTaskConfirmId) {
+          e.preventDefault();
+          setFrozenTaskConfirmId(null);
+          return;
+        }
+        if (taskPopoverOpen) {
+          e.preventDefault();
+          setTaskPopoverOpen(false);
+          return;
+        }
         if (customObjectsModalOpen) {
           e.preventDefault();
           setCustomObjectsModalOpen(false);
@@ -1251,6 +1458,8 @@ export const ReviewStudioPage: React.FC = () => {
 
       // Block global Studio shortcuts while any modal, drawer, or flag dialog is open
       const hasOpenOverlay =
+        taskWizardOpen ||
+        Boolean(frozenTaskConfirmId) ||
         customObjectsModalOpen ||
         shortcutsOpen ||
         flagDialogOpen ||
@@ -1470,6 +1679,9 @@ export const ReviewStudioPage: React.FC = () => {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    taskWizardOpen,
+    frozenTaskConfirmId,
+    taskPopoverOpen,
     customObjectsModalOpen,
     shortcutsOpen,
     flagDialogOpen,
@@ -1513,6 +1725,12 @@ export const ReviewStudioPage: React.FC = () => {
   const watchPct = Math.round(watchCoverage.coverage_ratio * 100);
   const minWatchPct = Math.round(minWatchCoverage * 100);
   const reviewerSubmitBlocked = !isLead && !canReviewerSubmit(watchCoverage, minWatchCoverage);
+  const isVlmActive =
+    episode.status === "vlm_queued" || episode.status === "vlm_running" || rerunning;
+  const isDefaultTask = episode.meta.task_id === "_default";
+  const canReassignTask = isLead
+    ? !isVlmActive
+    : isDefaultTask && !isGtFrozen && !isVlmActive;
 
   return (
     <div className="studio-page" data-testid="review-studio-page">
@@ -1533,6 +1751,104 @@ export const ReviewStudioPage: React.FC = () => {
               <span className="status-tag" style={{ backgroundColor: statusMeta.color }}>
                 {t(`status.${episode.status}`)}
               </span>
+              {canReassignTask ? (
+                <div className="task-popover-anchor" ref={taskPopoverWrapRef}>
+                  <button
+                    type="button"
+                    className={`task-badge-btn ${isDefaultTask ? "warn" : ""}`}
+                    data-testid="studio-task-badge-btn"
+                    title={t("studio.taskEditTitle")}
+                    aria-expanded={taskPopoverOpen}
+                    onClick={handleOpenTaskPopover}
+                  >
+                    {isDefaultTask ? <AlertTriangle size={11} /> : <Tag size={11} />}
+                    <span>
+                      {isDefaultTask
+                        ? t("studio.taskUnrecognized")
+                        : t("studio.taskBadgeLabel", { task: episode.meta.task_id })}
+                    </span>
+                    <Edit3 size={10} />
+                  </button>
+                  {taskPopoverOpen && (
+                    <div className="task-popover" data-testid="studio-task-popover">
+                      <div className="section-header-row">
+                        <strong className="small">{t("studio.taskPopoverTitle")}</strong>
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          onClick={() => setTaskPopoverOpen(false)}
+                          aria-label={t("common.close")}
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                      {!isLead && (
+                        <div className="muted small">{t("studio.taskReviewerHint")}</div>
+                      )}
+                      <select
+                        aria-label={t("studio.taskSelectAria")}
+                        data-testid="studio-task-select"
+                        value={pendingTaskId}
+                        onChange={(e) => setPendingTaskId(e.target.value)}
+                      >
+                        {!isLead && (
+                          <option value="">{t("studio.taskSelectPlaceholder")}</option>
+                        )}
+                        {studioTaskOptions.map((item) => (
+                          <option key={item.task_id} value={item.task_id}>
+                            {item.task_id}
+                            {item.title ? ` — ${item.title}` : ""}
+                          </option>
+                        ))}
+                      </select>
+                      <div className="modal-actions" style={{ justifyContent: "space-between" }}>
+                        {isLead ? (
+                          <button
+                            type="button"
+                            className="accent-btn compact"
+                            data-testid="studio-new-task-ai-btn"
+                            onClick={() => {
+                              setTaskPopoverOpen(false);
+                              setTaskWizardOpen(true);
+                            }}
+                          >
+                            <Sparkles size={12} /> {t("studio.taskNewAiBtn")}
+                          </button>
+                        ) : (
+                          <span />
+                        )}
+                        <button
+                          type="button"
+                          className="primary-btn compact"
+                          data-testid="studio-task-save-btn"
+                          disabled={
+                            updatingTask ||
+                            !pendingTaskId ||
+                            pendingTaskId === episode.meta.task_id ||
+                            (!isLead && pendingTaskId === "_default")
+                          }
+                          onClick={() => void handleApplyEpisodeTask(pendingTaskId, false)}
+                        >
+                          {updatingTask ? t("studio.taskSaving") : t("studio.taskSaveBtn")}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <span
+                  className={`badge-pill ${isDefaultTask ? "warn" : ""}`}
+                  data-testid="studio-task-badge-readonly"
+                  title={isVlmActive ? t("studio.taskRunningDisabledTitle") : undefined}
+                >
+                  {isDefaultTask ? <AlertTriangle size={11} /> : <Tag size={11} />}
+                  <span>
+                    {isDefaultTask
+                      ? t("studio.taskUnrecognized")
+                      : t("studio.taskBadgeLabel", { task: episode.meta.task_id })}
+                  </span>
+                </span>
+              )}
               {hasUnsavedChanges && (
                 <span className="dirty-indicator" data-testid="unsaved-indicator">
                   {t("studio.unsaved")}
@@ -1774,6 +2090,37 @@ export const ReviewStudioPage: React.FC = () => {
           >
             {t("studio.returnActiveView")}
           </button>
+        </div>
+      )}
+
+      {taskRerunPrompt && (
+        <div className="info-banner" data-testid="studio-rerun-vlm-banner">
+          <span>
+            {isLead
+              ? t("studio.taskRerunPrompt", { taskId: taskRerunPrompt.taskId })
+              : t("studio.taskRerunPromptReviewer", { taskId: taskRerunPrompt.taskId })}
+          </span>
+          <div className="header-actions">
+            {isLead && (
+              <button
+                type="button"
+                className="primary-btn compact"
+                data-testid="studio-rerun-vlm-now-btn"
+                disabled={rerunning}
+                onClick={() => void handleRerunVlmAfterTaskChange()}
+              >
+                <Play size={13} /> {t("studio.taskRerunNowBtn")}
+              </button>
+            )}
+            <button
+              type="button"
+              className="mini-btn"
+              data-testid="studio-dismiss-rerun-banner-btn"
+              onClick={() => setTaskRerunPrompt(null)}
+            >
+              <X size={13} /> {t("common.dismiss")}
+            </button>
+          </div>
         </div>
       )}
 
@@ -2272,6 +2619,60 @@ export const ReviewStudioPage: React.FC = () => {
             </div>
           </form>
         </div>
+      )}
+
+      {isLead && (
+        <>
+          <TaskDraftWizardModal
+            open={taskWizardOpen}
+            onClose={() => setTaskWizardOpen(false)}
+            initialSampleEpisodeId={episode.episode_id}
+            sampleEpisodes={[
+              {
+                episode_id: episode.episode_id,
+                task_id: episode.meta.task_id,
+                dataset: episode.meta.dataset,
+              },
+            ]}
+            onTaskSaved={handleStudioWizardTaskSaved}
+          />
+          {frozenTaskConfirmId && (
+            <div
+              className="modal-backdrop modal-backdrop-top"
+              data-testid="studio-frozen-task-confirm-modal"
+              onClick={(e) => {
+                if (e.target === e.currentTarget) setFrozenTaskConfirmId(null);
+              }}
+            >
+              <div className="modal-card">
+                <h3 style={{ margin: 0, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <AlertTriangle size={16} /> {t("studio.taskFrozenConfirmTitle")}
+                </h3>
+                <p className="muted small" style={{ margin: 0 }}>
+                  {t("studio.taskFrozenConfirmDesc", { taskId: frozenTaskConfirmId })}
+                </p>
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="secondary-btn compact"
+                    onClick={() => setFrozenTaskConfirmId(null)}
+                  >
+                    {t("common.cancel")}
+                  </button>
+                  <button
+                    type="button"
+                    className="warning-btn compact"
+                    data-testid="studio-confirm-frozen-task-btn"
+                    disabled={updatingTask}
+                    onClick={() => void handleApplyEpisodeTask(frozenTaskConfirmId, true)}
+                  >
+                    {t("studio.taskFrozenConfirmBtn")}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />

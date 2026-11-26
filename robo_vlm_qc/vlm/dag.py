@@ -37,6 +37,7 @@ from .client import (
     VlmClient,
     check_client_cancelled,
     normalize_stage_name,
+    resolve_client_stage_model,
 )
 from .prompt_builder import PromptBuilder
 from .stage1_grounding import normalize_custom_objects, run_stage1_grounding
@@ -157,9 +158,15 @@ class VlmDag:
         else:
             few_shot_hash = "none"
 
+        ep_wall_t0 = time.perf_counter()
+        vlm_cfg = self.cfg.settings.get("vlm", {})
+        pricing_cfg = (
+            vlm_cfg.get("pricing") if isinstance(vlm_cfg.get("pricing"), dict) else None
+        )
         ep_budget = BudgetTracker(
             max_tokens=self.cfg.resolve_episode_budget_tokens(ev.duration_s),
             parent=self.client.budget,
+            pricing=pricing_cfg,
         )
 
         # Manage episode status transition safely if tracked in SQLite
@@ -216,7 +223,7 @@ class VlmDag:
                 grounding = GroundingResult.model_validate(s1_cached)
                 ep_budget.record(
                     stage="s1_grounding",
-                    model=self.client.model_for_stage("s1_grounding"),
+                    model=resolve_client_stage_model(self.client, "s1_grounding"),
                     cache_hit=True,
                 )
             else:
@@ -249,7 +256,7 @@ class VlmDag:
                     )
                     ep_budget.record(
                         stage="s2_macro",
-                        model=self.client.model_for_stage("s2_macro"),
+                        model=resolve_client_stage_model(self.client, "s2_macro"),
                         cache_hit=True,
                     )
                     return stages, arms
@@ -279,7 +286,7 @@ class VlmDag:
                     verdict = SuccessVerdict.model_validate(s5_cached)
                     ep_budget.record(
                         stage="s5_success",
-                        model=self.client.model_for_stage("s5_success"),
+                        model=resolve_client_stage_model(self.client, "s5_success"),
                         cache_hit=True,
                     )
                     return verdict
@@ -323,7 +330,7 @@ class VlmDag:
                 ]
                 ep_budget.record(
                     stage="s3_discover",
-                    model=self.client.model_for_stage("s3_discover"),
+                    model=resolve_client_stage_model(self.client, "s3_discover"),
                     cache_hit=True,
                 )
             else:
@@ -363,7 +370,7 @@ class VlmDag:
                 ]
                 ep_budget.record(
                     stage="s4_verify",
-                    model=self.client.model_for_stage("s4_verify"),
+                    model=resolve_client_stage_model(self.client, "s4_verify"),
                     cache_hit=True,
                 )
             else:
@@ -423,6 +430,10 @@ class VlmDag:
                 few_shot_pack_version=few_shot_hash[:12] if fs_list else "none",
                 config_sha256=self.cfg.fingerprints.config_sha256,
             )
+            usage_summary = ep_budget.to_usage_summary()
+            usage_summary.total_elapsed_s = round(
+                max(0.0, time.perf_counter() - ep_wall_t0), 3
+            )
             artifact = VlmRunArtifact(
                 schema_version="1.0",
                 run_id=run_id,
@@ -442,7 +453,7 @@ class VlmDag:
                 arm_timelines=arm_timelines,
                 qc_segments=qc_segments,
                 success=success_verdict,
-                usage=ep_budget.to_usage_summary(),
+                usage=usage_summary,
             )
             _check_cancelled()
             if persist:

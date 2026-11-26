@@ -250,6 +250,8 @@ def run_stage2_macro(
     prompt_builder: PromptBuilder | None = None,
     budget: BudgetTracker | None = None,
     grounding: GroundingResult | None = None,
+    model_override: str | None = None,
+    thinking_budget_override: int | None = None,
 ) -> tuple[list[MacroStage], ArmTimelines]:
     """Execute Stage 2 macro task backbone and dual-arm timelines."""
     ev = view or episode_view
@@ -270,7 +272,11 @@ def run_stage2_macro(
     cell_h = int(s2_cfg.get("cell_h", 180))
     quality = int(s2_cfg.get("quality", 70))
     thinking = bool(s2_cfg.get("thinking", False))
-    thinking_budget = int(s2_cfg.get("thinking_budget", 1536))
+    thinking_budget = (
+        int(thinking_budget_override)
+        if thinking_budget_override is not None
+        else int(s2_cfg.get("thinking_budget", 1536))
+    )
     max_tokens = int(s2_cfg.get("max_tokens", 4096))
 
     check_client_cancelled(cl)
@@ -305,18 +311,21 @@ def run_stage2_macro(
         if g_txt:
             usr_p += f"\n[Stage 1 Grounding Object State Summary]:\n{g_txt}"
 
-    resp = cl.chat_json(
-        stage="s2_macro",
-        system_prompt=sys_p,
-        user_prompt=usr_p,
-        images=tiles,
-        timestamps_s=times_s,
-        thinking=thinking,
-        thinking_budget=thinking_budget,
-        max_tokens=max_tokens,
-        jpeg_quality=quality,
-        budget=budget,
-    )
+    chat_kwargs: dict[str, Any] = {
+        "stage": "s2_macro",
+        "system_prompt": sys_p,
+        "user_prompt": usr_p,
+        "images": tiles,
+        "timestamps_s": times_s,
+        "thinking": thinking,
+        "thinking_budget": thinking_budget,
+        "max_tokens": max_tokens,
+        "jpeg_quality": quality,
+        "budget": budget,
+    }
+    if model_override is not None:
+        chat_kwargs["model_override"] = model_override
+    resp = cl.chat_json(**chat_kwargs)
 
     macro_stages = normalize_macro_stages(resp.get("macro_stages"), ev.duration_s)
     arms_raw = resp.get("arm_timelines") if isinstance(resp.get("arm_timelines"), dict) else {}
@@ -389,6 +398,8 @@ def infer_subtasks_from_segments(
     config: ConfigManager | dict[str, Any] | None = None,
     prompt_builder: PromptBuilder | None = None,
     budget: BudgetTracker | None = None,
+    model_override: str | None = None,
+    thinking_budget_override: int | None = None,
 ) -> list[MacroStage]:
     """Re-infer aligned Subtask stages & VLA instructions from verified QC segments + grounding + frames."""
     ev = view or episode_view
@@ -410,7 +421,11 @@ def infer_subtasks_from_segments(
     cell_h = int(s2_cfg.get("cell_h", 180))
     quality = int(s2_cfg.get("quality", 70))
     thinking = bool(s2_cfg.get("thinking", False))
-    thinking_budget = int(s2_cfg.get("thinking_budget", 1536))
+    thinking_budget = (
+        int(thinking_budget_override)
+        if thinking_budget_override is not None
+        else int(s2_cfg.get("thinking_budget", 1536))
+    )
     max_tokens = int(s2_cfg.get("max_tokens", 4096))
 
     check_client_cancelled(cl)
@@ -460,18 +475,21 @@ def infer_subtasks_from_segments(
             parts.append(custom_hint.strip())
         usr_p = "\n".join(parts)
 
-    resp = cl.chat_json(
-        stage="s2_macro",
-        system_prompt=sys_p,
-        user_prompt=usr_p,
-        images=tiles,
-        timestamps_s=times_s,
-        thinking=thinking,
-        thinking_budget=thinking_budget,
-        max_tokens=max_tokens,
-        jpeg_quality=quality,
-        budget=budget,
-    )
+    chat_kwargs: dict[str, Any] = {
+        "stage": "s2_macro",
+        "system_prompt": sys_p,
+        "user_prompt": usr_p,
+        "images": tiles,
+        "timestamps_s": times_s,
+        "thinking": thinking,
+        "thinking_budget": thinking_budget,
+        "max_tokens": max_tokens,
+        "jpeg_quality": quality,
+        "budget": budget,
+    }
+    if model_override is not None:
+        chat_kwargs["model_override"] = model_override
+    resp = cl.chat_json(**chat_kwargs)
     return normalize_macro_stages(resp.get("macro_stages"), ev.duration_s)
 
 

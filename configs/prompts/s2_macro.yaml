@@ -1,16 +1,18 @@
 stage: "s2_macro"
 version: "1.0.0"
-description: "Stage 2 macro subtask stages with VLA instructions and dual-manipulator state timeline"
+description: "Stage 2 physical-milestone macro subtask stages with VLA instructions and dual-manipulator state timeline"
 system_template: |
   You are an embodied manipulation task segmentation expert (supporting both robot arms/grippers and human hands / egocentric demonstrations).
-  Inspect the full trajectory's multi-view composite keyframes, partition the episode into contiguous macro subtask stages (macro_stages),
-  and summarize both left and right manipulator (robot arm/gripper or human hand) state timelines (arm_timelines; states must be one of idle|work|hold|anom|mask|good).
-  For each stage, provide "instruction" as a clear, concise imperative VLA training instruction describing the atomic subtask (for example, "Pick up the green mug and place it into the dish rack").
+  Inspect the full trajectory's multi-view composite keyframes and partition the episode into contiguous macro subtask stages (macro_stages) strictly grounded in **actually observed physical milestones** (the exact moments when a target object is genuinely grasped, lifted, moved, inserted/placed stably, or dropped), and summarize both left and right manipulator (robot arm/gripper or human hand) state timelines (arm_timelines; states must be one of idle|work|hold|anom|mask|good).
+  Key constraints:
+  1. NEVER copy reference expected_steps mechanically to fabricate smooth progress or gloss over extended spans with no physical progress. If a manipulator hovers/probes for a long period, oscillates back and forth, or retries repeatedly without producing substantive displacement of the target object, state that truthfully in the stage summary (for example, "Left manipulator repeatedly probes near the container without grasping the target object") and never embellish it as normal progression.
+  2. In arm_timelines, whenever noticeable hesitation/oscillation, repeated back-and-forth probing, missed-grasp retries, object slips/drops, or unintended collisions occur, faithfully label that manipulator span as state="anom" with a concise factual desc.
+  3. For each stage, provide "instruction" as a clear, concise imperative VLA training instruction describing the atomic subtask (for example, "Pick up the green mug and place it into the dish rack").
   Output strict JSON only: {"macro_stages": [{"stage_id": "S1", "t_start": float, "t_end": float, "label": str, "label_en": str, "instruction": str, "summary": str}], "arm_timelines": {"left": [{"t_start": float, "t_end": float, "state": "idle|work|hold|anom|mask|good", "desc": str}], "right": [{"t_start": float, "t_end": float, "state": "idle|work|hold|anom|mask|good", "desc": str}]}}.
 user_template: |
   Task: {{ task_id }} (duration {{ duration_s }}s)
   Goal: {{ task_goal }}
-  Reference steps:
+  Reference steps (task goal background only; NEVER force-fit onto stalled or oscillating spans):
   {{ expected_steps }}
   Camera layout: {{ camera_layout_desc }}
   {% if grounding_summary_text %}
@@ -18,7 +20,7 @@ user_template: |
   {{ grounding_summary_text }}
   {% endif %}
   Task guidance: {{ task_prompt }}
-  Segment the macro subtask stages observed in the video (stage_id such as S1/S2/..., covering 0.0s to {{ duration_s }}s, each with an imperative VLA instruction) and annotate both left and right manipulator/hand timelines.
+  Segment the macro subtask stages strictly from actually observed physical milestones (stage_id such as S1/S2/..., covering 0.0s to {{ duration_s }}s, each with an imperative VLA instruction), truthfully record any extended hesitation/probing/retry/drop in summary, and mark corresponding anom spans in arm_timelines.
 extra_templates:
   infer_subtasks_system: |
     You are an embodied manipulation subtask alignment expert (supporting both robot arms/grippers and human hands / egocentric demonstrations).

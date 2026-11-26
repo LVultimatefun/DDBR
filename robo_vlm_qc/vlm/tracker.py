@@ -34,7 +34,7 @@ class TrackingConfig:
     enabled: bool = True
     track_fps: float = 15.0
     short_native_fps_max_s: float = 15.0
-    track_width: int = 320
+    track_width: int = 480
     flow_preset: str = "ultrafast"
     ncc_stride: int = 2
     ncc_min_score: float = 0.55
@@ -61,7 +61,7 @@ class TrackingConfig:
             enabled=bool(raw.get("enabled", True)),
             track_fps=max(1.0, float(raw.get("track_fps", 15.0))),
             short_native_fps_max_s=max(0.0, float(raw.get("short_native_fps_max_s", 15.0))),
-            track_width=max(64, int(raw.get("track_width", 320))),
+            track_width=max(64, int(raw.get("track_width", 480))),
             flow_preset=str(raw.get("flow_preset", "ultrafast")).strip().lower(),
             ncc_stride=max(1, int(raw.get("ncc_stride", 2))),
             ncc_min_score=float(np.clip(float(raw.get("ncc_min_score", 0.55)), 0.0, 0.99)),
@@ -396,6 +396,259 @@ def _estimate_bg_ego_motion_step(
     return dx, dy, agree
 
 
+def _warp_overlap_agreement(
+    ga: np.ndarray,
+    gb: np.ndarray,
+    M: np.ndarray,
+    *,
+    diff_tol: int = 14,
+) -> tuple[float, float, float, float]:
+    """Return (warped_agree, unwarped_agree, warped_strict_le6, overlap_ratio) under 2x3 affine M."""
+    h, w = ga.shape[:2]
+    warped = cv2.warpAffine(
+        ga, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+    )
+    mask = (
+        cv2.warpAffine(
+            np.full((h, w), 255, dtype=np.uint8),
+            M,
+            (w, h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        > 127
+    )
+    n_ov = int(np.count_nonzero(mask))
+    ov_ratio = n_ov / float(max(1, h * w))
+    if n_ov < 64 or ov_ratio < 0.15:
+        return 0.0, 0.0, 0.0, ov_ratio
+    ga_m = ga[mask].astype(np.int16)
+    gb_m = gb[mask].astype(np.int16)
+    wa_m = warped[mask].astype(np.int16)
+    w_diff = np.abs(wa_m - gb_m)
+    w_agree = float(np.mean(w_diff <= diff_tol))
+    u_agree = float(np.mean(np.abs(ga_m - gb_m) <= diff_tol))
+    w_strict = float(np.mean(w_diff <= 6))
+    return w_agree, u_agree, w_strict, ov_ratio
+
+
+def _estimate_direct_pair_shift(
+    ga: np.ndarray,
+    gb: np.ndarray,
+    *,
+    motion_threshold_norm: float,
+    strict_mode: bool = False,
+    static_ratio_le6: float = 0.0,
+) -> tuple[float, float, float, bool]:
+    """Direct two-frame background shift via ORB+RANSAC affine, falling back to phaseCorrelate.
+
+    Returns ``(dx_px, dy_px, shift_norm, reliable)``.
+    When ``strict_mode=True`` (used if ``static_ratio_le6 >= 0.32`` on low-contrast scenes),
+    requires strong global rigid warp alignment (``w_strict >= 0.55`` and
+    ``w_strict >= static_ratio_le6 + 0.20``) so articulated robot arms or human hands on a
+    fixed camera can never trigger a false positive.
+    """
+    h, w = ga.shape[:2]
+    if h < 16 or w < 16:
+        return 0.0, 0.0, 0.0, False
+    if float(np.std(ga)) < 3.0 or float(np.std(gb)) < 3.0:
+        return 0.0, 0.0, 0.0, False
+
+    def _passes_warp(
+        w_agree: float, u_agree: float, w_strict: float, ov_ratio: float
+    ) -> bool:
+        if ov_ratio < 0.15 or w_agree < 0.35 or w_agree < u_agree + 0.08:
+            return False
+        if strict_mode:
+            return w_strict >= 0.55 and w_strict >= static_ratio_le6 + 0.20
+        return True
+
+    # 1. Primary: ORB + Lowe ratio + RANSAC estimateAffinePartial2D
+    orb = cv2.ORB_create(nfeatures=500, fastThreshold=10)
+    kp1, des1 = orb.detectAndCompute(ga, None)
+    kp2, des2 = orb.detectAndCompute(gb, None)
+    if des1 is not None and des2 is not None and len(kp1) >= 8 and len(kp2) >= 8:
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        raw_matches = matcher.knnMatch(des1, des2, k=2)
+        good = [
+            pair[0]
+            for pair in raw_matches
+            if len(pair) == 2 and pair[0].distance < 0.78 * pair[1].distance
+        ]
+        if len(good) >= 6:
+            pts1 = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            pts2 = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+            M, inliers = cv2.estimateAffinePartial2D(
+                pts1,
+                pts2,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=3.0,
+                maxIters=500,
+                confidence=0.99,
+            )
+            if M is not None and inliers is not None:
+                n_in = int(np.count_nonzero(inliers))
+                inlier_ratio = n_in / float(len(good))
+                scale = math.hypot(float(M[0, 0]), float(M[0, 1]))
+                if n_in >= 6 and inlier_ratio >= 0.35 and 0.70 <= scale <= 1.40:
+                    cx, cy = 0.5 * w, 0.5 * h
+                    nx = float(M[0, 0]) * cx + float(M[0, 1]) * cy + float(M[0, 2])
+                    ny = float(M[1, 0]) * cx + float(M[1, 1]) * cy + float(M[1, 2])
+                    dx = nx - cx
+                    dy = ny - cy
+                    shift_norm = math.hypot(dx * 1000.0 / w, dy * 1000.0 / h)
+                    if shift_norm < motion_threshold_norm * 0.35:
+                        return dx, dy, shift_norm, True
+                    w_agree, u_agree, w_strict, ov_ratio = _warp_overlap_agreement(ga, gb, M)
+                    if _passes_warp(w_agree, u_agree, w_strict, ov_ratio):
+                        return dx, dy, shift_norm, True
+
+    # 2. Fallback: Hanning-windowed phaseCorrelate when ORB features/matches are sparse
+    hann = cv2.createHanningWindow((w, h), cv2.CV_64F)
+    fa = (ga.astype(np.float64) - float(np.mean(ga))) * hann
+    fb = (gb.astype(np.float64) - float(np.mean(gb))) * hann
+    (sx, sy), response = cv2.phaseCorrelate(fa, fb)
+    if not (math.isfinite(sx) and math.isfinite(sy) and math.isfinite(response)):
+        return 0.0, 0.0, 0.0, False
+    if float(response) < 0.25:
+        return 0.0, 0.0, 0.0, False
+
+    shift_norm = math.hypot(sx * 1000.0 / w, sy * 1000.0 / h)
+    # Disambiguate translation sign via warped overlap verification
+    M_pos = np.array([[1.0, 0.0, float(sx)], [0.0, 1.0, float(sy)]], dtype=np.float64)
+    M_neg = np.array([[1.0, 0.0, -float(sx)], [0.0, 1.0, -float(sy)]], dtype=np.float64)
+    wp, up, wsp, ovp = _warp_overlap_agreement(ga, gb, M_pos)
+    wn, un, wsn, ovn = _warp_overlap_agreement(ga, gb, M_neg)
+    if wn > wp:
+        dx, dy, best_w, best_u, best_ws, best_ov = -float(sx), -float(sy), wn, un, wsn, ovn
+    else:
+        dx, dy, best_w, best_u, best_ws, best_ov = float(sx), float(sy), wp, up, wsp, ovp
+
+    if shift_norm < motion_threshold_norm * 0.35:
+        return dx, dy, shift_norm, True
+    if _passes_warp(best_w, best_u, best_ws, best_ov):
+        return dx, dy, shift_norm, True
+    return 0.0, 0.0, 0.0, False
+
+
+def detect_camera_motion_direct(
+    view: EpisodeView,
+    camera: str,
+    sample_times_s: Sequence[float] | None = None,
+    *,
+    target_w: int = 320,
+    motion_threshold_norm: float = 25.0,
+    check_cancelled: Callable[[], None] | None = None,
+) -> bool:
+    """Direct fixed-vs-moving camera detector without open-loop frame-by-frame integration.
+
+    Samples up to 7 evenly spaced frames, checks direct static-pixel ratio ``|g0 - gk| <= 6``
+    against the initial frame, and estimates direct two-frame background displacement
+    (ORB+RANSAC affine, fallback phaseCorrelate). When ``static_ratio >= 0.32`` (e.g. fixed
+    camera with large robotic arm/human hand OR pan over low-contrast background), requires
+    strict global rigid-warp proof so articulated manipulators on fixed cameras never
+    false-trigger while true pans are reliably caught. Also checks coherent adjacent-sample
+    translations to catch extreme pans with no start-to-end overlap.
+    """
+    chk = check_cancelled or _noop
+    chk()
+
+    dur = max(0.0, float(getattr(view, "duration_s", 0.0) or 0.0))
+    if sample_times_s is None:
+        if dur <= 1e-4:
+            return False
+        raw_times = [round(float(t), 3) for t in np.linspace(0.0, dur, 7)]
+    else:
+        cleaned = sorted(
+            {round(max(0.0, min(dur if dur > 0.0 else float(t), float(t))), 3) for t in sample_times_s}
+        )
+        if len(cleaned) <= 7:
+            raw_times = cleaned
+        else:
+            idxs = sorted({int(round(x)) for x in np.linspace(0, len(cleaned) - 1, 7)})
+            raw_times = [cleaned[i] for i in idxs]
+
+    times: list[float] = []
+    for t in raw_times:
+        if not times or t > times[-1] + 1e-4:
+            times.append(t)
+    if len(times) < 2:
+        return False
+
+    grays, eff_w, eff_h = _decode_span_gray(
+        view,
+        camera,
+        times,
+        max(64, int(target_w)),
+        chk,
+        chunk_size=16,
+    )
+    if len(grays) < 2 or eff_w <= 0 or eff_h <= 0:
+        return False
+
+    thresh = max(1.0, float(motion_threshold_norm))
+    g0 = grays[0]
+    g0_i16 = g0.astype(np.int16)
+    non_static_count = 0
+
+    for k in range(1, len(grays)):
+        chk()
+        gk = grays[k]
+        static_ratio = float(np.mean(np.abs(g0_i16 - gk.astype(np.int16)) <= 6))
+        if static_ratio >= 0.75:
+            continue
+        if static_ratio < 0.32:
+            non_static_count += 1
+        _dx, _dy, shift_norm, reliable = _estimate_direct_pair_shift(
+            g0,
+            gk,
+            motion_threshold_norm=thresh,
+            strict_mode=(static_ratio >= 0.32),
+            static_ratio_le6=static_ratio,
+        )
+        if reliable and shift_norm >= thresh:
+            return True
+
+    # Supplement for extreme camera pans where g0 and gk lose overlap:
+    # inspect coherent adjacent-sample translations only when majority lost static overlap vs g0.
+    if non_static_count >= max(2, len(grays) // 2):
+        adj_shifts: list[tuple[float, float]] = []
+        for j in range(len(grays) - 1):
+            chk()
+            ga, gb = grays[j], grays[j + 1]
+            adj_static = float(
+                np.mean(np.abs(ga.astype(np.int16) - gb.astype(np.int16)) <= 6)
+            )
+            if adj_static >= 0.75:
+                continue
+            dx, dy, shift_norm, reliable = _estimate_direct_pair_shift(
+                ga,
+                gb,
+                motion_threshold_norm=thresh,
+                strict_mode=(adj_static >= 0.32),
+                static_ratio_le6=adj_static,
+            )
+            if not reliable:
+                continue
+            if shift_norm >= thresh:
+                return True
+            if shift_norm >= 3.0:
+                adj_shifts.append((dx, dy))
+
+        if len(adj_shifts) >= 2:
+            sum_dx = sum(s[0] for s in adj_shifts)
+            sum_dy = sum(s[1] for s in adj_shifts)
+            vec_mag = math.hypot(sum_dx, sum_dy)
+            scalar_mag = sum(math.hypot(s[0], s[1]) for s in adj_shifts)
+            coherence = vec_mag / max(1e-6, scalar_mag)
+            vec_norm = math.hypot(sum_dx * 1000.0 / eff_w, sum_dy * 1000.0 / eff_h)
+            if coherence >= 0.70 and vec_norm >= thresh:
+                return True
+
+    return False
+
+
 def _step_box_with_flow(
     box: np.ndarray,
     flow_step: np.ndarray,
@@ -407,15 +660,17 @@ def _step_box_with_flow(
     w: int,
     h: int,
 ) -> tuple[np.ndarray, float]:
-    """Propagate box 1 frame using inner-70%-core DIS flow filtered by FB consistency."""
+    """Propagate box 1 frame using inner-core DIS flow filtered by FB consistency."""
     x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
     bw = max(2.0, x2 - x1)
     bh = max(2.0, y2 - y1)
     cx = 0.5 * (x1 + x2)
     cy = 0.5 * (y1 + y2)
 
-    mx = 0.15 * bw
-    my = 0.15 * bh
+    # Preserve core pixels on slender/small targets (e.g. tubes/tools <14px wide or tall)
+    margin_ratio = 0.08 if (bw < 14.0 or bh < 14.0) else 0.15
+    mx = margin_ratio * bw
+    my = margin_ratio * bh
     cx1 = max(0, min(w - 2, int(round(x1 + mx))))
     cy1 = max(0, min(h - 2, int(round(y1 + my))))
     cx2 = max(cx1 + 2, min(w, int(round(x2 - mx))))
@@ -488,28 +743,32 @@ def _step_box_with_flow(
 def _extract_template(
     gray: np.ndarray, box: np.ndarray
 ) -> tuple[np.ndarray | None, tuple[int, int, int, int]]:
-    """Extract grayscale template patch, adding a 3px silhouette collar if low-texture."""
+    """Extract grayscale template patch, adding a 3-4px silhouette collar if slender or low-texture."""
     h, w = gray.shape[:2]
     x1 = max(0, min(w - 2, int(round(float(box[0])))))
     y1 = max(0, min(h - 2, int(round(float(box[1])))))
     x2 = max(x1 + 2, min(w, int(round(float(box[2])))))
     y2 = max(y1 + 2, min(h, int(round(float(box[3])))))
     patch = gray[y1:y2, x1:x2]
-    if patch.size < 16 or patch.shape[0] < 4 or patch.shape[1] < 4:
+    if patch.size == 0 or patch.shape[0] < 2 or patch.shape[1] < 2:
         return None, (0, 0, 0, 0)
 
-    # Low-texture object (e.g. uniform white cup or solid synthetic box): include 3px border
-    if float(np.std(patch)) < 6.0:
-        px1 = max(0, x1 - 3)
-        py1 = max(0, y1 - 3)
-        px2 = min(w, x2 + 3)
-        py2 = min(h, y2 + 3)
+    is_slender = patch.shape[0] < 10 or patch.shape[1] < 10
+    is_low_tex = float(np.std(patch)) < 6.0
+    if is_slender or is_low_tex:
+        pad = 4 if is_slender else 3
+        px1 = max(0, x1 - pad)
+        py1 = max(0, y1 - pad)
+        px2 = min(w, x2 + pad)
+        py2 = min(h, y2 + pad)
         padded = gray[py1:py2, px1:px2]
         if padded.shape[0] >= 6 and padded.shape[1] >= 6:
             return (
                 padded.astype(np.float32),
                 (x1 - px1, y1 - py1, px2 - x2, py2 - y2),
             )
+    if patch.size < 16 or patch.shape[0] < 4 or patch.shape[1] < 4:
+        return None, (0, 0, 0, 0)
     return patch.astype(np.float32), (0, 0, 0, 0)
 
 
@@ -779,7 +1038,7 @@ def _track_interval_bidirectional_detailed(
             1.0,
         )
 
-    fwd_boxes, fwd_confs, _ = _rollout_one_direction(
+    fwd_boxes, fwd_confs, fwd_nccs = _rollout_one_direction(
         grays, flow_fwd, flow_bwd, bg_steps, box_start_px, cfg, w, h
     )
 
@@ -789,11 +1048,12 @@ def _track_interval_bidirectional_detailed(
     rev_flow_back = list(reversed(flow_fwd))
     rev_bg = [(-dx, -dy) for dx, dy in reversed(bg_steps)]
 
-    bwd_boxes_rev, bwd_confs_rev, _ = _rollout_one_direction(
+    bwd_boxes_rev, bwd_confs_rev, bwd_nccs_rev = _rollout_one_direction(
         rev_grays, rev_flow_step, rev_flow_back, rev_bg, box_end_px, cfg, w, h
     )
     bwd_boxes = bwd_boxes_rev[::-1]
     bwd_confs = bwd_confs_rev[::-1]
+    bwd_nccs = bwd_nccs_rev[::-1]
 
     fused = np.zeros((L, 4), dtype=np.float64)
     flags = np.full(L, FLAG_TRACKED, dtype=np.int32)
@@ -812,58 +1072,123 @@ def _track_interval_bidirectional_detailed(
     mid_lo = max(1, L // 4)
     mid_hi = min(L - 1, max(mid_lo + 1, (3 * L) // 4 + 1))
 
+    ious = np.zeros(L, dtype=np.float64)
     for i in range(1, L - 1):
-        u = i / float(L - 1)
-        cf = float(fwd_confs[i])
-        cb = float(bwd_confs[i])
-        wf = ((1.0 - u) ** 1.5) * (0.15 + cf)
-        wb = (u**1.5) * (0.15 + cb)
-        denom = max(1e-6, wf + wb)
         iou_i = box_iou(fwd_boxes[i], bwd_boxes[i])
-        if iou_i < 0.20:
-            # Disjoint objects: never linearly average across empty air.
-            fwd_ok = cf >= cfg.occlusion_conf_thresh
-            bwd_ok = cb >= cfg.occlusion_conf_thresh
-            if not fwd_ok and not bwd_ok:
-                both_low[i] = True
-                flags[i] = FLAG_INVISIBLE
-                fused[i] = 0.0
-                confs[i] = 0.0
-            else:
-                if fwd_ok != bwd_ok:
-                    if fwd_ok:
-                        win_box, win_conf = fwd_boxes[i], cf
-                    else:
-                        win_box, win_conf = bwd_boxes[i], cb
-                elif abs(cf - cb) >= 0.15:
-                    if cf > cb:
-                        win_box, win_conf = fwd_boxes[i], cf
-                    else:
-                        win_box, win_conf = bwd_boxes[i], cb
-                elif abs(wf - wb) <= 0.08 * (wf + wb):
-                    flags[i] = FLAG_INVISIBLE
-                    fused[i] = 0.0
-                    confs[i] = 0.0
-                    if mid_lo <= i < mid_hi:
-                        disagrees.append(1.0 - iou_i)
-                    continue
-                else:
-                    if wf > wb:
-                        win_box, win_conf = fwd_boxes[i], cf
-                    else:
-                        win_box, win_conf = bwd_boxes[i], cb
-                agree = max(0.10, float(iou_i))
-                fused[i] = _clamp_box_px(win_box, w, h)
-                confs[i] = float(np.clip(win_conf * agree, 0.0, 1.0))
-        else:
+        ious[i] = iou_i
+        if mid_lo <= i < mid_hi:
+            disagrees.append(1.0 - iou_i)
+        if iou_i >= 0.20:
+            u = i / float(L - 1)
+            cf = float(fwd_confs[i])
+            cb = float(bwd_confs[i])
+            wf = ((1.0 - u) ** 1.5) * (0.15 + cf)
+            wb = (u**1.5) * (0.15 + cb)
+            denom = max(1e-6, wf + wb)
             agree = float(np.clip(0.35 + 0.65 * (iou_i / 0.65), 0.35, 1.0))
             fused[i] = _clamp_box_px((wf * fwd_boxes[i] + wb * bwd_boxes[i]) / denom, w, h)
             base_conf = (wf * cf + wb * cb) / denom
             confs[i] = float(np.clip(base_conf * agree, 0.0, 1.0))
             if cf < cfg.occlusion_conf_thresh and cb < cfg.occlusion_conf_thresh:
                 both_low[i] = True
-        if mid_lo <= i < mid_hi:
-            disagrees.append(1.0 - iou_i)
+
+    # Single-Switchpoint Monotonic DP on each contiguous disjoint (iou < 0.20) run [r0, r1]:
+    # allows at most ONE forward -> backward transition, mathematically preventing 15Hz ping-pong.
+    idx = 1
+    while idx < L - 1:
+        if ious[idx] >= 0.20:
+            idx += 1
+            continue
+        r0 = idx
+        while idx < L - 1 and ious[idx] < 0.20:
+            idx += 1
+        r1 = idx - 1
+        run_len = r1 - r0 + 1
+
+        disjoint_min_conf = max(cfg.occlusion_conf_thresh, 0.50)
+        disjoint_min_ncc = min(cfg.ncc_min_score, 0.45)
+
+        score_f = np.zeros(run_len, dtype=np.float64)
+        score_b = np.zeros(run_len, dtype=np.float64)
+        for k in range(run_len):
+            i = r0 + k
+            u = i / float(L - 1)
+            cf = float(fwd_confs[i])
+            cb = float(bwd_confs[i])
+            fn = float(fwd_nccs[i])
+            bn = float(bwd_nccs[i])
+            fwd_ok = cf >= disjoint_min_conf and fn >= disjoint_min_ncc
+            bwd_ok = cb >= disjoint_min_conf and bn >= disjoint_min_ncc
+            score_f[k] = (2.0 if fwd_ok else 0.0) + cf + 0.30 * (1.0 - u)
+            score_b[k] = (2.0 if bwd_ok else 0.0) + cb + 0.30 * u
+
+        pref_f = np.zeros(run_len + 1, dtype=np.float64)
+        suff_b = np.zeros(run_len + 1, dtype=np.float64)
+        for k in range(run_len):
+            pref_f[k + 1] = pref_f[k] + score_f[k]
+        for k in range(run_len - 1, -1, -1):
+            suff_b[k] = suff_b[k + 1] + score_b[k]
+
+        best_split_k = 0
+        best_total = -1e18
+        for split_k in range(run_len + 1):
+            total = float(pref_f[split_k] + suff_b[split_k])
+            if total > best_total:
+                best_total = total
+                best_split_k = split_k
+        best_s = r0 + best_split_k
+
+        for i in range(r0, r1 + 1):
+            u = i / float(L - 1)
+            cf = float(fwd_confs[i])
+            cb = float(bwd_confs[i])
+            fn = float(fwd_nccs[i])
+            bn = float(bwd_nccs[i])
+            wf = ((1.0 - u) ** 1.5) * (0.15 + cf)
+            wb = (u**1.5) * (0.15 + cb)
+            fwd_ok = cf >= disjoint_min_conf and fn >= disjoint_min_ncc
+            bwd_ok = cb >= disjoint_min_conf and bn >= disjoint_min_ncc
+            if not fwd_ok and not bwd_ok:
+                both_low[i] = True
+                flags[i] = FLAG_INVISIBLE
+                fused[i] = 0.0
+                confs[i] = 0.0
+                continue
+
+            use_fwd = i < best_s
+            win_box, win_conf, win_ncc = (
+                (fwd_boxes[i], cf, fn) if use_fwd else (bwd_boxes[i], cb, bn)
+            )
+            if win_conf < disjoint_min_conf or win_ncc < disjoint_min_ncc:
+                flags[i] = FLAG_INVISIBLE
+                fused[i] = 0.0
+                confs[i] = 0.0
+                continue
+            if (
+                abs(i - best_s) <= 1
+                and abs(cf - cb) < 0.15
+                and abs(wf - wb) <= 0.08 * (wf + wb)
+            ):
+                flags[i] = FLAG_INVISIBLE
+                fused[i] = 0.0
+                confs[i] = 0.0
+                continue
+
+            agree = max(0.10, float(ious[i]))
+            fused[i] = _clamp_box_px(win_box, w, h)
+            confs[i] = float(np.clip(win_conf * agree, 0.0, 1.0))
+
+        # Hide ambiguous handoff frames when BOTH sides have low confidence at the switch boundary
+        if r0 < best_s <= r1:
+            low_switch_thresh = max(cfg.occlusion_conf_thresh, 0.45)
+            for b_idx in (best_s - 1, best_s):
+                if (
+                    float(fwd_confs[b_idx]) < low_switch_thresh
+                    and float(bwd_confs[b_idx]) < low_switch_thresh
+                ):
+                    flags[b_idx] = FLAG_INVISIBLE
+                    fused[b_idx] = 0.0
+                    confs[b_idx] = 0.0
 
     # Occlusion hysteresis: only hide when BOTH directions fail for >= occlusion_min_frames
     i = 1
@@ -1367,6 +1692,150 @@ def stabilize_static_keyframes(
     return list(kfs), med_norm
 
 
+def _patch_texture_stats(gray: np.ndarray, box_px: np.ndarray) -> tuple[float, float]:
+    """Return (grayscale std, mean Sobel gradient magnitude) inside box_px."""
+    h, w = gray.shape[:2]
+    x1 = max(0, min(w - 2, int(round(float(box_px[0])))))
+    y1 = max(0, min(h - 2, int(round(float(box_px[1])))))
+    x2 = max(x1 + 2, min(w, int(round(float(box_px[2])))))
+    y2 = max(y1 + 2, min(h, int(round(float(box_px[3])))))
+    patch = gray[y1:y2, x1:x2]
+    if patch.size < 4:
+        return 0.0, 0.0
+    std_val = float(np.std(patch))
+    gx = cv2.Sobel(patch, cv2.CV_32F, 1, 0, ksize=3, scale=0.25)
+    gy = cv2.Sobel(patch, cv2.CV_32F, 0, 1, ksize=3, scale=0.25)
+    grad_val = float(np.mean(np.hypot(gx, gy)))
+    return std_val, grad_val
+
+
+def _eval_local_ncc(
+    gray: np.ndarray,
+    box_px: np.ndarray,
+    tmpl: np.ndarray,
+    search_pad: int = 4,
+) -> float:
+    """Evaluate best local TM_CCOEFF_NORMED match of tmpl centered around box_px."""
+    h, w = gray.shape[:2]
+    th, tw = tmpl.shape[:2]
+    if th < 4 or tw < 4 or float(np.std(tmpl)) < 1.0:
+        return 0.0
+    cx = 0.5 * (float(box_px[0]) + float(box_px[2]))
+    cy = 0.5 * (float(box_px[1]) + float(box_px[3]))
+    half_w = 0.5 * tw + search_pad
+    half_h = 0.5 * th + search_pad
+    rx1 = max(0, int(math.floor(cx - half_w)))
+    ry1 = max(0, int(math.floor(cy - half_h)))
+    rx2 = min(w, int(math.ceil(cx + half_w)))
+    ry2 = min(h, int(math.ceil(cy + half_h)))
+    roi = gray[ry1:ry2, rx1:rx2]
+    if roi.shape[0] < th or roi.shape[1] < tw:
+        return 0.0
+    roi_f = roi.astype(np.float32)
+    if float(np.std(roi_f)) < 1.0:
+        return 0.0
+    res = cv2.matchTemplate(roi_f, tmpl, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(res)
+    if not math.isfinite(max_val):
+        return 0.0
+    return float(max_val)
+
+
+def reject_hallucinated_anchors(
+    keyframes: Sequence[GroundingKeyframe],
+    anchor_grays: Sequence[np.ndarray],
+    *,
+    outlier_jump_norm: float = 250.0,
+    ref_std_min: float = 12.0,
+    ref_grad_min: float = 6.0,
+    blank_std_max: float = 5.5,
+    blank_grad_max: float = 3.5,
+    old_ncc_min: float = 0.68,
+    new_ncc_max: float = 0.20,
+) -> list[GroundingKeyframe]:
+    """Filter out VLM anchor boxes hallucinated onto flat/blank tabletop or invalid teleports.
+
+    1. Records the first strongly textured reference box (``std >= ref_std_min`` and
+       ``grad >= ref_grad_min``). Any anchor landing on a flat/blank region
+       (``std < blank_std_max`` and ``grad < blank_grad_max``) is rejected (``visible=False``).
+    2. When an anchor jumps by ``> outlier_jump_norm`` while the previous position still
+       matches strongly in the current frame (``NCC >= old_ncc_min``) and the new location
+       matches poorly (``NCC < new_ncc_max``), rejects the hallucinated jump.
+    """
+    out: list[GroundingKeyframe] = list(keyframes)
+    n = min(len(keyframes), len(anchor_grays))
+    if n == 0:
+        return out
+
+    def _invisible_copy(kf: GroundingKeyframe) -> GroundingKeyframe:
+        return kf.model_copy(
+            update={
+                "visible": False,
+                "bbox_norm_1000": [0, 0, 0, 0],
+                "bbox_px": [0, 0, 0, 0],
+                "state": "",
+                "status_kind": "neutral",
+            }
+        )
+
+    ref_has_strong_tex = False
+    ref_tmpl: np.ndarray | None = None
+    last_valid_box_norm: list[int] | None = None
+    last_valid_box_px: np.ndarray | None = None
+    last_valid_tmpl: np.ndarray | None = None
+    early_blank_indices: list[int] = []
+
+    for i in range(n):
+        kf = out[i]
+        if not kf.visible:
+            continue
+        gray = anchor_grays[i]
+        h, w = gray.shape[:2]
+        if h < 4 or w < 4:
+            continue
+
+        cur_box_px = _clamp_box_px(_norm_to_px(kf.bbox_norm_1000, w, h), w, h)
+        cur_std, cur_grad = _patch_texture_stats(gray, cur_box_px)
+        is_blank = cur_std < blank_std_max and cur_grad < blank_grad_max
+
+        if ref_has_strong_tex and is_blank:
+            out[i] = _invisible_copy(kf)
+            continue
+
+        if (
+            last_valid_box_norm is not None
+            and last_valid_box_px is not None
+            and last_valid_tmpl is not None
+        ):
+            jump_dist = box_center_dist(kf.bbox_norm_1000, last_valid_box_norm)
+            if jump_dist > outlier_jump_norm:
+                old_ncc = _eval_local_ncc(gray, last_valid_box_px, last_valid_tmpl)
+                new_ncc = _eval_local_ncc(gray, cur_box_px, last_valid_tmpl)
+                if ref_tmpl is not None and ref_tmpl is not last_valid_tmpl:
+                    new_ncc = max(new_ncc, _eval_local_ncc(gray, cur_box_px, ref_tmpl))
+                if old_ncc >= old_ncc_min and new_ncc < new_ncc_max:
+                    out[i] = _invisible_copy(kf)
+                    continue
+
+        tmpl_cur, _ = _extract_template(gray, cur_box_px)
+        if not ref_has_strong_tex:
+            if cur_std >= ref_std_min and cur_grad >= ref_grad_min:
+                ref_has_strong_tex = True
+                ref_tmpl = tmpl_cur
+                for prev_i in early_blank_indices:
+                    out[prev_i] = _invisible_copy(out[prev_i])
+                early_blank_indices.clear()
+            elif is_blank:
+                early_blank_indices.append(i)
+
+        last_valid_box_norm = list(kf.bbox_norm_1000)
+        last_valid_box_px = cur_box_px
+        if tmpl_cur is not None:
+            last_valid_tmpl = tmpl_cur
+
+    return out
+
+
 def run_baft_tracking(
     *,
     view: EpisodeView,
@@ -1380,6 +1849,7 @@ def run_baft_tracking(
     static_defaults: dict[str, str],
     cfg: TrackingConfig,
     check_cancelled: Callable[[], None] | None = None,
+    camera_motion_override: bool | None = None,
 ) -> BaftTrackingOutput:
     """Densify sparse Stage 1 VLM anchor tracks into smooth frame-level 2D tracks."""
     chk = check_cancelled or _noop
@@ -1403,29 +1873,62 @@ def run_baft_tracking(
             interval_reports=[],
         )
 
-    # Clamp anchor scale outliers (>35% width/height breathing) before interval tracking
-    work_tracks: dict[str, GroundingTrack] = {
-        oid: tr.model_copy(
-            update={
-                "keyframes": clamp_anchor_scale_outliers(
-                    tr.keyframes, ref_w=ref_w, ref_h=ref_h
-                )
-            }
+    # Direct fixed-vs-moving camera verdict (zero open-loop optical-flow integration drift)
+    if camera_motion_override is not None:
+        camera_motion_detected = bool(camera_motion_override)
+    else:
+        camera_motion_detected = detect_camera_motion_direct(
+            view,
+            camera,
+            sample_times_s=None,
+            target_w=min(320, cfg.track_width),
+            motion_threshold_norm=cfg.camera_motion_threshold_norm,
+            check_cancelled=chk,
         )
+
+    dynamic_oids = [
+        oid
         for oid, tr in raw_tracks.items()
-    }
+        if not (tr.is_static_container and not camera_motion_detected)
+    ]
+
+    # Decode sparse anchor frames once to reject blank-tabletop / jump hallucinations
+    anchor_grays: list[np.ndarray] = []
+    if dynamic_oids and n_anchors >= 2:
+        anchor_grays, _aw, _ah = _decode_span_gray(
+            view,
+            camera,
+            anchor_times_s,
+            cfg.track_width,
+            chk,
+            chunk_size=32,
+        )
+
+    # Reject hallucinated anchors on dynamic tracks, then clamp >35% scale breathing outliers
+    work_tracks: dict[str, GroundingTrack] = {}
+    for oid, tr in raw_tracks.items():
+        kfs = list(tr.keyframes)
+        if oid in dynamic_oids and len(anchor_grays) >= 2:
+            kfs = reject_hallucinated_anchors(
+                kfs,
+                anchor_grays,
+                outlier_jump_norm=cfg.outlier_jump_norm,
+            )
+        kfs = clamp_anchor_scale_outliers(kfs, ref_w=ref_w, ref_h=ref_h)
+        work_tracks[oid] = tr.model_copy(update={"keyframes": kfs})
+    del anchor_grays
 
     # Identify candidate VLM instance-switch & moderate/multi-frame jitter outliers BEFORE streaming intervals
     cand_outliers: dict[str, dict[int, tuple[int, int]]] = {
         oid: _find_candidate_outliers(
-            tr.keyframes,
+            work_tracks[oid].keyframes,
             cfg.outlier_jump_norm,
             moderate_jump_norm=cfg.moderate_outlier_jump_norm,
             scale_jitter_ratio=cfg.anchor_scale_jitter_ratio,
         )
-        for oid, tr in work_tracks.items()
+        for oid in dynamic_oids
     }
-    # Merge adjacent anchor intervals whenever any object has a candidate outlier on the middle anchor
+    # Merge adjacent anchor intervals whenever any dynamic object has a candidate outlier on the middle anchor
     merged_boundary_anchors: set[int] = set()
     for c_map in cand_outliers.values():
         merged_boundary_anchors.update(c_map.keys())
@@ -1450,20 +1953,20 @@ def run_baft_tracking(
 
     # Per-object dense buffers (stored in tracking pixel coords)
     obj_boxes_px: dict[str, np.ndarray] = {
-        oid: np.zeros((n_dense, 4), dtype=np.float64) for oid in work_tracks
+        oid: np.zeros((n_dense, 4), dtype=np.float64) for oid in dynamic_oids
     }
     obj_flags: dict[str, np.ndarray] = {
-        oid: np.zeros(n_dense, dtype=np.int32) for oid in work_tracks
+        oid: np.zeros(n_dense, dtype=np.int32) for oid in dynamic_oids
     }
     obj_confs: dict[str, np.ndarray] = {
-        oid: np.zeros(n_dense, dtype=np.float64) for oid in work_tracks
+        oid: np.zeros(n_dense, dtype=np.float64) for oid in dynamic_oids
     }
     # Per-object endpoint flow arrival predictions at anchors: dense_idx -> (pred_box_px, conf)
     anchor_fwd_in: dict[str, dict[int, tuple[np.ndarray, float]]] = {
-        oid: {} for oid in work_tracks
+        oid: {} for oid in dynamic_oids
     }
     anchor_bwd_out: dict[str, dict[int, tuple[np.ndarray, float]]] = {
-        oid: {} for oid in work_tracks
+        oid: {} for oid in dynamic_oids
     }
 
     dis = _create_dis_flow(cfg.flow_preset)
@@ -1472,329 +1975,303 @@ def run_baft_tracking(
     dims: tuple[int, int] | None = None
     last_gray: np.ndarray | None = None
     last_dense_idx = -1
-
-    # Global camera ego-motion accumulator (in tracking pixel coords)
-    cum_dx = 0.0
-    cum_dy = 0.0
-    min_cx = 0.0
-    max_cx = 0.0
-    min_cy = 0.0
-    max_cy = 0.0
-
     interval_reports: list[IntervalDisagreement] = []
 
-    for a_start, a_end in spans:
-        chk()
-        d_start = anchor_dense_idx[a_start]
-        d_end = anchor_dense_idx[a_end]
-        span_times = dense_times[d_start : d_end + 1]
-        reuse = last_gray if (last_gray is not None and d_start == last_dense_idx) else None
-        grays, eff_w, eff_h = _decode_span_gray(
-            view,
-            camera,
-            span_times,
-            cfg.track_width,
-            chk,
-            chunk_size=64,
-            reuse_first=reuse,
-            dims=dims,
-        )
-        dims = (eff_w, eff_h)
-        if grays:
-            last_gray = grays[-1]
-            last_dense_idx = d_end
-
-        if len(grays) <= 1:
-            # Single-frame span: pin visible anchors directly
-            for oid, tr in work_tracks.items():
-                kf = tr.keyframes[a_start]
-                if kf.visible:
-                    obj_boxes_px[oid][d_start] = _norm_to_px(
-                        kf.bbox_norm_1000, eff_w, eff_h
-                    )
-                    obj_flags[oid][d_start] = FLAG_VLM_ANCHOR
-                    obj_confs[oid][d_start] = 1.0
-            continue
-
-        flow_fwd, flow_bwd = _compute_span_flows(grays, dis, chk)
-
-        # Estimate background camera ego-motion once per pair in this span
-        span_anchor_boxes: list[np.ndarray] = []
-        for tr in work_tracks.values():
-            for ak in range(a_start, a_end + 1):
-                if ak < len(tr.keyframes) and tr.keyframes[ak].visible:
-                    span_anchor_boxes.append(
-                        _norm_to_px(tr.keyframes[ak].bbox_norm_1000, eff_w, eff_h)
-                    )
-
-        bg_steps: list[tuple[float, float]] = []
-        for p_idx in range(len(flow_fwd)):
-            bdx, bdy, _ = _estimate_bg_ego_motion_step(
-                flow_fwd[p_idx], span_anchor_boxes
-            )
-            bg_steps.append((bdx, bdy))
-            # Dead-zone filter rejects sub-pixel JPEG/sensor jitter while catching real pan/tilt
-            if math.hypot(bdx, bdy) >= 0.30:
-                cum_dx += bdx
-                cum_dy += bdy
-                if cum_dx < min_cx:
-                    min_cx = cum_dx
-                if cum_dx > max_cx:
-                    max_cx = cum_dx
-                if cum_dy < min_cy:
-                    min_cy = cum_dy
-                if cum_dy > max_cy:
-                    max_cy = cum_dy
-
-        # Track each object across its sub-intervals inside [a_start .. a_end]
-        for oid, tr in work_tracks.items():
+    if dynamic_oids:
+        for a_start, a_end in spans:
             chk()
-            c_map = cand_outliers.get(oid, {})
+            d_start = anchor_dense_idx[a_start]
+            d_end = anchor_dense_idx[a_end]
+            span_times = dense_times[d_start : d_end + 1]
+            reuse = last_gray if (last_gray is not None and d_start == last_dense_idx) else None
+            grays, eff_w, eff_h = _decode_span_gray(
+                view,
+                camera,
+                span_times,
+                cfg.track_width,
+                chk,
+                chunk_size=64,
+                reuse_first=reuse,
+                dims=dims,
+            )
+            dims = (eff_w, eff_h)
+            if grays:
+                last_gray = grays[-1]
+                last_dense_idx = d_end
 
-            # Validate candidate outlier/jitter anchors inside (a_start, a_end) using optical flow residual + NCC
-            dropped_anchors: set[int] = set()
-            bridge_groups: dict[tuple[int, int], list[int]] = {}
-            for ak in range(a_start + 1, a_end):
-                if ak not in c_map:
-                    continue
-                k_prev, k_next = c_map[ak]
-                if k_prev < a_start or k_next > a_end:
-                    continue
-                bridge_groups.setdefault((k_prev, k_next), []).append(ak)
-
-            for (k_prev, k_next), aks in bridge_groups.items():
-                rel0 = anchor_dense_idx[k_prev] - d_start
-                rel1 = anchor_dense_idx[k_next] - d_start
-                if rel1 <= rel0:
-                    continue
-                b_prev_px = _norm_to_px(
-                    tr.keyframes[k_prev].bbox_norm_1000, eff_w, eff_h
-                )
-                b_next_px = _norm_to_px(
-                    tr.keyframes[k_next].bbox_norm_1000, eff_w, eff_h
-                )
-                fwd_b, fwd_c, fwd_ncc = _rollout_one_direction(
-                    grays[rel0 : rel1 + 1],
-                    flow_fwd[rel0:rel1],
-                    flow_bwd[rel0:rel1],
-                    bg_steps[rel0:rel1],
-                    b_prev_px,
-                    cfg,
-                    eff_w,
-                    eff_h,
-                )
-                bridge_iou = box_iou(fwd_b[-1], b_next_px)
-                if bridge_iou <= 0.35:
-                    continue
-                tmpl_prev, _ = _extract_template(grays[rel0], b_prev_px)
-                for ak in aks:
-                    r_off = anchor_dense_idx[ak] - anchor_dense_idx[k_prev]
-                    if not (0 < r_off < len(fwd_b)):
-                        continue
-                    pred_px = fwd_b[r_off]
-                    c_pred = float(fwd_c[r_off])
-                    ncc_pred = float(fwd_ncc[r_off])
-                    b_ak_px = _norm_to_px(
-                        tr.keyframes[ak].bbox_norm_1000, eff_w, eff_h
-                    )
-                    iou_pred = box_iou(pred_px, b_ak_px)
-                    if iou_pred < 0.35:
-                        dropped_anchors.add(ak)
-                        continue
-                    pred_w = max(4.0, float(pred_px[2] - pred_px[0]))
-                    pred_h = max(4.0, float(pred_px[3] - pred_px[1]))
-                    ak_w = max(4.0, float(b_ak_px[2] - b_ak_px[0]))
-                    ak_h = max(4.0, float(b_ak_px[3] - b_ak_px[1]))
-                    pred_diag = max(8.0, math.hypot(pred_w, pred_h))
-                    rel_center_err = box_center_dist(pred_px, b_ak_px) / pred_diag
-                    scale_err = max(
-                        abs(ak_w - pred_w) / pred_w,
-                        abs(ak_h - pred_h) / pred_h,
-                    )
-                    ncc_anchor = _patch_ncc(
-                        grays[rel0 + r_off], b_ak_px, tmpl_prev
-                    )
-                    if bridge_iou > 0.45 and c_pred >= 0.45 and ncc_pred >= 0.45:
-                        if (
-                            rel_center_err > 0.18
-                            and (iou_pred < 0.72 or ncc_anchor < ncc_pred - 0.03)
-                        ) or (
-                            scale_err > cfg.anchor_scale_jitter_ratio
-                            and ncc_anchor <= ncc_pred + 0.03
-                        ):
-                            dropped_anchors.add(ak)
-
-            active_anchors = [
-                ak for ak in range(a_start, a_end + 1) if ak not in dropped_anchors
-            ]
-            for s_i in range(len(active_anchors) - 1):
-                k0 = active_anchors[s_i]
-                k1 = active_anchors[s_i + 1]
-                i0 = anchor_dense_idx[k0]
-                i1 = anchor_dense_idx[k1]
-                r0 = i0 - d_start
-                r1 = i1 - d_start
-                if r1 < r0:
-                    continue
-
-                kf0 = tr.keyframes[k0]
-                kf1 = tr.keyframes[k1]
-                sub_grays = grays[r0 : r1 + 1]
-                sub_ff = flow_fwd[r0:r1]
-                sub_fb = flow_bwd[r0:r1]
-                sub_bg = bg_steps[r0:r1]
-
-                if kf0.visible and kf1.visible:
-                    b0_px = _norm_to_px(kf0.bbox_norm_1000, eff_w, eff_h)
-                    b1_px = _norm_to_px(kf1.bbox_norm_1000, eff_w, eff_h)
-                    (
-                        f_boxes,
-                        f_flags,
-                        f_confs,
-                        disagree,
-                        fwd_end_box,
-                        fwd_end_conf,
-                        bwd_start_box,
-                        bwd_start_conf,
-                    ) = _track_interval_bidirectional_detailed(
-                        sub_grays,
-                        sub_ff,
-                        sub_fb,
-                        sub_bg,
-                        b0_px,
-                        b1_px,
-                        cfg,
-                        eff_w,
-                        eff_h,
-                    )
-                    obj_boxes_px[oid][i0 : i1 + 1] = f_boxes
-                    obj_flags[oid][i0 : i1 + 1] = f_flags
-                    obj_confs[oid][i0 : i1 + 1] = f_confs
-                    anchor_fwd_in[oid][i1] = (fwd_end_box, fwd_end_conf)
-                    anchor_bwd_out[oid][i0] = (bwd_start_box, bwd_start_conf)
-                    interval_reports.append(
-                        IntervalDisagreement(
-                            object_id=oid,
-                            a0_idx=k0,
-                            a1_idx=k1,
-                            dense_i0=i0,
-                            dense_i1=i1,
-                            t0=dense_times[i0],
-                            t1=dense_times[i1],
-                            disagree_ratio=disagree,
+            if len(grays) <= 1:
+                # Single-frame span: pin visible anchors directly
+                for oid in dynamic_oids:
+                    kf = work_tracks[oid].keyframes[a_start]
+                    if kf.visible:
+                        obj_boxes_px[oid][d_start] = _norm_to_px(
+                            kf.bbox_norm_1000, eff_w, eff_h
                         )
-                    )
-                elif kf0.visible and not kf1.visible:
-                    b0_px = _norm_to_px(kf0.bbox_norm_1000, eff_w, eff_h)
-                    f_boxes, f_flags, f_confs = _track_interval_onesided(
-                        sub_grays,
-                        sub_ff,
-                        sub_fb,
-                        sub_bg,
-                        b0_px,
-                        from_start=True,
-                        cfg=cfg,
-                        w=eff_w,
-                        h=eff_h,
-                    )
-                    obj_boxes_px[oid][i0 : i1 + 1] = f_boxes
-                    obj_flags[oid][i0 : i1 + 1] = f_flags
-                    obj_confs[oid][i0 : i1 + 1] = f_confs
-                elif not kf0.visible and kf1.visible:
-                    b1_px = _norm_to_px(kf1.bbox_norm_1000, eff_w, eff_h)
-                    f_boxes, f_flags, f_confs = _track_interval_onesided(
-                        sub_grays,
-                        sub_ff,
-                        sub_fb,
-                        sub_bg,
-                        b1_px,
-                        from_start=False,
-                        cfg=cfg,
-                        w=eff_w,
-                        h=eff_h,
-                    )
-                    obj_boxes_px[oid][i0 : i1 + 1] = f_boxes
-                    obj_flags[oid][i0 : i1 + 1] = f_flags
-                    obj_confs[oid][i0 : i1 + 1] = f_confs
-                else:
-                    obj_boxes_px[oid][i0 : i1 + 1] = 0.0
-                    obj_flags[oid][i0 : i1 + 1] = FLAG_INVISIBLE
-                    obj_confs[oid][i0 : i1 + 1] = 0.0
+                        obj_flags[oid][d_start] = FLAG_VLM_ANCHOR
+                        obj_confs[oid][d_start] = 1.0
+                continue
 
-        # Free span frames & flows before moving to the next interval
-        del grays, flow_fwd, flow_bwd
+            flow_fwd, flow_bwd = _compute_span_flows(grays, dis, chk)
 
-    # Handle any leading frames before anchor_dense_idx[0] or trailing frames after anchor_dense_idx[-1]
-    first_d = anchor_dense_idx[0]
-    last_d = anchor_dense_idx[-1]
-    if first_d > 0 and dims is not None:
-        chk()
-        g_lead, eff_w, eff_h = _decode_span_gray(
-            view, camera, dense_times[: first_d + 1], cfg.track_width, chk, dims=dims
-        )
-        if len(g_lead) > 1:
-            ff_l, fb_l = _compute_span_flows(g_lead, dis, chk)
-            bg_l = [(0.0, 0.0)] * len(ff_l)
-            for oid, tr in work_tracks.items():
-                kf0 = tr.keyframes[0]
-                if kf0.visible:
-                    b0_px = _norm_to_px(kf0.bbox_norm_1000, eff_w, eff_h)
-                    rev_b, rev_c, rev_n = _rollout_one_direction(
-                        list(reversed(g_lead)),
-                        list(reversed(fb_l)),
-                        list(reversed(ff_l)),
-                        bg_l,
-                        b0_px,
+            if camera_motion_detected:
+                span_anchor_boxes: list[np.ndarray] = []
+                for tr in work_tracks.values():
+                    for ak in range(a_start, a_end + 1):
+                        if ak < len(tr.keyframes) and tr.keyframes[ak].visible:
+                            span_anchor_boxes.append(
+                                _norm_to_px(tr.keyframes[ak].bbox_norm_1000, eff_w, eff_h)
+                            )
+                bg_steps: list[tuple[float, float]] = [
+                    _estimate_bg_ego_motion_step(flow_fwd[p_idx], span_anchor_boxes)[:2]
+                    for p_idx in range(len(flow_fwd))
+                ]
+            else:
+                bg_steps = [(0.0, 0.0)] * len(flow_fwd)
+
+            # Track each dynamic object across its sub-intervals inside [a_start .. a_end]
+            for oid in dynamic_oids:
+                chk()
+                tr = work_tracks[oid]
+                c_map = cand_outliers.get(oid, {})
+
+                # Validate candidate outlier/jitter anchors inside (a_start, a_end) using optical flow residual + NCC
+                dropped_anchors: set[int] = set()
+                bridge_groups: dict[tuple[int, int], list[int]] = {}
+                for ak in range(a_start + 1, a_end):
+                    if ak not in c_map:
+                        continue
+                    k_prev, k_next = c_map[ak]
+                    if k_prev < a_start or k_next > a_end:
+                        continue
+                    bridge_groups.setdefault((k_prev, k_next), []).append(ak)
+
+                for (k_prev, k_next), aks in bridge_groups.items():
+                    rel0 = anchor_dense_idx[k_prev] - d_start
+                    rel1 = anchor_dense_idx[k_next] - d_start
+                    if rel1 <= rel0:
+                        continue
+                    b_prev_px = _norm_to_px(
+                        tr.keyframes[k_prev].bbox_norm_1000, eff_w, eff_h
+                    )
+                    b_next_px = _norm_to_px(
+                        tr.keyframes[k_next].bbox_norm_1000, eff_w, eff_h
+                    )
+                    fwd_b, fwd_c, fwd_ncc = _rollout_one_direction(
+                        grays[rel0 : rel1 + 1],
+                        flow_fwd[rel0:rel1],
+                        flow_bwd[rel0:rel1],
+                        bg_steps[rel0:rel1],
+                        b_prev_px,
                         cfg,
                         eff_w,
                         eff_h,
-                        stop_on_low_conf=True,
                     )
-                    boxes_l = rev_b[::-1]
-                    confs_l = rev_c[::-1]
-                    nccs_l = rev_n[::-1]
-                    for idx in range(first_d):
-                        if confs_l[idx] >= 0.55 and nccs_l[idx] >= 0.50:
-                            obj_boxes_px[oid][idx] = boxes_l[idx]
-                            obj_flags[oid][idx] = FLAG_TRACKED
-                            obj_confs[oid][idx] = confs_l[idx]
-    if last_d < n_dense - 1 and dims is not None:
-        chk()
-        g_tail, eff_w, eff_h = _decode_span_gray(
-            view, camera, dense_times[last_d:], cfg.track_width, chk, dims=dims
-        )
-        if len(g_tail) > 1:
-            ff_t, fb_t = _compute_span_flows(g_tail, dis, chk)
-            bg_t = [(0.0, 0.0)] * len(ff_t)
-            for oid, tr in work_tracks.items():
-                kfn = tr.keyframes[-1]
-                if kfn.visible:
-                    bn_px = _norm_to_px(kfn.bbox_norm_1000, eff_w, eff_h)
-                    fwd_b, fwd_c, fwd_n = _rollout_one_direction(
-                        g_tail,
-                        ff_t,
-                        fb_t,
-                        bg_t,
-                        bn_px,
-                        cfg,
-                        eff_w,
-                        eff_h,
-                        stop_on_low_conf=True,
-                    )
-                    for off in range(1, len(g_tail)):
-                        idx = last_d + off
-                        if fwd_c[off] >= 0.55 and fwd_n[off] >= 0.50:
-                            obj_boxes_px[oid][idx] = fwd_b[off]
-                            obj_flags[oid][idx] = FLAG_TRACKED
-                            obj_confs[oid][idx] = fwd_c[off]
+                    bridge_iou = box_iou(fwd_b[-1], b_next_px)
+                    if bridge_iou <= 0.35:
+                        continue
+                    tmpl_prev, _ = _extract_template(grays[rel0], b_prev_px)
+                    for ak in aks:
+                        r_off = anchor_dense_idx[ak] - anchor_dense_idx[k_prev]
+                        if not (0 < r_off < len(fwd_b)):
+                            continue
+                        pred_px = fwd_b[r_off]
+                        c_pred = float(fwd_c[r_off])
+                        ncc_pred = float(fwd_ncc[r_off])
+                        b_ak_px = _norm_to_px(
+                            tr.keyframes[ak].bbox_norm_1000, eff_w, eff_h
+                        )
+                        iou_pred = box_iou(pred_px, b_ak_px)
+                        if iou_pred < 0.35:
+                            dropped_anchors.add(ak)
+                            continue
+                        pred_w = max(4.0, float(pred_px[2] - pred_px[0]))
+                        pred_h = max(4.0, float(pred_px[3] - pred_px[1]))
+                        ak_w = max(4.0, float(b_ak_px[2] - b_ak_px[0]))
+                        ak_h = max(4.0, float(b_ak_px[3] - b_ak_px[1]))
+                        pred_diag = max(8.0, math.hypot(pred_w, pred_h))
+                        rel_center_err = box_center_dist(pred_px, b_ak_px) / pred_diag
+                        scale_err = max(
+                            abs(ak_w - pred_w) / pred_w,
+                            abs(ak_h - pred_h) / pred_h,
+                        )
+                        ncc_anchor = _patch_ncc(
+                            grays[rel0 + r_off], b_ak_px, tmpl_prev
+                        )
+                        if bridge_iou > 0.45 and c_pred >= 0.45 and ncc_pred >= 0.45:
+                            if (
+                                rel_center_err > 0.18
+                                and (iou_pred < 0.72 or ncc_anchor < ncc_pred - 0.03)
+                            ) or (
+                                scale_err > cfg.anchor_scale_jitter_ratio
+                                and ncc_anchor <= ncc_pred + 0.03
+                            ):
+                                dropped_anchors.add(ak)
 
-    # Global camera ego-motion verdict
-    drift_x_norm = (max_cx - min_cx) * 1000.0 / float(max(1, eff_w))
-    drift_y_norm = (max_cy - min_cy) * 1000.0 / float(max(1, eff_h))
-    max_drift_norm = math.hypot(drift_x_norm, drift_y_norm)
-    camera_motion_detected = max_drift_norm >= cfg.camera_motion_threshold_norm
+                active_anchors = [
+                    ak for ak in range(a_start, a_end + 1) if ak not in dropped_anchors
+                ]
+                for s_i in range(len(active_anchors) - 1):
+                    k0 = active_anchors[s_i]
+                    k1 = active_anchors[s_i + 1]
+                    i0 = anchor_dense_idx[k0]
+                    i1 = anchor_dense_idx[k1]
+                    r0 = i0 - d_start
+                    r1 = i1 - d_start
+                    if r1 < r0:
+                        continue
 
-    # Finalize tracks: Smart Static-vs-Moving policy + zero-phase smoothing
+                    kf0 = tr.keyframes[k0]
+                    kf1 = tr.keyframes[k1]
+                    sub_grays = grays[r0 : r1 + 1]
+                    sub_ff = flow_fwd[r0:r1]
+                    sub_fb = flow_bwd[r0:r1]
+                    sub_bg = bg_steps[r0:r1]
+
+                    if kf0.visible and kf1.visible:
+                        b0_px = _norm_to_px(kf0.bbox_norm_1000, eff_w, eff_h)
+                        b1_px = _norm_to_px(kf1.bbox_norm_1000, eff_w, eff_h)
+                        (
+                            f_boxes,
+                            f_flags,
+                            f_confs,
+                            disagree,
+                            fwd_end_box,
+                            fwd_end_conf,
+                            bwd_start_box,
+                            bwd_start_conf,
+                        ) = _track_interval_bidirectional_detailed(
+                            sub_grays,
+                            sub_ff,
+                            sub_fb,
+                            sub_bg,
+                            b0_px,
+                            b1_px,
+                            cfg,
+                            eff_w,
+                            eff_h,
+                        )
+                        obj_boxes_px[oid][i0 : i1 + 1] = f_boxes
+                        obj_flags[oid][i0 : i1 + 1] = f_flags
+                        obj_confs[oid][i0 : i1 + 1] = f_confs
+                        anchor_fwd_in[oid][i1] = (fwd_end_box, fwd_end_conf)
+                        anchor_bwd_out[oid][i0] = (bwd_start_box, bwd_start_conf)
+                        interval_reports.append(
+                            IntervalDisagreement(
+                                object_id=oid,
+                                a0_idx=k0,
+                                a1_idx=k1,
+                                dense_i0=i0,
+                                dense_i1=i1,
+                                t0=dense_times[i0],
+                                t1=dense_times[i1],
+                                disagree_ratio=disagree,
+                            )
+                        )
+                    elif kf0.visible and not kf1.visible:
+                        b0_px = _norm_to_px(kf0.bbox_norm_1000, eff_w, eff_h)
+                        f_boxes, f_flags, f_confs = _track_interval_onesided(
+                            sub_grays,
+                            sub_ff,
+                            sub_fb,
+                            sub_bg,
+                            b0_px,
+                            from_start=True,
+                            cfg=cfg,
+                            w=eff_w,
+                            h=eff_h,
+                        )
+                        obj_boxes_px[oid][i0 : i1 + 1] = f_boxes
+                        obj_flags[oid][i0 : i1 + 1] = f_flags
+                        obj_confs[oid][i0 : i1 + 1] = f_confs
+                    elif not kf0.visible and kf1.visible:
+                        b1_px = _norm_to_px(kf1.bbox_norm_1000, eff_w, eff_h)
+                        f_boxes, f_flags, f_confs = _track_interval_onesided(
+                            sub_grays,
+                            sub_ff,
+                            sub_fb,
+                            sub_bg,
+                            b1_px,
+                            from_start=False,
+                            cfg=cfg,
+                            w=eff_w,
+                            h=eff_h,
+                        )
+                        obj_boxes_px[oid][i0 : i1 + 1] = f_boxes
+                        obj_flags[oid][i0 : i1 + 1] = f_flags
+                        obj_confs[oid][i0 : i1 + 1] = f_confs
+                    else:
+                        obj_boxes_px[oid][i0 : i1 + 1] = 0.0
+                        obj_flags[oid][i0 : i1 + 1] = FLAG_INVISIBLE
+                        obj_confs[oid][i0 : i1 + 1] = 0.0
+
+            # Free span frames & flows before moving to the next interval
+            del grays, flow_fwd, flow_bwd
+
+        # Handle any leading frames before anchor_dense_idx[0] or trailing frames after anchor_dense_idx[-1]
+        first_d = anchor_dense_idx[0]
+        last_d = anchor_dense_idx[-1]
+        if first_d > 0 and dims is not None:
+            chk()
+            g_lead, eff_w, eff_h = _decode_span_gray(
+                view, camera, dense_times[: first_d + 1], cfg.track_width, chk, dims=dims
+            )
+            if len(g_lead) > 1:
+                ff_l, fb_l = _compute_span_flows(g_lead, dis, chk)
+                bg_l = [(0.0, 0.0)] * len(ff_l)
+                for oid in dynamic_oids:
+                    kf0 = work_tracks[oid].keyframes[0]
+                    if kf0.visible:
+                        b0_px = _norm_to_px(kf0.bbox_norm_1000, eff_w, eff_h)
+                        rev_b, rev_c, rev_n = _rollout_one_direction(
+                            list(reversed(g_lead)),
+                            list(reversed(fb_l)),
+                            list(reversed(ff_l)),
+                            bg_l,
+                            b0_px,
+                            cfg,
+                            eff_w,
+                            eff_h,
+                            stop_on_low_conf=True,
+                        )
+                        boxes_l = rev_b[::-1]
+                        confs_l = rev_c[::-1]
+                        nccs_l = rev_n[::-1]
+                        for idx_l in range(first_d):
+                            if confs_l[idx_l] >= 0.55 and nccs_l[idx_l] >= 0.50:
+                                obj_boxes_px[oid][idx_l] = boxes_l[idx_l]
+                                obj_flags[oid][idx_l] = FLAG_TRACKED
+                                obj_confs[oid][idx_l] = confs_l[idx_l]
+        if last_d < n_dense - 1 and dims is not None:
+            chk()
+            g_tail, eff_w, eff_h = _decode_span_gray(
+                view, camera, dense_times[last_d:], cfg.track_width, chk, dims=dims
+            )
+            if len(g_tail) > 1:
+                ff_t, fb_t = _compute_span_flows(g_tail, dis, chk)
+                bg_t = [(0.0, 0.0)] * len(ff_t)
+                for oid in dynamic_oids:
+                    kfn = work_tracks[oid].keyframes[-1]
+                    if kfn.visible:
+                        bn_px = _norm_to_px(kfn.bbox_norm_1000, eff_w, eff_h)
+                        fwd_b, fwd_c, fwd_n = _rollout_one_direction(
+                            g_tail,
+                            ff_t,
+                            fb_t,
+                            bg_t,
+                            bn_px,
+                            cfg,
+                            eff_w,
+                            eff_h,
+                            stop_on_low_conf=True,
+                        )
+                        for off in range(1, len(g_tail)):
+                            idx_t = last_d + off
+                            if fwd_c[off] >= 0.55 and fwd_n[off] >= 0.50:
+                                obj_boxes_px[oid][idx_t] = fwd_b[off]
+                                obj_flags[oid][idx_t] = FLAG_TRACKED
+                                obj_confs[oid][idx_t] = fwd_c[off]
+
+    # Finalize tracks: Smart Static-vs-Moving policy + zero-phase adaptive smoothing
     final_tracks: dict[str, GroundingTrack] = {}
     for oid, tr in work_tracks.items():
         if tr.is_static_container and not camera_motion_detected:

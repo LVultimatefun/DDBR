@@ -41,6 +41,7 @@ from .prompt_assist import (
     suggest_prompt_updates,
     suggest_updates,
 )
+from .task_assist import draft_task_spec
 
 __all__ = [
     "DiagnosisCluster",
@@ -61,6 +62,7 @@ __all__ = [
     "create_few_shot_example",
     "diagnose",
     "diagnose_workspace",
+    "draft_task_spec",
     "generate_prompt_suggestion",
     "generate_suggestions",
     "get_relevant_few_shots",

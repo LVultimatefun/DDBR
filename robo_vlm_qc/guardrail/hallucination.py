@@ -36,7 +36,7 @@ def apply_hallucination_check(
     settings: dict[str, Any] | None = None,
     duration_s: float | None = None,
 ) -> list[QcSegment]:
-    """Override idle_freeze/boundary_idle -> keep_positive if all arms move monotonically > idle_arm_disp_m."""
+    """Override idle_freeze/boundary_idle -> keep_positive if affected arm(s) move monotonically > idle_arm_disp_m."""
     segs = list(segments if segments is not None else (qc_segments or []))
     k = kinematics or kin
     h_cfg = _extract_hallu_cfg(cfg or config or settings)
@@ -88,8 +88,27 @@ def apply_hallucination_check(
             arm_nets.append(net)
             arm_mono.append(net > disp_thresh and net >= 0.5 * max(path, 1e-9))
 
-        if arm_mono and all(arm_mono):
-            min_disp = min(arm_nets)
+        triggered = False
+        moving_disp = 0.0
+        arm_desc = "arm"
+        if seg.affected_arm == "left":
+            if arm_mono and arm_mono[0]:
+                triggered = True
+                moving_disp = arm_nets[0]
+                arm_desc = "left-arm"
+        elif seg.affected_arm == "right":
+            if n_arms >= 2 and arm_mono[1]:
+                triggered = True
+                moving_disp = arm_nets[1]
+                arm_desc = "right-arm"
+        else:
+            if arm_mono and any(arm_mono):
+                triggered = True
+                moving_disps = [d for d, m in zip(arm_nets, arm_mono) if m]
+                moving_disp = max(moving_disps) if moving_disps else 0.0
+                arm_desc = "dual-arm" if (len(arm_mono) >= 2 and all(arm_mono)) else "single-arm"
+
+        if triggered:
             new_role = seg.training_role if seg.training_role in {"necessary", "recovery"} else "necessary"
             out.append(
                 seg.model_copy(
@@ -103,7 +122,7 @@ def apply_hallucination_check(
                             downgraded=False,
                             guardrail_override=True,
                             override_reason=(
-                                f"Monotonic dual-arm motion ({min_disp:.3f}m > {disp_thresh:.2f}m) "
+                                f"Monotonic {arm_desc} motion ({moving_disp:.3f}m > {disp_thresh:.2f}m) "
                                 f"contradicts {seg.label_id}"
                             ),
                             metrics=seg.guardrail.metrics,

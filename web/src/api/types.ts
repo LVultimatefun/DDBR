@@ -488,6 +488,7 @@ export interface IngestJobParams {
   data_paths?: string[];
   adapter?: string;
   dataset?: string | null;
+  task_id?: string | null;
 }
 
 export interface CreateJobRequest {
@@ -556,6 +557,66 @@ export interface TaskSpec {
 export interface TaskListResponse {
   tasks: Record<string, TaskSpec>;
   total: number;
+}
+
+export interface EpisodeTaskSummary {
+  task_id: string;
+  title: string;
+  description: string;
+  goal: string;
+  match: string[];
+  aliases: string[];
+  grounding_objects_count: number;
+}
+
+export interface EpisodeTaskCatalogResponse {
+  tasks: EpisodeTaskSummary[];
+  total: number;
+}
+
+export interface AssignEpisodeTaskRequest {
+  task_id: string;
+  allow_frozen?: boolean;
+}
+
+export interface AssignEpisodeTaskResponse {
+  episode_id: string;
+  previous_task_id: string;
+  task_id: string;
+  status: EpisodeStatus;
+  has_active_run: boolean;
+  re_run_recommended: boolean;
+}
+
+export interface BatchAssignEpisodeTaskRequest {
+  episode_ids: string[];
+  task_id: string;
+  allow_frozen?: boolean;
+}
+
+export interface BatchAssignEpisodeTaskResponse {
+  task_id: string;
+  updated: number;
+  episode_ids: string[];
+  has_active_runs: number;
+  re_run_recommended_ids: string[];
+}
+
+export interface TaskDraftRequest {
+  task_id: string;
+  description: string;
+  title?: string | null;
+  sample_episode_id?: string | null;
+  num_frames?: number;
+}
+
+export interface TaskDraftResponse {
+  advisory_only: true;
+  task_spec: TaskSpec;
+  used_sample_episode_id: string | null;
+  sampled_frames_count: number;
+  rationale: string;
+  warnings: string[];
 }
 
 export interface DiagnosisErrorItem {

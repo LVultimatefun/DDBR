@@ -14,6 +14,36 @@ vlm:
   episode_concurrency: 4
   decode_concurrency: 6
   input_mode: "interleaved"
+  gemini_media_resolution: "MEDIA_RESOLUTION_HIGH"
+  vision_min_tokens_per_image: 550
+  vision_blind_node_retries: 5
+  vision_blind_node_guard: "auto"
+  vision_blind_node_on_exhaust: "raise"
+  fallback_model: null
+  fallback_provider: null
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 3
+    trip_on_quota_403: true
+  pricing:
+    default:
+      input_per_1m_usd: 2.50
+      output_per_1m_usd: 10.0
+    gpt-4o:
+      input_per_1m_usd: 2.50
+      output_per_1m_usd: 10.0
+    gpt-4o-mini:
+      input_per_1m_usd: 0.15
+      output_per_1m_usd: 0.60
+    gemini-2.5-pro:
+      input_per_1m_usd: 1.25
+      output_per_1m_usd: 10.0
+    gemini-2.5-flash:
+      input_per_1m_usd: 0.30
+      output_per_1m_usd: 2.50
+    qwen-vl-max:
+      input_per_1m_usd: 0.80
+      output_per_1m_usd: 3.20
 
   # Stage-level heterogeneous model routing
   stage_models:
@@ -32,7 +62,9 @@ vlm:
 
   s1_grounding:
     enabled: true
-    batch_size: 8
+    batch_size: 4
+    batch_concurrency: 3
+    reference_anchor_enabled: true
     interval_s: 2.5
     max_keyframes: 32
     hard_max_keyframes: 72
@@ -50,7 +82,7 @@ vlm:
       enabled: true
       track_fps: 15.0
       short_native_fps_max_s: 15.0
-      track_width: 320
+      track_width: 480
       flow_preset: "ultrafast"
       ncc_stride: 2
       ncc_min_score: 0.55
@@ -60,6 +92,10 @@ vlm:
       smooth_window: 5
       camera_motion_threshold_norm: 25.0
       outlier_jump_norm: 250.0
+      moderate_outlier_jump_norm: 75.0
+      anchor_scale_jitter_ratio: 0.22
+      anchor_min_blend_weight: 0.15
+      anchor_max_blend_weight: 0.80
       adaptive_reanchor_max_calls: 0
       adaptive_disagree_ratio: 0.65
 
@@ -79,9 +115,9 @@ vlm:
     window_s: 16.0
     window_stride_s: 12.0
     window_step_s: 0.8
-    cell_w: 360
-    cell_h: 202
-    quality: 72
+    cell_w: 420
+    cell_h: 236
+    quality: 76
     thinking: false
     thinking_budget: 1536
     max_tokens: 3200
@@ -100,17 +136,23 @@ vlm:
     thinking: false
     refine_thinking_budget: 1280
     refine_max_tokens: 1536
+    boundary_idle_kin_skip_s4b: true
 
   s5_success:
     enabled: true
-    tail_s: 10.0
-    body_frames: 14
-    tail_frames: 11
+    tail_s: 12.0
+    tail_ratio: 0.22
+    max_tail_s: 25.0
+    body_frames: 6
+    tail_frames: 10
     control_ratio: 0.30
-    control_frames: 10
-    cell_w: 360
-    cell_h: 202
-    quality: 74
+    control_frames: 8
+    cell_w: 420
+    cell_h: 236
+    quality: 78
+    start_end_compare: true
+    compare_panel_w: 640
+    compare_panel_h: 360
     thinking: false
     thinking_budget: 1024
     max_tokens: 1536
@@ -145,7 +187,7 @@ guardrail:
     max_other_arm_disp_m: 0.03       # 3.0 cm (bimanual coupling limit)
   hallucination:
     enabled: true
-    idle_arm_disp_m: 0.15            # >15 cm monotonic motion on both arms contradicts idle_freeze
+    idle_arm_disp_m: 0.15            # >15 cm monotonic motion on affected arm contradicts idle_freeze
   visual_gate:
     min_crop_ssim: 0.85
     max_l1_diff: 0.12

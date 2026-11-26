@@ -271,9 +271,10 @@ def test_stage4_overlaps_empty_s4a_and_case_insensitive_legacy(tmp_path: Path) -
         assert len(verified) == 1
         assert verified[0].t_start == 4.8 and verified[0].t_end == 6.0
 
+        # Pass 2 overlapping candidates so S4A invokes VLM and explicit empty merged_segments returns []
         merged_empty = run_stage4a_merge(
             view=view,
-            candidates=[a3],
+            candidates=[a3, a4],
             client=_FakeClient(lambda _kw: {"merged_segments": []}),  # type: ignore[arg-type]
             cfg=cfg,
         )

@@ -40,9 +40,12 @@ from robo_vlm_qc.vlm.tracker import (
     FLAG_TRACKED,
     FLAG_VLM_ANCHOR,
     TrackingConfig,
+    _extract_template,
     box_center_dist,
     box_iou,
     clamp_anchor_scale_outliers,
+    detect_camera_motion_direct,
+    reject_hallucinated_anchors,
     run_baft_tracking,
     track_interval_bidirectional,
 )
@@ -1025,7 +1028,8 @@ def test_baft_clamps_vlm_anchor_scale_breathing_outlier(tmp_path: Path) -> None:
             cfg=cfg,
         )
 
-    assert len(client.calls) == 1
+    expected_calls = math.ceil(5 / int(cfg.settings["vlm"]["s1_grounding"].get("batch_size", 4)))
+    assert len(client.calls) == expected_calls
     cup = res.object_tracks_2d["cup"]
     mid_kf = min(cup.keyframes, key=lambda k: abs(k.time_s - 1.0))
     norm_w = cup.keyframes[0].bbox_norm_1000[2] - cup.keyframes[0].bbox_norm_1000[0]
@@ -1368,3 +1372,277 @@ def test_smooth_dense_track_adaptive_anchor_weighting_prevents_rubber_banding() 
         anchor_flow_info=flow_info_clean,
     )
     assert box_center_dist(sm_clean[7], clean_boxes[7]) < 1.0
+
+
+def test_detect_camera_motion_direct_fixed_with_large_arm_vs_panning_camera() -> None:
+    w, h, fps = 640, 360, 15.0
+
+    class _MemMedia:
+        def __init__(self, frames_rgb: list[np.ndarray]) -> None:
+            self._frames = frames_rgb
+            self.fps = fps
+            self.duration_s = (len(frames_rgb) - 1) / fps
+            self.cameras = [CameraSpec(name="main", role="main", width=w, height=h, fps=fps)]
+
+        def read_frames_batch(self, camera: str, times_s: list[float]) -> list[np.ndarray]:
+            return [
+                self._frames[max(0, min(len(self._frames) - 1, int(round(t * self.fps))))]
+                for t in times_s
+            ]
+
+    def _make_view(name: str, frames_bgr: list[np.ndarray]) -> EpisodeView:
+        frames_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames_bgr]
+        dur_s = (len(frames_rgb) - 1) / fps
+        meta = EpisodeMeta(
+            episode_id=f"ds/{name}",
+            dataset="ds",
+            stem=name,
+            task_id="pick_and_place",
+            adapter_type="video_dir",
+            source_uri=f"/tmp/{name}",
+            source_mtime=1.0,
+            episode_fingerprint=f"fp_{name}",
+            duration_s=dur_s,
+            fps=fps,
+            frame_count=len(frames_rgb),
+            cameras=[CameraSpec(name="main", role="main", width=w, height=h, fps=fps)],
+            camera_roles={"main": "main"},
+            kinematics=KinematicsSpec(has_kinematics=False),
+        )
+        return EpisodeView(meta=meta, media=_MemMedia(frames_rgb))  # type: ignore[arg-type]
+
+    # 1. Fixed camera with large swinging robotic arm covering ~45% of the frame across 75 frames
+    #    plus +/-2 gray compression jitter: must return False (ZERO open-loop drift accumulation!)
+    bg = _make_textured_bg(1201, h, w)
+    rack_l = _make_textured_patch(1202, 90, 90, (40, 130, 235))
+    rack_r = _make_textured_patch(1203, 90, 90, (220, 120, 40))
+    bg[200:290, 60:150] = rack_l
+    bg[200:290, 470:560] = rack_r
+    arm_patch = _make_textured_patch(1204, 220, 260, (190, 195, 200))
+    rng = np.random.default_rng(1205)
+
+    fixed_arm_frames: list[np.ndarray] = []
+    for i in range(75):
+        fr = bg.copy()
+        u = i / 74.0
+        # Large robot arm sweeping across central 45% of image
+        ax = int(round(80 + 220 * math.sin(math.pi * u)))
+        ay = int(round(70 + 50 * math.cos(2.0 * math.pi * u)))
+        ax2 = min(w, ax + 260)
+        ay2 = min(h, ay + 220)
+        fr[ay:ay2, ax:ax2] = arm_patch[: ay2 - ay, : ax2 - ax]
+        jitter = rng.integers(-2, 3, size=fr.shape, dtype=np.int16)
+        fr = np.clip(fr.astype(np.int16) + jitter, 0, 255).astype(np.uint8)
+        fixed_arm_frames.append(fr)
+
+    v_fixed = _make_view("fixed_big_arm", fixed_arm_frames)
+    assert detect_camera_motion_direct(v_fixed, "main", motion_threshold_norm=25.0) is False
+
+    # 2. All-black static synthetic video -> False
+    v_black = _make_view("black_static", [np.zeros((h, w, 3), dtype=np.uint8) for _ in range(30)])
+    assert detect_camera_motion_direct(v_black, "main", motion_threshold_norm=25.0) is False
+
+    # 3. Panning camera (140px smooth pan across 2.5s) -> True
+    big_bg = _make_textured_bg(1206, h, w + 180)
+    big_bg[90:210, 260:380] = _make_textured_patch(1207, 120, 120, (170, 90, 60))
+    pan_frames = [
+        np.ascontiguousarray(big_bg[:, int(round(140 * i / 37.0)) : int(round(140 * i / 37.0)) + w])
+        for i in range(38)
+    ]
+    v_pan = _make_view("pan_140px", pan_frames)
+    assert detect_camera_motion_direct(v_pan, "main", motion_threshold_norm=25.0) is True
+
+    # 4. Extreme wide camera pan (1.5x frame width so start and end have zero overlap) -> True
+    wide_bg = _make_textured_bg(1208, h, w * 3)
+    for k in range(8):
+        px = 80 + k * 210
+        wide_bg[80:200, px : px + 110] = _make_textured_patch(1300 + k, 120, 110, (90 + 15 * k, 140, 200 - 15 * k))
+    extreme_pan_frames = [
+        np.ascontiguousarray(wide_bg[:, int(round(960 * i / 44.0)) : int(round(960 * i / 44.0)) + w])
+        for i in range(45)
+    ]
+    v_extreme = _make_view("extreme_pan", extreme_pan_frames)
+    assert detect_camera_motion_direct(v_extreme, "main", motion_threshold_norm=25.0) is True
+
+
+def test_reject_hallucinated_anchors_blank_tabletop_and_invalid_jump_vs_real_teleport() -> None:
+    w, h = 480, 270
+    # Base frame: uniform clean white tabletop on right half, textured region on left
+    blank_table = np.full((h, w), 235, dtype=np.uint8)
+    rng = np.random.default_rng(1401)
+    # Realistic mild sensor noise (std ~ 1.5, grad ~ 1.6) on blank tabletop
+    blank_table = np.clip(blank_table.astype(np.int16) + rng.integers(-2, 3, size=(h, w)), 0, 255).astype(np.uint8)
+
+    tube_patch = cv2.cvtColor(_make_textured_patch(1402, 60, 24, (40, 180, 90)), cv2.COLOR_BGR2GRAY)
+    other_patch = cv2.cvtColor(
+        rng.integers(20, 230, size=(60, 24, 3), dtype=np.uint8), cv2.COLOR_BGR2GRAY
+    )
+
+    def _kf(idx: int, box_px: tuple[int, int, int, int]) -> GroundingKeyframe:
+        x1, y1, x2, y2 = box_px
+        b_norm = _px_to_norm_box(x1, y1, x2, y2, w, h)
+        return GroundingKeyframe(
+            row=idx * 30,
+            time_s=float(idx),
+            visible=True,
+            bbox_norm_1000=b_norm,
+            bbox_px=[x1, y1, x2, y2],
+            state="visible",
+            status_kind="neutral",
+        )
+
+    # Case 1: Blank tabletop hallucination at anchor 2 (object is at left, VLM hallucinates onto white table)
+    grays_blank: list[np.ndarray] = []
+    for _ in range(4):
+        fr = blank_table.copy()
+        fr[90:150, 80:104] = tube_patch
+        grays_blank.append(fr)
+
+    kfs_blank = [
+        _kf(0, (80, 90, 104, 150)),
+        _kf(1, (82, 90, 106, 150)),
+        _kf(2, (340, 140, 410, 220)),  # pure blank tabletop hallucination!
+        _kf(3, (80, 90, 104, 150)),
+    ]
+    cleaned_blank = reject_hallucinated_anchors(kfs_blank, grays_blank, outlier_jump_norm=250.0)
+    assert [k.visible for k in cleaned_blank] == [True, True, False, True]
+    assert cleaned_blank[2].bbox_norm_1000 == [0, 0, 0, 0]
+
+    # Case 2: Invalid jump >250 norm onto unrelated textured region while old position still strongly matches
+    textured_bg = cv2.cvtColor(_make_textured_bg(1409, h, w), cv2.COLOR_BGR2GRAY)
+    grays_jump: list[np.ndarray] = []
+    for _ in range(3):
+        fr = textured_bg.copy()
+        fr[90:150, 80:104] = tube_patch
+        fr[90:150, 360:384] = other_patch  # unrelated random noise (NCC < 0.20)
+        grays_jump.append(fr)
+
+    kfs_jump = [
+        _kf(0, (80, 90, 104, 150)),
+        _kf(1, (360, 90, 384, 150)),  # >550 norm jump, old_ncc~1.0, new_ncc<0.20 -> reject!
+        _kf(2, (80, 90, 104, 150)),
+    ]
+    cleaned_jump = reject_hallucinated_anchors(kfs_jump, grays_jump, outlier_jump_norm=250.0)
+    assert [k.visible for k in cleaned_jump] == [True, False, True]
+
+    # Case 3: Genuine object teleport (old position is now empty, new position has the real textured object)
+    # Must NOT be rejected (protects adaptive_reanchor true-move scenarios)!
+    fr0 = blank_table.copy()
+    fr0[90:150, 80:104] = tube_patch
+    fr1 = blank_table.copy()
+    fr1[90:150, 360:384] = tube_patch
+    kfs_real_move = [_kf(0, (80, 90, 104, 150)), _kf(1, (360, 90, 384, 150))]
+    cleaned_move = reject_hallucinated_anchors(kfs_real_move, [fr0, fr1], outlier_jump_norm=250.0)
+    assert [k.visible for k in cleaned_move] == [True, True]
+
+    # Case 4: All-black synthetic frames must never drop anchors
+    blacks = [np.zeros((h, w), dtype=np.uint8) for _ in range(3)]
+    cleaned_black = reject_hallucinated_anchors(kfs_jump, blacks, outlier_jump_norm=250.0)
+    assert [k.visible for k in cleaned_black] == [True, True, True]
+
+
+def test_track_interval_bidirectional_single_switchpoint_dp_zero_pingpong() -> None:
+    """Verify Single-Switchpoint Monotonic DP eliminates 15Hz ping-pong oscillation
+    even when forward & backward confidences alternate winning on every single frame."""
+    L, h, w = 25, 140, 220
+    bg = cv2.cvtColor(_make_textured_bg(1501, h, w), cv2.COLOR_BGR2GRAY)
+    patch_left = cv2.cvtColor(_make_textured_patch(1502, 32, 32, (60, 170, 230)), cv2.COLOR_BGR2GRAY)
+    patch_right = cv2.cvtColor(_make_textured_patch(1503, 32, 32, (220, 90, 70)), cv2.COLOR_BGR2GRAY)
+
+    # Alternate partial occlusion between left & right on odd/even frames so cf vs cb flips every frame!
+    grays: list[np.ndarray] = []
+    for t in range(L):
+        fr = bg.copy()
+        p_l = patch_left.copy()
+        p_r = patch_right.copy()
+        if 0 < t < L - 1:
+            if t % 2 == 1:
+                p_l[:14, :] = 128  # degrade left on odd frames -> cb > cf
+            else:
+                p_r[:14, :] = 128  # degrade right on even frames -> cf > cb
+        fr[50:82, 16:48] = p_l
+        fr[50:82, 166:198] = p_r
+        grays.append(fr)
+
+    flow_fwd = [np.zeros((h, w, 2), dtype=np.float32) for _ in range(L - 1)]
+    flow_bwd = [np.zeros((h, w, 2), dtype=np.float32) for _ in range(L - 1)]
+    bg_steps = [(0.0, 0.0) for _ in range(L - 1)]
+    box_start_px = np.array([16.0, 50.0, 48.0, 82.0], dtype=np.float64)
+    box_end_px = np.array([166.0, 50.0, 198.0, 82.0], dtype=np.float64)
+    cfg = TrackingConfig(ncc_stride=1, occlusion_conf_thresh=0.25)
+
+    fused, flags, _confs, _ = track_interval_bidirectional(
+        grays, flow_fwd, flow_bwd, bg_steps, box_start_px, box_end_px, cfg, w, h
+    )
+
+    # Classify each visible interior frame as 'L' (near start) or 'R' (near end)
+    sides: list[str] = []
+    for i in range(1, L - 1):
+        if flags[i] == FLAG_INVISIBLE:
+            continue
+        cx = 0.5 * (fused[i][0] + fused[i][2])
+        assert not (60.0 < cx < 150.0), f"Averaged into empty gap at i={i}: cx={cx:.1f}"
+        sides.append("L" if cx < 100.0 else "R")
+
+    assert len(sides) >= 15
+    transitions = sum(1 for a, b in zip(sides, sides[1:]) if a != b)
+    # Mathematically guaranteed <= 1 monotonic transition (zero ping-pong!)
+    assert transitions <= 1, f"Ping-pong oscillation detected ({transitions} transitions): {sides}"
+    # Monotonicity: once 'R' appears, 'L' never reappears
+    if "R" in sides:
+        first_r = sides.index("R")
+        assert all(s == "R" for s in sides[first_r:]), f"Non-monotonic return to L: {sides}"
+
+
+def test_slender_target_tracking_480px_default_and_collar() -> None:
+    assert TrackingConfig().track_width == 480
+    assert TrackingConfig.from_dict({}).track_width == 480
+
+    # High-texture slender 6x28px box still receives 4px silhouette collar in _extract_template
+    h, w = 120, 160
+    gray = cv2.cvtColor(_make_textured_bg(1601, h, w), cv2.COLOR_BGR2GRAY)
+    tube = cv2.cvtColor(_make_textured_patch(1602, 28, 6, (40, 220, 120)), cv2.COLOR_BGR2GRAY)
+    gray[40:68, 70:76] = tube
+    tmpl, collar = _extract_template(gray, np.array([70.0, 40.0, 76.0, 68.0], dtype=np.float64))
+    assert tmpl is not None
+    assert collar == (4, 4, 4, 4)
+    assert tmpl.shape == (36, 14)
+
+
+def test_track_interval_bidirectional_disjoint_hides_low_ncc_lost_lock() -> None:
+    """When IoU < 0.20 and BOTH sides lose visual appearance match (NCC < 0.45) even with
+    smooth zero flow, emit FLAG_INVISIBLE rather than drawing 9%/10% drifting boxes."""
+    L, h, w = 9, 120, 160
+    bg = cv2.cvtColor(_make_textured_bg(1701, h, w), cv2.COLOR_BGR2GRAY)
+    patch_left = cv2.cvtColor(_make_textured_patch(1702, 30, 30, (60, 170, 230)), cv2.COLOR_BGR2GRAY)
+    patch_right = cv2.cvtColor(_make_textured_patch(1703, 30, 30, (220, 90, 70)), cv2.COLOR_BGR2GRAY)
+    rng = np.random.default_rng(1704)
+
+    grays: list[np.ndarray] = []
+    for t in range(L):
+        fr = bg.copy()
+        if t == 0:
+            fr[40:70, 10:40] = patch_left
+        elif t == L - 1:
+            fr[40:70, 110:140] = patch_right
+        else:
+            # Interior frames have unrelated texture at both anchor boxes -> low NCC (< 0.45)
+            fr[40:70, 10:40] = rng.integers(20, 235, size=(30, 30), dtype=np.uint8)
+            fr[40:70, 110:140] = rng.integers(20, 235, size=(30, 30), dtype=np.uint8)
+        grays.append(fr)
+
+    flow_fwd = [np.zeros((h, w, 2), dtype=np.float32) for _ in range(L - 1)]
+    flow_bwd = [np.zeros((h, w, 2), dtype=np.float32) for _ in range(L - 1)]
+    bg_steps = [(0.0, 0.0) for _ in range(L - 1)]
+    box_start_px = np.array([10.0, 40.0, 40.0, 70.0], dtype=np.float64)
+    box_end_px = np.array([110.0, 40.0, 140.0, 70.0], dtype=np.float64)
+    cfg = TrackingConfig(ncc_stride=1, occlusion_conf_thresh=0.25)
+
+    fused, flags, confs, _ = track_interval_bidirectional(
+        grays, flow_fwd, flow_bwd, bg_steps, box_start_px, box_end_px, cfg, w, h
+    )
+    assert flags[0] == FLAG_VLM_ANCHOR and flags[-1] == FLAG_VLM_ANCHOR
+    for i in range(1, L - 1):
+        assert flags[i] == FLAG_INVISIBLE, f"Expected lost-lock frame {i} hidden, got flag={flags[i]} conf={confs[i]:.3f}"
+        assert np.all(fused[i] == 0.0)
+        assert confs[i] == 0.0

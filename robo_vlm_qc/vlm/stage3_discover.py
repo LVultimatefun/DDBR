@@ -1,4 +1,4 @@
-"""Stage 3: Precision-First sliding-window QC discovery with S2 protection & Few-Shot injection."""
+"""Stage 3: Precision-First sliding-window QC discovery with S2 context, 30Hz kinematics facts & Few-Shot injection."""
 
 from __future__ import annotations
 
@@ -22,11 +22,13 @@ from ..models.taxonomy import FewShotItem, LabelRegistry, TaskSpec, VisualLabelD
 from .client import (
     BudgetExceeded,
     BudgetTracker,
+    VlmBlindVisionError,
     VlmCancelledError,
+    VlmCircuitOpenError,
     VlmClient,
     check_client_cancelled,
 )
-from .prompt_builder import PromptBuilder
+from .prompt_builder import PromptBuilder, format_window_kinematics_summary
 
 _FORBIDDEN_LEGACY = {"long_pause", "back_and_forth"}
 
@@ -162,8 +164,10 @@ def run_stage3_discover(
     prompt_builder: PromptBuilder | None = None,
     labels: LabelRegistry | None = None,
     budget: BudgetTracker | None = None,
+    model_override: str | None = None,
+    thinking_budget_override: int | None = None,
 ) -> list[QcSegment]:
-    """Execute Stage 3 sliding-window QC discovery with S2 backbone protection & Few-Shot."""
+    """Execute Stage 3 sliding-window QC discovery with S2 context, kinematics cross-check & Few-Shot."""
     ev = view or episode_view
     cl = client or vlm_client
     cm = cfg if isinstance(cfg, ConfigManager) else (config if isinstance(config, ConfigManager) else None)
@@ -176,11 +180,15 @@ def run_stage3_discover(
     window_s = float(s3_cfg.get("window_s", 16.0))
     stride_s = float(s3_cfg.get("window_stride_s", 12.0))
     step_s = float(s3_cfg.get("window_step_s", 0.8))
-    cell_w = int(s3_cfg.get("cell_w", 360))
-    cell_h = int(s3_cfg.get("cell_h", 202))
-    quality = int(s3_cfg.get("quality", 72))
+    cell_w = int(s3_cfg.get("cell_w", 420))
+    cell_h = int(s3_cfg.get("cell_h", 236))
+    quality = int(s3_cfg.get("quality", 76))
     thinking = bool(s3_cfg.get("thinking", False))
-    thinking_budget = int(s3_cfg.get("thinking_budget", 1536))
+    thinking_budget = (
+        int(thinking_budget_override)
+        if thinking_budget_override is not None
+        else int(s3_cfg.get("thinking_budget", 1536))
+    )
     max_tokens = int(s3_cfg.get("max_tokens", 3200))
 
     windows = _plan_windows(ev.duration_s, window_s, stride_s)
@@ -200,6 +208,7 @@ def run_stage3_discover(
                 )
             )
         check_client_cancelled(cl)
+        kin_summary = format_window_kinematics_summary(ev.kinematics, w0, w1)
         if pb is not None:
             sys_p, usr_p = pb.build_s3(
                 task=t_spec,
@@ -209,6 +218,7 @@ def run_stage3_discover(
                 window_end_s=w1,
                 duration_s=ev.duration_s,
                 few_shots=fs_list,
+                kinematics_summary=kin_summary,
             )
         else:
             sys_p = "You are a high-precision embodied trajectory QC expert following Precision-First principles."
@@ -216,22 +226,32 @@ def run_stage3_discover(
                 f"Task: {t_spec.task_id} | Window: [{w0:.2f}s, {w1:.2f}s] / total {ev.duration_s:.2f}s\n"
                 "[Active Pure-Visual QC Label Registry]:\n- boundary_idle"
             )
+            if kin_summary:
+                usr_p += f"\n[Window 30Hz Objective Kinematics Telemetry]:\n{kin_summary}"
         try:
-            resp = cl.chat_json(
-                stage="s3_discover",
-                system_prompt=sys_p,
-                user_prompt=usr_p,
-                images=tiles,
-                timestamps_s=t_list,
-                thinking=thinking,
-                thinking_budget=thinking_budget,
-                max_tokens=max_tokens,
-                jpeg_quality=quality,
-                budget=budget,
-            )
+            chat_kwargs: dict[str, Any] = {
+                "stage": "s3_discover",
+                "system_prompt": sys_p,
+                "user_prompt": usr_p,
+                "images": tiles,
+                "timestamps_s": t_list,
+                "thinking": thinking,
+                "thinking_budget": thinking_budget,
+                "max_tokens": max_tokens,
+                "jpeg_quality": quality,
+                "budget": budget,
+            }
+            if model_override is not None:
+                chat_kwargs["model_override"] = model_override
+            resp = cl.chat_json(**chat_kwargs)
             segs = resp.get("segments")
             return w_idx, segs if isinstance(segs, list) else [], None
-        except (BudgetExceeded, VlmCancelledError):
+        except (
+            BudgetExceeded,
+            VlmCancelledError,
+            VlmCircuitOpenError,
+            VlmBlindVisionError,
+        ):
             raise
         except Exception as exc:
             check_client_cancelled(cl)

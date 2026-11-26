@@ -297,4 +297,210 @@ describe("ReviewStudioPage", () => {
     expect(screen.getByTestId("shortcuts-modal")).toHaveTextContent("审核工作台快捷键速查");
     expect(screen.getByTestId("shortcuts-modal")).toHaveTextContent("播放 / 暂停");
   });
+
+  it("enforces RBAC on interactive header task badge: Reviewer only reassigns non-frozen _default without AI button, Lead reassigns any with frozen confirm and 1-click Re-run VLM", async () => {
+    const taskCatalog = [
+      {
+        task_id: "pick_and_place",
+        title: "Pick and Place",
+        description: "",
+        goal: "",
+        match: [],
+        aliases: [],
+        grounding_objects_count: 1,
+      },
+      {
+        task_id: "fold_towel",
+        title: "Fold Towel",
+        description: "",
+        goal: "",
+        match: [],
+        aliases: [],
+        grounding_objects_count: 1,
+      },
+      {
+        task_id: "_default",
+        title: "Default",
+        description: "",
+        goal: "",
+        match: [],
+        aliases: [],
+        grounding_objects_count: 0,
+      },
+    ];
+
+    const patchCalls: Array<{ url: string; body: unknown }> = [];
+    const jobCalls: unknown[] = [];
+
+    function mockStudioFetch(epOverrides: Record<string, unknown>) {
+      const base = makeResolvedEpisode();
+      const ep = {
+        ...base,
+        ...epOverrides,
+        meta: {
+          ...base.meta,
+          ...((epOverrides.meta as Record<string, unknown> | undefined) ?? {}),
+        },
+      };
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          const method = init?.method ?? "GET";
+          if (url === "/api/episodes/tasks") {
+            return new Response(JSON.stringify({ tasks: taskCatalog, total: taskCatalog.length }), {
+              status: 200,
+            });
+          }
+          if (url.endsWith("/task") && method === "PATCH") {
+            const body = JSON.parse(String(init?.body ?? "{}"));
+            patchCalls.push({ url, body });
+            return new Response(
+              JSON.stringify({
+                episode_id: ep.episode_id,
+                previous_task_id: ep.meta.task_id,
+                task_id: body.task_id,
+                status: ep.status,
+                has_active_run: true,
+                re_run_recommended: true,
+              }),
+              { status: 200 },
+            );
+          }
+          if (url.endsWith("/api/jobs") && method === "POST") {
+            const body = JSON.parse(String(init?.body ?? "{}"));
+            jobCalls.push(body);
+            return new Response(
+              JSON.stringify({
+                job_id: "job_studio_rerun",
+                job_type: "batch_vlm",
+                status: "queued",
+                progress_done: 0,
+                progress_total: 1,
+              }),
+              { status: 201 },
+            );
+          }
+          if (url.endsWith("/reviews")) {
+            return new Response(JSON.stringify({ items: [] }), { status: 200 });
+          }
+          if (url.endsWith("/runs")) {
+            return new Response(JSON.stringify({ runs: [] }), { status: 200 });
+          }
+          if (url.includes("/api/episodes/demo_ds/ep_001")) {
+            return new Response(JSON.stringify(ep), { status: 200 });
+          }
+          if (url.includes("/labels")) {
+            return new Response(
+              JSON.stringify({ schema_version: "1.0", version: 1, categories: [], labels: [] }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({}), { status: 200 });
+        }),
+      );
+    }
+
+    // 1. Reviewer on already-classified episode -> read-only badge only
+    mockStudioFetch({ status: "vlm_ready", meta: { task_id: "pick_and_place" } });
+    const r1 = render(
+      <AuthProvider initialAuth={{ token: "rev-tok", username: "rev_1", role: "reviewer" }}>
+        <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+          <Routes>
+            <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("review-studio-page")).toBeInTheDocument());
+    expect(screen.getByTestId("studio-task-badge-readonly")).toBeInTheDocument();
+    expect(screen.queryByTestId("studio-task-badge-btn")).toBeNull();
+    r1.unmount();
+
+    // 2. Reviewer on gt_frozen _default episode -> read-only badge only
+    mockStudioFetch({ status: "gt_frozen", meta: { task_id: "_default" } });
+    const r2 = render(
+      <AuthProvider initialAuth={{ token: "rev-tok", username: "rev_1", role: "reviewer" }}>
+        <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+          <Routes>
+            <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("review-studio-page")).toBeInTheDocument());
+    expect(screen.getByTestId("studio-task-badge-readonly")).toBeInTheDocument();
+    expect(screen.queryByTestId("studio-task-badge-btn")).toBeNull();
+    r2.unmount();
+
+    // 3. Reviewer on non-frozen _default episode -> can reassign to non-_default, NO "+ New Task (AI)"
+    mockStudioFetch({ status: "vlm_ready", meta: { task_id: "_default" } });
+    const r3 = render(
+      <AuthProvider initialAuth={{ token: "rev-tok", username: "rev_1", role: "reviewer" }}>
+        <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+          <Routes>
+            <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("studio-task-badge-btn")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("studio-task-badge-btn"));
+    expect(screen.getByTestId("studio-task-popover")).toBeInTheDocument();
+    expect(screen.queryByTestId("studio-new-task-ai-btn")).toBeNull();
+
+    const revSelect = screen.getByTestId("studio-task-select") as HTMLSelectElement;
+    expect(Array.from(revSelect.options).some((o) => o.value === "_default")).toBe(false);
+    fireEvent.change(revSelect, { target: { value: "fold_towel" } });
+    fireEvent.click(screen.getByTestId("studio-task-save-btn"));
+
+    await waitFor(() => expect(patchCalls).toHaveLength(1));
+    expect(patchCalls[0]).toEqual({
+      url: "/api/episodes/demo_ds/ep_001/task",
+      body: { task_id: "fold_towel" },
+    });
+    // Reviewer should not see a Re-run VLM button even when re_run_recommended is true
+    expect(screen.queryByTestId("studio-rerun-vlm-now-btn")).toBeNull();
+    r3.unmount();
+
+    // 4. Lead on gt_frozen episode -> requires confirmation -> sends allow_frozen: true -> offers 1-click Re-run VLM
+    mockStudioFetch({ status: "gt_frozen", meta: { task_id: "_default" } });
+    render(
+      <AuthProvider initialAuth={{ token: "lead-tok", username: "lead_1", role: "lead" }}>
+        <MemoryRouter initialEntries={["/review/demo_ds/ep_001"]}>
+          <Routes>
+            <Route path="/review/:dataset/:stem" element={<ReviewStudioPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("studio-task-badge-btn")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("studio-task-badge-btn"));
+    expect(screen.getByTestId("studio-new-task-ai-btn")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId("studio-task-select"), {
+      target: { value: "pick_and_place" },
+    });
+    fireEvent.click(screen.getByTestId("studio-task-save-btn"));
+
+    expect(await screen.findByTestId("studio-frozen-task-confirm-modal")).toBeInTheDocument();
+    expect(patchCalls).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("studio-confirm-frozen-task-btn"));
+
+    await waitFor(() => expect(patchCalls).toHaveLength(2));
+    expect(patchCalls[1]).toEqual({
+      url: "/api/episodes/demo_ds/ep_001/task",
+      body: { task_id: "pick_and_place", allow_frozen: true },
+    });
+
+    expect(await screen.findByTestId("studio-rerun-vlm-banner")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("studio-rerun-vlm-now-btn"));
+    await waitFor(() =>
+      expect(jobCalls).toContainEqual({
+        job_type: "batch_vlm",
+        episode_ids: ["demo_ds/ep_001"],
+        fresh: true,
+      }),
+    );
+  });
 });

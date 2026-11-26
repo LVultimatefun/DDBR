@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
@@ -12,16 +13,22 @@ import {
   RefreshCw,
   Settings,
   ShieldAlert,
+  Sparkles,
+  Tag,
   Video,
   X,
 } from "lucide-react";
 import {
+  ApiError,
+  assignEpisodeTask,
+  batchAssignEpisodeTask,
   cancelJob as apiCancelJob,
   claimEpisode,
   createJob,
   encodeEpPath,
   getSettings,
   listEpisodes,
+  listEpisodeTasks,
   updateSettings,
 } from "../api/client";
 import type {
@@ -29,12 +36,15 @@ import type {
   EpisodeListItem,
   EpisodeSortField,
   EpisodeStatus,
+  EpisodeTaskSummary,
   JobStatus,
   SortDir,
+  TaskSpec,
 } from "../api/types";
 import { useEventStream } from "../api/useEventStream";
 import { FacetCombobox } from "../components/FacetCombobox";
 import { IngestModal } from "../components/IngestModal";
+import { TaskDraftWizardModal } from "../components/TaskDraftWizardModal";
 import { VlmSettingsModal } from "../components/VlmSettingsModal";
 import {
   ALL_EPISODE_STATUSES,
@@ -55,6 +65,7 @@ const QUEUE_REFRESH_EVENTS = new Set([
   "job_update",
   "export_completed",
   "episode_updated",
+  "config_updated",
 ]);
 
 const PAGE_SIZE = 100;
@@ -137,12 +148,30 @@ export const QueuePage: React.FC = () => {
     sortDir,
   ]);
 
-  // Lead batch job, ingest & workspace settings state
+  // Lead batch job, ingest, task intervention & workspace settings state
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [vlmStage, setVlmStage] = useState<string>("");
   const [localActiveJob, setLocalActiveJob] = useState<JobStatus | null>(null);
   const [ingestOpen, setIngestOpen] = useState(false);
   const [vlmModalOpen, setVlmModalOpen] = useState(false);
+
+  const [taskCatalog, setTaskCatalog] = useState<EpisodeTaskSummary[]>([]);
+  const [batchTaskId, setBatchTaskId] = useState<string>("");
+  const [inlineTaskMap, setInlineTaskMap] = useState<Record<string, string>>({});
+  const [assigningTask, setAssigningTask] = useState(false);
+  const [taskWizardOpen, setTaskWizardOpen] = useState(false);
+  const [wizardSampleEpId, setWizardSampleEpId] = useState<string | null>(null);
+  const [wizardTargetEpIds, setWizardTargetEpIds] = useState<string[]>([]);
+  const [frozenConfirm, setFrozenConfirm] = useState<{
+    episodeIds: string[];
+    taskId: string;
+    mode: "single" | "batch";
+    frozenCount: number;
+  } | null>(null);
+  const [rerunPrompt, setRerunPrompt] = useState<{
+    taskId: string;
+    episodeIds: string[];
+  } | null>(null);
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsLoading, setSettingsLoading] = useState(false);
@@ -330,6 +359,20 @@ export const QueuePage: React.FC = () => {
     setAuthPromptOpen,
   ]);
 
+  const loadTaskCatalog = useCallback(async () => {
+    if (!isLead || authProbing) return;
+    try {
+      const res = await listEpisodeTasks();
+      setTaskCatalog(res.tasks ?? []);
+    } catch {
+      // Optional task catalog
+    }
+  }, [isLead, authProbing]);
+
+  useEffect(() => {
+    void loadTaskCatalog();
+  }, [loadTaskCatalog, token]);
+
   useEffect(() => {
     void fetchQueue();
   }, [fetchQueue]);
@@ -346,6 +389,9 @@ export const QueuePage: React.FC = () => {
           : typeof evt.event === "string"
             ? evt.event
             : "";
+      if (eventName === "config_updated" && isLead) {
+        void loadTaskCatalog();
+      }
       if (QUEUE_REFRESH_EVENTS.has(eventName)) {
         void fetchQueue();
       }
@@ -432,6 +478,206 @@ export const QueuePage: React.FC = () => {
     }
     return Array.from(set);
   }, [facets]);
+
+  const assignableTaskOptions = useMemo(() => {
+    const byId = new Map<string, { task_id: string; title: string }>();
+    for (const item of taskCatalog) {
+      if (item.task_id) {
+        byId.set(item.task_id, { task_id: item.task_id, title: item.title });
+      }
+    }
+    for (const tid of facets?.task_ids ?? []) {
+      if (tid && !byId.has(tid)) {
+        byId.set(tid, { task_id: tid, title: "" });
+      }
+    }
+    const list = Array.from(byId.values());
+    list.sort((a, b) => {
+      if (a.task_id === "_default" && b.task_id !== "_default") return 1;
+      if (b.task_id === "_default" && a.task_id !== "_default") return -1;
+      return a.task_id.localeCompare(b.task_id);
+    });
+    return list;
+  }, [taskCatalog, facets]);
+
+  const nonDefaultTaskOptions = useMemo(
+    () => assignableTaskOptions.filter((item) => item.task_id !== "_default"),
+    [assignableTaskOptions],
+  );
+
+  const taskFacetOptions = useMemo(() => {
+    const set = new Set<string>(facets?.task_ids ?? []);
+    for (const item of taskCatalog) {
+      if (item.task_id) set.add(item.task_id);
+    }
+    return Array.from(set);
+  }, [facets, taskCatalog]);
+
+  useEffect(() => {
+    if (!batchTaskId && nonDefaultTaskOptions.length > 0) {
+      setBatchTaskId(nonDefaultTaskOptions[0].task_id);
+    }
+  }, [batchTaskId, nonDefaultTaskOptions]);
+
+  const executeTaskAssignment = useCallback(
+    async (
+      episodeIds: string[],
+      taskId: string,
+      mode: "single" | "batch",
+      allowFrozen = false,
+    ) => {
+      const targetTask = taskId.trim();
+      if (episodeIds.length === 0) {
+        toast.showToast({
+          message: t("queue.toastSelectOne"),
+          variant: "warning",
+          testId: "queue-job-toast",
+        });
+        return;
+      }
+      if (!targetTask) {
+        toast.showToast({
+          message: t("queue.errSelectTaskFirst"),
+          variant: "warning",
+          testId: "queue-job-toast",
+        });
+        return;
+      }
+
+      if (!allowFrozen) {
+        const epMap = new Map(episodes.map((ep) => [ep.episode_id, ep]));
+        const frozenMatches = episodeIds.filter((id) => epMap.get(id)?.status === "gt_frozen");
+        if (frozenMatches.length > 0) {
+          setFrozenConfirm({
+            episodeIds,
+            taskId: targetTask,
+            mode,
+            frozenCount: frozenMatches.length,
+          });
+          return;
+        }
+      }
+
+      setAssigningTask(true);
+      try {
+        if (mode === "single" && episodeIds.length === 1) {
+          const res = await assignEpisodeTask(episodeIds[0], {
+            task_id: targetTask,
+            ...(allowFrozen ? { allow_frozen: true } : {}),
+          });
+          setFrozenConfirm(null);
+          toast.showToast({
+            message: t("queue.toastTaskAssignedSingle", {
+              episodeId: res.episode_id,
+              taskId: res.task_id,
+            }),
+            variant: "success",
+            testId: "queue-task-toast",
+          });
+          if (res.re_run_recommended) {
+            setRerunPrompt({ taskId: res.task_id, episodeIds: [res.episode_id] });
+          }
+        } else {
+          const res = await batchAssignEpisodeTask({
+            episode_ids: episodeIds,
+            task_id: targetTask,
+            ...(allowFrozen ? { allow_frozen: true } : {}),
+          });
+          setFrozenConfirm(null);
+          toast.showToast({
+            message: t("queue.toastTaskAssignedBatch", {
+              count: res.updated,
+              taskId: res.task_id,
+            }),
+            variant: "success",
+            testId: "queue-task-toast",
+          });
+          if (res.re_run_recommended_ids && res.re_run_recommended_ids.length > 0) {
+            setRerunPrompt({ taskId: res.task_id, episodeIds: res.re_run_recommended_ids });
+          }
+        }
+        await fetchQueue();
+      } catch (err) {
+        if (
+          err instanceof ApiError &&
+          err.status === 409 &&
+          !allowFrozen &&
+          /gt_frozen|allow_frozen/i.test(err.detail)
+        ) {
+          setFrozenConfirm({
+            episodeIds,
+            taskId: targetTask,
+            mode,
+            frozenCount: episodeIds.length,
+          });
+          return;
+        }
+        toast.showToast({
+          message: err instanceof Error ? err.message : t("queue.errAssignTask"),
+          variant: "error",
+          testId: "queue-task-toast",
+        });
+      } finally {
+        setAssigningTask(false);
+      }
+    },
+    [episodes, fetchQueue, t, toast],
+  );
+
+  const handleOpenTaskWizard = (sampleEpId: string | null, targetIds: string[]) => {
+    setWizardSampleEpId(sampleEpId);
+    setWizardTargetEpIds(targetIds);
+    setTaskWizardOpen(true);
+  };
+
+  const handleWizardTaskSaved = async (savedSpec: TaskSpec) => {
+    const summary: EpisodeTaskSummary = {
+      task_id: savedSpec.task_id,
+      title: savedSpec.title,
+      description: savedSpec.description,
+      goal: savedSpec.goal,
+      match: savedSpec.match ?? [],
+      aliases: savedSpec.aliases ?? [],
+      grounding_objects_count: (savedSpec.grounding_objects ?? []).length,
+    };
+    setTaskCatalog((prev) => [
+      summary,
+      ...prev.filter((item) => item.task_id !== summary.task_id),
+    ]);
+    setBatchTaskId(savedSpec.task_id);
+    void loadTaskCatalog();
+
+    if (wizardTargetEpIds.length > 0) {
+      const mode = wizardTargetEpIds.length === 1 ? "single" : "batch";
+      await executeTaskAssignment(wizardTargetEpIds, savedSpec.task_id, mode, false);
+    } else {
+      toast.showToast({
+        message: t("queue.toastTaskCreated", { taskId: savedSpec.task_id }),
+        variant: "success",
+        testId: "queue-task-toast",
+      });
+    }
+  };
+
+  const handleRerunRecommendedVlm = async () => {
+    if (!rerunPrompt || rerunPrompt.episodeIds.length === 0) return;
+    try {
+      const job = await createJob({
+        job_type: "batch_vlm",
+        episode_ids: rerunPrompt.episodeIds,
+        fresh: true,
+      });
+      setRerunPrompt(null);
+      handleTrackSubmittedJob(job);
+      void fetchQueue();
+    } catch (err) {
+      toast.showToast({
+        message: err instanceof Error ? err.message : t("queue.toastCreateJobFailed"),
+        variant: "error",
+        testId: "queue-job-toast",
+      });
+    }
+  };
 
   const handleClaimNext = async () => {
     setClaimingNext(true);
@@ -799,8 +1045,19 @@ export const QueuePage: React.FC = () => {
                 setPage(0);
                 setTaskFilter(val);
               }}
-              options={facets?.task_ids ?? []}
+              options={taskFacetOptions}
             />
+            <button
+              type="button"
+              className={`pill-btn ${taskFilter === "_default" ? "active" : ""}`}
+              data-testid="filter-unrecognized-chip"
+              onClick={() => {
+                setPage(0);
+                setTaskFilter((prev) => (prev === "_default" ? "" : "_default"));
+              }}
+            >
+              <AlertTriangle size={12} /> {t("queue.filterUnrecognized")}
+            </button>
             <select
               aria-label={t("queue.adapterFilterAria")}
               data-testid="adapter-filter-select"
@@ -915,7 +1172,78 @@ export const QueuePage: React.FC = () => {
             >
               <PackageCheck size={14} /> {t("queue.exportSelected", { count: selectedIds.length })}
             </button>
+
+            <span className="batch-task-divider" aria-hidden="true" />
+
+            <select
+              aria-label={t("queue.assignTaskAria")}
+              data-testid="batch-assign-task-select"
+              value={batchTaskId}
+              onChange={(e) => setBatchTaskId(e.target.value)}
+            >
+              <option value="">{t("queue.assignTaskPlaceholder")}</option>
+              {assignableTaskOptions.map((item) => (
+                <option key={item.task_id} value={item.task_id}>
+                  {item.task_id}
+                  {item.title ? ` — ${item.title}` : ""}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="secondary-btn compact"
+              disabled={selectedIds.length === 0 || !batchTaskId || assigningTask}
+              onClick={() => void executeTaskAssignment(selectedIds, batchTaskId, "batch", false)}
+              data-testid="batch-assign-task-btn"
+            >
+              <Tag size={13} />{" "}
+              {assigningTask ? t("queue.assigningTask") : t("queue.assignTaskBtn")}
+            </button>
+            <button
+              type="button"
+              className="accent-btn compact"
+              data-testid="queue-new-task-ai-btn"
+              onClick={() => {
+                const defaultSample =
+                  selectedIds[0] ??
+                  displayRows.find((r) => r.task_id === "_default")?.episode_id ??
+                  displayRows[0]?.episode_id ??
+                  null;
+                handleOpenTaskWizard(defaultSample, [...selectedIds]);
+              }}
+            >
+              <Sparkles size={13} /> {t("queue.newTaskAiBtn")}
+            </button>
           </div>
+
+          {rerunPrompt && (
+            <div className="info-banner" data-testid="rerun-vlm-prompt-banner">
+              <span>
+                {t("queue.rerunPromptText", {
+                  taskId: rerunPrompt.taskId,
+                  count: rerunPrompt.episodeIds.length,
+                })}
+              </span>
+              <div className="header-actions">
+                <button
+                  type="button"
+                  className="primary-btn compact"
+                  data-testid="rerun-vlm-now-btn"
+                  onClick={() => void handleRerunRecommendedVlm()}
+                >
+                  <Play size={13} /> {t("queue.rerunVlmNowBtn")}
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  data-testid="dismiss-rerun-prompt-btn"
+                  onClick={() => setRerunPrompt(null)}
+                >
+                  <X size={13} /> {t("common.dismiss")}
+                </button>
+              </div>
+            </div>
+          )}
 
           {activeJob && (
             <div className="job-progress-banner" data-testid="active-job-banner">
@@ -1116,7 +1444,84 @@ export const QueuePage: React.FC = () => {
                     )}
                     <td className="mono">{ep.episode_id}</td>
                     <td>
-                      <div>{ep.task_id}</div>
+                      {ep.task_id === "_default" ? (
+                        <div>
+                          <span
+                            className="badge-pill warn"
+                            data-testid={`default-task-badge-${ep.episode_id}`}
+                          >
+                            <AlertTriangle size={11} /> {t("queue.unrecognizedBadge")}
+                          </span>
+                          {isLead &&
+                            ep.status !== "vlm_queued" &&
+                            ep.status !== "vlm_running" && (
+                              <div className="inline-task-assign">
+                                <select
+                                  aria-label={t("queue.inlineAssignAria", {
+                                    episodeId: ep.episode_id,
+                                  })}
+                                  data-testid={`inline-task-select-${ep.episode_id}`}
+                                  value={
+                                    inlineTaskMap[ep.episode_id] ??
+                                    nonDefaultTaskOptions[0]?.task_id ??
+                                    ""
+                                  }
+                                  onChange={(e) =>
+                                    setInlineTaskMap((prev) => ({
+                                      ...prev,
+                                      [ep.episode_id]: e.target.value,
+                                    }))
+                                  }
+                                >
+                                  <option value="">{t("queue.assignTaskPlaceholder")}</option>
+                                  {nonDefaultTaskOptions.map((item) => (
+                                    <option key={item.task_id} value={item.task_id}>
+                                      {item.task_id}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  className="mini-btn primary"
+                                  data-testid={`inline-assign-btn-${ep.episode_id}`}
+                                  disabled={
+                                    assigningTask ||
+                                    !(
+                                      inlineTaskMap[ep.episode_id] ??
+                                      nonDefaultTaskOptions[0]?.task_id
+                                    )
+                                  }
+                                  onClick={() => {
+                                    const chosen =
+                                      inlineTaskMap[ep.episode_id] ??
+                                      nonDefaultTaskOptions[0]?.task_id ??
+                                      "";
+                                    void executeTaskAssignment(
+                                      [ep.episode_id],
+                                      chosen,
+                                      "single",
+                                      false,
+                                    );
+                                  }}
+                                >
+                                  {t("queue.inlineAssignBtn")}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="mini-btn accent"
+                                  data-testid={`inline-new-task-btn-${ep.episode_id}`}
+                                  onClick={() =>
+                                    handleOpenTaskWizard(ep.episode_id, [ep.episode_id])
+                                  }
+                                >
+                                  <Sparkles size={11} /> {t("queue.inlineNewTaskBtn")}
+                                </button>
+                              </div>
+                            )}
+                        </div>
+                      ) : (
+                        <div>{ep.task_id}</div>
+                      )}
                       <div className="muted small">{ep.adapter_type}</div>
                     </td>
                     <td>
@@ -1196,6 +1601,59 @@ export const QueuePage: React.FC = () => {
             onJobCreated={handleTrackSubmittedJob}
           />
           <VlmSettingsModal open={vlmModalOpen} onClose={() => setVlmModalOpen(false)} />
+          <TaskDraftWizardModal
+            open={taskWizardOpen}
+            onClose={() => setTaskWizardOpen(false)}
+            initialSampleEpisodeId={wizardSampleEpId}
+            sampleEpisodes={episodes}
+            onTaskSaved={handleWizardTaskSaved}
+          />
+          {frozenConfirm && (
+            <div
+              className="modal-backdrop modal-backdrop-top"
+              data-testid="frozen-task-confirm-modal"
+              onClick={(e) => {
+                if (e.target === e.currentTarget) setFrozenConfirm(null);
+              }}
+            >
+              <div className="modal-card">
+                <h3 style={{ margin: 0, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <AlertTriangle size={16} /> {t("queue.frozenConfirmTitle")}
+                </h3>
+                <p className="muted small" style={{ margin: 0 }}>
+                  {t("queue.frozenConfirmDesc", {
+                    count: frozenConfirm.frozenCount,
+                    taskId: frozenConfirm.taskId,
+                  })}
+                </p>
+                <div className="modal-actions">
+                  <button
+                    type="button"
+                    className="secondary-btn compact"
+                    onClick={() => setFrozenConfirm(null)}
+                  >
+                    {t("common.cancel")}
+                  </button>
+                  <button
+                    type="button"
+                    className="warning-btn compact"
+                    data-testid="confirm-frozen-task-btn"
+                    disabled={assigningTask}
+                    onClick={() =>
+                      void executeTaskAssignment(
+                        frozenConfirm.episodeIds,
+                        frozenConfirm.taskId,
+                        frozenConfirm.mode,
+                        true,
+                      )
+                    }
+                  >
+                    {t("queue.frozenConfirmBtn")}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </>
       )}
       {toast.StandaloneHost}

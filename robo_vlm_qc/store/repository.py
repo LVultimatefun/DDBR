@@ -340,9 +340,67 @@ class Repository:
             raise NotFoundError(f"Episode not found: {episode_id!r}")
         return dict(row)
 
+    @staticmethod
+    def _meta_from_row(row: Any) -> EpisodeMeta:
+        meta = EpisodeMeta.model_validate_json(row["meta_json"])
+        row_task_id = row["task_id"]
+        if row_task_id and meta.task_id != row_task_id:
+            meta = meta.model_copy(update={"task_id": str(row_task_id)})
+        return meta
+
     def get_episode_meta(self, episode_id: str) -> EpisodeMeta:
         row = self.get_episode_row(episode_id)
-        return EpisodeMeta.model_validate_json(row["meta_json"])
+        return self._meta_from_row(row)
+
+    def update_episodes_task_id(
+        self,
+        episode_ids: Sequence[str],
+        task_id: str,
+        *,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Atomically update episodes.task_id and episodes.updated_at without clearing runs/reviews/status."""
+        clean_tid = str(task_id or "").strip()
+        if not clean_tid:
+            raise ValueError("task_id must be non-empty")
+        unique_ids = list(dict.fromkeys(str(e) for e in episode_ids if e))
+        if not unique_ids:
+            return []
+        ts_now = time.time() if now is None else float(now)
+        with self.db.transaction() as conn:
+            for ep_id in unique_ids:
+                row = conn.execute(
+                    "SELECT episode_id FROM episodes WHERE episode_id = ?",
+                    (ep_id,),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"Episode not found: {ep_id!r}")
+            updated_rows: list[dict[str, Any]] = []
+            for ep_id in unique_ids:
+                conn.execute(
+                    "UPDATE episodes SET task_id = ?, updated_at = ? WHERE episode_id = ?",
+                    (clean_tid, ts_now, ep_id),
+                )
+                after = conn.execute(
+                    "SELECT * FROM episodes WHERE episode_id = ?",
+                    (ep_id,),
+                ).fetchone()
+                assert after is not None
+                updated_rows.append(dict(after))
+            return updated_rows
+
+    def update_episode_task_id(
+        self,
+        episode_id: str,
+        task_id: str,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Update a single episode's task_id and updated_at without clearing active runs, reviews, or status."""
+        if not episode_id:
+            raise NotFoundError(f"Episode not found: {episode_id!r}")
+        rows = self.update_episodes_task_id([episode_id], task_id, now=now)
+        return rows[0]
 
     def episode_guardrail_downgraded(self, row: dict[str, Any]) -> bool:
         if not row.get("active_run_id"):
@@ -1223,7 +1281,7 @@ class Repository:
                 payload.success,
                 payload.macro_stages,
             )
-            meta = EpisodeMeta.model_validate_json(ep_row["meta_json"])
+            meta = self._meta_from_row(ep_row)
             rev_id = f"rev_{int(ts_now * 1000)}_{uuid.uuid4().hex[:8]}"
             artifact = HumanReviewArtifact(
                 rev_id=rev_id,
@@ -1319,7 +1377,7 @@ class Repository:
         self, episode_id: str, *, run_id: str | None = None
     ) -> ResolvedEpisode:
         row = self.get_episode_row(episode_id)
-        meta = EpisodeMeta.model_validate_json(row["meta_json"])
+        meta = self._meta_from_row(row)
         target_run_id = run_id or row["active_run_id"]
         if not target_run_id:
             raise NotFoundError(f"Episode {episode_id!r} has no active VLM run")
@@ -1376,7 +1434,7 @@ class Repository:
         row = self.get_episode_row(episode_id)
         if run_id or row["active_run_id"]:
             return self.resolve_episode(episode_id, run_id=run_id)
-        meta = EpisodeMeta.model_validate_json(row["meta_json"])
+        meta = self._meta_from_row(row)
         return ResolvedEpisode(
             episode_id=episode_id,
             meta=meta,

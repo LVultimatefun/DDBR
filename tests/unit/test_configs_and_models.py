@@ -72,27 +72,30 @@ def test_stage_cache_fingerprint_isolation_and_history_override(tmp_path: Path) 
     s3_0 = mgr_base.s3_cache_basis("pick_and_place")
     s4_0 = mgr_base.s4_cache_basis("pick_and_place")
 
-    # Override labels.yaml and s3_discover.yaml in workspace
+    # Override labels.yaml and s3_discover.yaml in workspace (bump dynamically from base versions)
     art = ArtifactStore(ws)
+    base_label_ver = mgr_base.labels.version
+    bumped_label_ver = base_label_ver + 1
     labels_yaml = (default_config_dir() / "labels.yaml").read_text(encoding="utf-8")
     art.write_config_override("labels.yaml", labels_yaml + "\n", reason="first_write")
     # Modify version in labels.yaml override -> triggers .history snapshot
     art.write_config_override(
         "labels.yaml",
-        labels_yaml.replace("version: 1", "version: 2", 1),
+        labels_yaml.replace(f"version: {base_label_ver}", f"version: {bumped_label_ver}", 1),
         reason="bump_label_version",
     )
+    base_s3_ver = mgr_base.prompts.s3_discover.version
     s3_yaml = (default_config_dir() / "prompts" / "s3_discover.yaml").read_text(
         encoding="utf-8"
     )
     art.write_config_override(
         "prompts/s3_discover.yaml",
-        s3_yaml.replace('version: "1.0.0"', 'version: "1.1.0"', 1),
+        s3_yaml.replace(f'version: "{base_s3_ver}"', f'version: "{base_s3_ver}-ov"', 1),
         reason="tweak_s3_prompt",
     )
 
     mgr_ov = ConfigManager(workspace_dir=ws)
-    assert mgr_ov.labels.version == 2
+    assert mgr_ov.labels.version == bumped_label_ver
     assert mgr_ov.s1_cache_basis("pick_and_place") == s1_0
     assert mgr_ov.s2_cache_basis("pick_and_place") == s2_0
     assert mgr_ov.s5_cache_basis("pick_and_place") == s5_0
@@ -377,3 +380,94 @@ def test_backward_compatible_input_aliases() -> None:
         }
     )
     assert lbl_both.name == "Primary Name"
+
+
+def test_default_yaml_pure_vlm_keys_and_provider_cache_isolation(tmp_path: Path) -> None:
+    import yaml
+
+    cfg_oai = ConfigManager()
+    vlm = cfg_oai.settings["vlm"]
+
+    # Preserved OSS OpenAI defaults
+    assert cfg_oai.vlm_provider() == "openai_compat"
+    assert vlm["provider"] == "openai_compat"
+    assert vlm["base_url"] == "https://api.openai.com/v1"
+    assert vlm["api_key_env"] == "OPENAI_API_KEY"
+    assert vlm["key_file"] == ".env"
+    assert vlm["thinking_mode"] == "auto"
+    for stage in ("s1_grounding", "s2_macro", "s3_discover", "s4_verify", "s5_success"):
+        assert cfg_oai.stage_model(stage) == "gpt-4o"
+        assert vlm[stage]["thinking"] is False
+
+    # Pure VLM resilience, pricing, and stage tuning keys
+    assert vlm["gemini_media_resolution"] == "MEDIA_RESOLUTION_HIGH"
+    assert vlm["vision_min_tokens_per_image"] == 550
+    assert vlm["vision_blind_node_retries"] == 5
+    assert vlm["vision_blind_node_guard"] == "auto"
+    assert vlm["vision_blind_node_on_exhaust"] == "raise"
+    assert vlm["fallback_model"] is None
+    assert vlm["fallback_provider"] is None
+    assert vlm["circuit_breaker"] == {
+        "enabled": True,
+        "failure_threshold": 3,
+        "trip_on_quota_403": True,
+    }
+    assert set(vlm["pricing"].keys()) == {
+        "default",
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "qwen-vl-max",
+    }
+
+    assert vlm["s1_grounding"]["batch_size"] == 4
+    assert vlm["s1_grounding"]["batch_concurrency"] == 3
+    assert vlm["s1_grounding"]["reference_anchor_enabled"] is True
+    assert vlm["s1_grounding"]["tracking"]["track_width"] == 480
+    assert vlm["s3_discover"]["cell_w"] == 420
+    assert vlm["s3_discover"]["cell_h"] == 236
+    assert vlm["s3_discover"]["quality"] == 76
+    assert vlm["s4_verify"]["boundary_idle_kin_skip_s4b"] is True
+    assert vlm["s5_success"]["tail_s"] == 12.0
+    assert vlm["s5_success"]["tail_ratio"] == 0.22
+    assert vlm["s5_success"]["max_tail_s"] == 25.0
+    assert vlm["s5_success"]["body_frames"] == 6
+    assert vlm["s5_success"]["tail_frames"] == 10
+    assert vlm["s5_success"]["control_frames"] == 8
+    assert vlm["s5_success"]["cell_w"] == 420
+    assert vlm["s5_success"]["cell_h"] == 236
+    assert vlm["s5_success"]["quality"] == 78
+    assert vlm["s5_success"]["start_end_compare"] is True
+    assert vlm["s5_success"]["compare_panel_w"] == 640
+    assert vlm["s5_success"]["compare_panel_h"] == 360
+
+    # Non-OSS subsystem keys must stay excluded
+    assert "same_task_accel" not in vlm
+    assert "ingest_qc" not in cfg_oai.settings
+    assert "preview" not in cfg_oai.settings["io"]
+    assert "tri_color" not in cfg_oai.settings["review"]
+
+    # Provider isolation in model_routing_sha256 and all s1..s5 cache bases (even with identical models)
+    ws_gem = tmp_path / "ws_gem"
+    (ws_gem / "configs_override").mkdir(parents=True, exist_ok=True)
+    (ws_gem / "configs_override" / "default.yaml").write_text(
+        yaml.safe_dump({"vlm": {"provider": "gemini"}}),
+        encoding="utf-8",
+    )
+    cfg_gem = ConfigManager(workspace_dir=ws_gem)
+    assert cfg_gem.vlm_provider() == "gemini"
+    assert cfg_gem.fingerprints.model_routing_sha256 != cfg_oai.fingerprints.model_routing_sha256
+    for fn_name in (
+        "s1_cache_basis",
+        "s2_cache_basis",
+        "s3_cache_basis",
+        "s4_cache_basis",
+        "s5_cache_basis",
+    ):
+        b_oai = getattr(cfg_oai, fn_name)("pick_and_place")
+        b_gem = getattr(cfg_gem, fn_name)("pick_and_place")
+        b_ov = getattr(cfg_oai, fn_name)("pick_and_place", model_override="gpt-4o-mini")
+        assert b_oai != b_gem, f"{fn_name} must isolate provider"
+        assert b_oai != b_ov, f"{fn_name} must isolate model_override"
+
