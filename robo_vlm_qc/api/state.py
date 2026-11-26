@@ -158,6 +158,10 @@ class AppState:
         with self._jobs_lock:
             return job_id in self._active_jobs
 
+    def active_job_control_ids(self) -> list[str]:
+        with self._jobs_lock:
+            return list(self._active_jobs.keys())
+
     def add_job_cancel_callback(
         self, job_id: str, callback: Callable[[], None]
     ) -> None:

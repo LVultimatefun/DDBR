@@ -1583,6 +1583,138 @@ class Repository:
         )
         return int(row["cnt"]) if row is not None else 0
 
+    def count_jobs_by_status(
+        self,
+        *,
+        job_type: str | None = None,
+    ) -> dict[str, int]:
+        counts = {
+            "queued": 0,
+            "running": 0,
+            "completed": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+        clauses: list[str] = []
+        params: list[Any] = []
+        if job_type is not None:
+            clauses.append("job_type = ?")
+            params.append(job_type)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = (
+            self.db.connect()
+            .execute(
+                f"SELECT status, COUNT(*) AS cnt FROM jobs {where_sql} GROUP BY status",
+                params,
+            )
+            .fetchall()
+        )
+        for r in rows:
+            st = str(r["status"])
+            counts[st] = int(r["cnt"])
+        return counts
+
+    def delete_job(self, job_id: str) -> dict[str, Any]:
+        """Permanently remove a single terminal job record from SQLite (never touches disk artifacts)."""
+        terminal = ("completed", "failed", "cancelled")
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"Job not found: {job_id!r}")
+            st = str(row["status"])
+            if st not in terminal:
+                raise InvalidTransitionError(
+                    f"Cannot delete active job {job_id!r} with status {st!r}; cancel it first."
+                )
+            deleted = self._job_row_to_dict(row)
+            conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            return deleted
+
+    def delete_terminal_jobs(
+        self,
+        *,
+        statuses: Sequence[str] | None = None,
+        job_type: str | None = None,
+        exclude_job_ids: Sequence[str] | None = None,
+    ) -> list[str]:
+        """Permanently remove matching terminal job records from SQLite (never touches active jobs or disk artifacts)."""
+        allowed = {"completed", "failed", "cancelled"}
+        target_statuses = (
+            list(dict.fromkeys(str(s) for s in statuses))
+            if statuses is not None
+            else ["completed", "failed", "cancelled"]
+        )
+        if not target_statuses:
+            return []
+        invalid = [s for s in target_statuses if s not in allowed]
+        if invalid:
+            raise ValueError(
+                f"Only terminal job statuses {sorted(allowed)} may be deleted; got {invalid!r}"
+            )
+        excluded = set(str(j) for j in (exclude_job_ids or ()) if j)
+        with self.db.transaction() as conn:
+            placeholders = ", ".join("?" for _ in target_statuses)
+            clauses = [f"status IN ({placeholders})"]
+            params: list[Any] = list(target_statuses)
+            if job_type is not None:
+                clauses.append("job_type = ?")
+                params.append(job_type)
+            where_sql = " AND ".join(clauses)
+            rows = conn.execute(
+                f"SELECT job_id FROM jobs WHERE {where_sql} ORDER BY created_at DESC, rowid DESC",
+                params,
+            ).fetchall()
+            to_delete = [str(r["job_id"]) for r in rows if str(r["job_id"]) not in excluded]
+            if not to_delete:
+                return []
+            del_placeholders = ", ".join("?" for _ in to_delete)
+            conn.execute(f"DELETE FROM jobs WHERE job_id IN ({del_placeholders})", to_delete)
+            return to_delete
+
+    def recover_stale_active_jobs(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[list[dict[str, Any]], list[tuple[str, EpisodeStatus]]]:
+        """Reconcile orphaned queued/running jobs and transient VLM episode states after an abrupt server restart."""
+        ts_now = time.time() if now is None else float(now)
+        recovered_jobs: list[dict[str, Any]] = []
+        stale_ep_ids: list[str] = []
+        with self.db.transaction() as conn:
+            job_rows = conn.execute(
+                "SELECT * FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at ASC, rowid ASC"
+            ).fetchall()
+            for row in job_rows:
+                jid = str(row["job_id"])
+                raw_summary = row["summary_json"]
+                summary: dict[str, Any] = {}
+                if raw_summary:
+                    try:
+                        parsed = json.loads(raw_summary)
+                        if isinstance(parsed, dict):
+                            summary = parsed
+                    except Exception:
+                        summary = {}
+                summary.setdefault("error", "interrupted_by_server_restart")
+                conn.execute(
+                    "UPDATE jobs SET status = ?, summary_json = ?, updated_at = ? WHERE job_id = ?",
+                    ("failed", json.dumps(summary, ensure_ascii=False), ts_now, jid),
+                )
+                updated = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (jid,)).fetchone()
+                if updated is not None:
+                    recovered_jobs.append(self._job_row_to_dict(updated))
+
+            ep_rows = conn.execute(
+                "SELECT episode_id FROM episodes WHERE status IN (?, ?)",
+                (EpisodeStatus.VLM_QUEUED.value, EpisodeStatus.VLM_RUNNING.value),
+            ).fetchall()
+            stale_ep_ids = [str(r["episode_id"]) for r in ep_rows]
+
+        restored_episodes: list[tuple[str, EpisodeStatus]] = []
+        if stale_ep_ids:
+            restored_episodes = self.restore_vlm_episodes_on_cancel(stale_ep_ids)
+        return recovered_jobs, restored_episodes
+
     def update_job(
         self,
         job_id: str,

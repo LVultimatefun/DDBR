@@ -81,6 +81,7 @@ def create_app(
     web_dist_dir: Path | None = None,
     allowed_data_roots: Sequence[Path | str] | None = None,
     cors_origins: Sequence[str] | None = None,
+    recover_stale_jobs: bool = False,
 ) -> FastAPI:
     ws_path = Path(workspace).resolve()
     ws_path.mkdir(parents=True, exist_ok=True)
@@ -117,6 +118,9 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        if recover_stale_jobs:
+            with contextlib.suppress(Exception):
+                repo.recover_stale_active_jobs()
         try:
             yield
         finally:

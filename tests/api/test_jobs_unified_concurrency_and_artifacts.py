@@ -776,3 +776,167 @@ def test_batch_vlm_s1_only_rerun_refreshes_grounding_and_reuses_s2_s5_cache(
         assert row_rev["active_run_id"] == rev_run_before
     finally:
         repo_after.close()
+
+
+def test_job_delete_batch_clear_sse_artifact_preservation_and_startup_recovery(
+    api_env: dict[str, Any],
+) -> None:
+    """Lead can delete terminal job records (single & batch DB-wide), active jobs return 409,
+    disk artifacts remain untouched, SSE broadcasts jobs_deleted, and startup recovers stale jobs."""
+    from fastapi.testclient import TestClient
+    from robo_vlm_qc.api import create_app
+
+    ws: Path = api_env["workspace"]
+    cfg_dir: Path = api_env["config_dir"]
+    ds_dir = api_env["data_root"] / "ds_job_del"
+    create_video_episode_file(ds_dir, "ep0.mp4", duration_s=1.5)
+    create_video_episode_file(ds_dir, "ep1.mp4", duration_s=1.5)
+    repo_init = Repository(ws)
+    try:
+        ingest_dir(repo_init, cfg_dir, ws, ds_dir, dataset="ds_job_del")
+    finally:
+        repo_init.close()
+
+    # Create a real dummy artifact file on disk to prove deletion NEVER removes disk files
+    artifact_file = ws / "exports" / "viz_mp4" / "keep_me.mp4"
+    artifact_file.parent.mkdir(parents=True, exist_ok=True)
+    artifact_file.write_bytes(b"fake-mp4-payload")
+
+    repo = Repository(ws)
+    try:
+        j_done = repo.create_job(
+            "render_mp4",
+            {"episode_ids": ["ds/ep0"]},
+            progress_total=1,
+            job_id="job_del_done",
+            status="completed",
+        )
+        repo.update_job(
+            j_done["job_id"],
+            progress_done=1,
+            summary={"artifacts": [{"name": "keep_me.mp4", "path": "exports/viz_mp4/keep_me.mp4", "kind": "mp4"}]},
+        )
+        repo.create_job("batch_vlm", {}, job_id="job_del_fail", status="failed")
+        repo.create_job("batch_vlm", {}, job_id="job_del_cancel", status="cancelled")
+        repo.create_job("batch_vlm", {}, job_id="job_del_running", status="running")
+        repo.create_job("batch_vlm", {}, job_id="job_del_queued", status="queued")
+        # Add 22 extra completed jobs so total exceeds drawer limit=20
+        for idx in range(22):
+            repo.create_job("export", {}, job_id=f"job_bulk_done_{idx:02d}", status="completed")
+    finally:
+        repo.close()
+
+    with make_client(ws, cfg_dir) as client:
+        seq0 = client.app.state.ctx.sse.latest_seq()  # type: ignore[attr-defined]
+
+        # 1. GET /api/jobs returns exact DB-wide status_counts even with limit=20
+        r_list = client.get("/api/jobs?limit=20", headers=LEAD_HEADERS)
+        assert r_list.status_code == 200
+        body = r_list.json()
+        assert len(body["items"]) == 20
+        assert body["total"] == 27
+        assert body["status_counts"] == {
+            "queued": 1,
+            "running": 1,
+            "completed": 23,
+            "failed": 1,
+            "cancelled": 1,
+        }
+
+        # 2. Reviewer receives 403 on DELETE single & batch
+        assert client.delete("/api/jobs/job_del_done", headers=REV_HEADERS).status_code == 403
+        assert client.delete("/api/jobs?scope=finished", headers=REV_HEADERS).status_code == 403
+
+        # 3. Missing job -> 404; active queued/running jobs -> 409 Conflict
+        assert client.delete("/api/jobs/job_nonexistent", headers=LEAD_HEADERS).status_code == 404
+        assert client.delete("/api/jobs/job_del_running", headers=LEAD_HEADERS).status_code == 409
+        assert client.delete("/api/jobs/job_del_queued", headers=LEAD_HEADERS).status_code == 409
+
+        # 4. Single delete on completed job succeeds, preserves disk artifact, emits SSE jobs_deleted
+        r_del_one = client.delete("/api/jobs/job_del_done", headers=LEAD_HEADERS)
+        assert r_del_one.status_code == 200
+        d1 = r_del_one.json()
+        assert d1["deleted"] == 1
+        assert d1["job_ids"] == ["job_del_done"]
+        assert d1["status_counts"]["completed"] == 22
+        assert artifact_file.is_file()
+        assert client.get("/api/jobs/job_del_done", headers=LEAD_HEADERS).status_code == 404
+
+        # 5. Batch clear failed_cancelled deletes ONLY failed & cancelled
+        r_del_fc = client.delete("/api/jobs?scope=failed_cancelled", headers=LEAD_HEADERS)
+        assert r_del_fc.status_code == 200
+        dfc = r_del_fc.json()
+        assert dfc["deleted"] == 2
+        assert set(dfc["job_ids"]) == {"job_del_fail", "job_del_cancel"}
+        assert dfc["status_counts"]["completed"] == 22
+        assert dfc["status_counts"]["failed"] == 0
+        assert dfc["status_counts"]["cancelled"] == 0
+        assert dfc["status_counts"]["running"] == 1
+        assert dfc["status_counts"]["queued"] == 1
+
+        # 6. Batch clear finished deletes ALL 22 remaining completed jobs across DB (> limit=20)
+        #    while preserving active queued & running jobs
+        r_del_fin = client.delete("/api/jobs?scope=finished", headers=LEAD_HEADERS)
+        assert r_del_fin.status_code == 200
+        dfin = r_del_fin.json()
+        assert dfin["deleted"] == 22
+        assert dfin["status_counts"] == {
+            "queued": 1,
+            "running": 1,
+            "completed": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+
+        # Verify SSE jobs_deleted events were broadcast
+        _, events = client.app.state.ctx.sse.since(seq0)  # type: ignore[attr-defined]
+        del_events = [ev for ev in events if ev.get("type") == "jobs_deleted"]
+        assert len(del_events) == 3
+        assert del_events[0]["job_ids"] == ["job_del_done"]
+        assert del_events[1]["scope"] == "failed_cancelled"
+        assert del_events[2]["scope"] == "finished"
+
+    # 7. Startup stale-job recovery (recover_stale_jobs=True): converts crashed queued/running
+    #    jobs to failed (interrupted_by_server_restart) and rolls back stuck VLM episodes
+    repo_crash = Repository(ws)
+    try:
+        eps = [r["episode_id"] for r in repo_crash.list_episodes(limit=10)]
+        ep_ing, ep_rdy = eps[0], eps[1]
+        repo_crash.transition_status(ep_ing, EpisodeStatus.VLM_QUEUED)
+        # Give ep_rdy an existing active_run_id so rollback restores VLM_READY
+        repo_crash.transition_status(ep_rdy, EpisodeStatus.VLM_RUNNING)
+        with repo_crash.db.transaction() as conn:
+            conn.execute(
+                "UPDATE episodes SET active_run_id = ? WHERE episode_id = ?",
+                ("run_prev_1", ep_rdy),
+            )
+    finally:
+        repo_crash.close()
+
+    app_recovered = create_app(
+        workspace=ws,
+        config_dir=cfg_dir,
+        reviewer_token=REV_HEADERS["X-Auth-Token"],
+        lead_token=LEAD_HEADERS["X-Auth-Token"],
+        recover_stale_jobs=True,
+    )
+    with TestClient(app_recovered) as rec_client:
+        j_run = rec_client.get("/api/jobs/job_del_running", headers=LEAD_HEADERS).json()
+        j_que = rec_client.get("/api/jobs/job_del_queued", headers=LEAD_HEADERS).json()
+        assert j_run["status"] == "failed"
+        assert j_run["summary"]["error"] == "interrupted_by_server_restart"
+        assert j_que["status"] == "failed"
+        assert j_que["summary"]["error"] == "interrupted_by_server_restart"
+
+        ep_rows = {
+            r["episode_id"]: r["status"]
+            for r in rec_client.get("/api/episodes", headers=LEAD_HEADERS).json()["items"]
+        }
+        assert ep_rows[ep_ing] == EpisodeStatus.INGESTED.value
+        assert ep_rows[ep_rdy] == EpisodeStatus.VLM_READY.value
+
+        # Recovered jobs can now be cleanly deleted
+        r_cleanup = rec_client.delete("/api/jobs?scope=finished", headers=LEAD_HEADERS)
+        assert r_cleanup.status_code == 200
+        assert r_cleanup.json()["deleted"] == 2
+        assert artifact_file.is_file()

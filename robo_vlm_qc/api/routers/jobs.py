@@ -25,7 +25,7 @@ from ...io import auto_detect, get_adapter
 from ...io.base import validate_id_part
 from ...lab.eval_runner import run_gt_eval
 from ...models.review import EpisodeStatus
-from ...store import NotFoundError
+from ...store import InvalidTransitionError, NotFoundError
 from ...vlm import VlmDag
 from ...vlm.client import VlmCancelledError, VlmClient, normalize_stage_name
 from ..auth import AuthContext, get_app_state, require_auth, require_lead
@@ -648,7 +648,46 @@ def list_jobs(
         status=status_filter,
         job_type=job_type,
     )
-    return {"items": items, "total": total}
+    status_counts = state.repo.count_jobs_by_status(job_type=job_type)
+    return {"items": items, "total": total, "status_counts": status_counts}
+
+
+@router.delete("/api/jobs")
+def clear_terminal_jobs(
+    scope: Literal["finished", "failed_cancelled"] = Query(default="finished"),
+    job_type: str | None = Query(default=None),
+    auth: AuthContext = Depends(require_lead),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Clear terminal job records from SQLite (Lead-only; never touches active jobs or disk artifacts)."""
+    _ = auth
+    target_statuses = (
+        ("completed", "failed", "cancelled")
+        if scope == "finished"
+        else ("failed", "cancelled")
+    )
+    active_control_ids = state.active_job_control_ids()
+    deleted_ids = state.repo.delete_terminal_jobs(
+        statuses=target_statuses,
+        job_type=job_type,
+        exclude_job_ids=active_control_ids,
+    )
+    status_counts = state.repo.count_jobs_by_status(job_type=job_type)
+    if deleted_ids:
+        state.sse.publish(
+            {
+                "type": "jobs_deleted",
+                "job_ids": deleted_ids,
+                "scope": scope,
+                "status_counts": status_counts,
+            }
+        )
+    return {
+        "deleted": len(deleted_ids),
+        "job_ids": deleted_ids,
+        "scope": scope,
+        "status_counts": status_counts,
+    }
 
 
 @router.post("/api/jobs", status_code=status.HTTP_201_CREATED)
@@ -931,6 +970,43 @@ def get_job(
         return state.repo.get_job(job_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/api/jobs/{job_id}")
+def delete_job(
+    job_id: str,
+    auth: AuthContext = Depends(require_lead),
+    state: AppState = Depends(get_app_state),
+) -> dict[str, Any]:
+    """Delete a single terminal job record from SQLite (Lead-only; never deletes disk artifacts)."""
+    _ = auth
+    if state.has_job_control(job_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete active job {job_id!r} while execution is in progress; cancel it first.",
+        )
+    try:
+        state.repo.delete_job(job_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidTransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    status_counts = state.repo.count_jobs_by_status()
+    state.sse.publish(
+        {
+            "type": "jobs_deleted",
+            "job_ids": [job_id],
+            "scope": "single",
+            "status_counts": status_counts,
+        }
+    )
+    return {
+        "deleted": 1,
+        "job_ids": [job_id],
+        "scope": "single",
+        "status_counts": status_counts,
+    }
 
 
 @router.post("/api/jobs/{job_id}/cancel")

@@ -829,6 +829,7 @@ def serve_cmd(
         no_auth=no_auth,
         allowed_data_roots=([Path(p) for p in allowed_data_roots] if allowed_data_roots else None),
         cors_origins=(list(cors_origins) if cors_origins else None),
+        recover_stale_jobs=True,
     )
     uvicorn.run(app, host=host, port=port)
 
