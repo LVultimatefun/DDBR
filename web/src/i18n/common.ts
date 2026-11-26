@@ -452,6 +452,16 @@ export const commonEn = {
   "jobs.evalPrefix": "Eval: {id}",
   "jobs.evalMetrics": " · F1 {f1} · Cache {cache}%",
   "jobs.perItemDetails": "Per-item details (succeeded {ok} · failed {failed})",
+  "jobs.delete": "Delete",
+  "jobs.deleting": "Deleting...",
+  "jobs.clearFinished": "Clear Finished ({count})",
+  "jobs.clearFailedCancelled": "Clear Failed / Cancelled ({count})",
+  "jobs.confirmDeleteSingle": "Delete job record {id}?",
+  "jobs.confirmClearFinished": "Delete all {count} finished job record(s) (completed / failed / cancelled) in this workspace?",
+  "jobs.confirmClearFailedCancelled": "Delete all {count} failed / cancelled job record(s) in this workspace?",
+  "jobs.deleteSafetyNote": "Only SQLite job history records are deleted. VLM annotations, human reviews, exported datasets, and eval reports on disk remain untouched.",
+  "jobs.confirmDeleteBtn": "Confirm Delete",
+  "jobs.interruptedByRestart": "Interrupted by server restart (episodes reverted safely).",
 } as const;
 
 export const commonZh: Record<keyof typeof commonEn, string> = {
@@ -891,4 +901,14 @@ export const commonZh: Record<keyof typeof commonEn, string> = {
   "jobs.evalPrefix": "评测：{id}",
   "jobs.evalMetrics": " · F1 {f1} · 缓存命中 {cache}%",
   "jobs.perItemDetails": "逐项明细（成功 {ok} · 失败 {failed}）",
+  "jobs.delete": "删除记录",
+  "jobs.deleting": "删除中...",
+  "jobs.clearFinished": "清理全部已终结 ({count})",
+  "jobs.clearFailedCancelled": "仅清理失败/已取消 ({count})",
+  "jobs.confirmDeleteSingle": "确认删除任务记录 {id}？",
+  "jobs.confirmClearFinished": "确认删除当前工作区全部 {count} 条已终结（已完成 / 失败 / 已取消）的任务记录？",
+  "jobs.confirmClearFailedCancelled": "确认删除当前工作区全部 {count} 条失败 / 已取消的任务记录？",
+  "jobs.deleteSafetyNote": "仅删除 SQLite 中的任务流水记录，不会删除磁盘上的 VLM 标注、人工审阅、导出数据包或评测报告。",
+  "jobs.confirmDeleteBtn": "确认删除",
+  "jobs.interruptedByRestart": "因服务重启中断（受影响的轨迹状态已安全回滚）。",
 };

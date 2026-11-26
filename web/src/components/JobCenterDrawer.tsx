@@ -1,17 +1,33 @@
 import React, { useEffect, useState } from "react";
-import { Activity, Download, RefreshCw, X, XCircle } from "lucide-react";
+import { Activity, AlertTriangle, Download, RefreshCw, Trash2, X, XCircle } from "lucide-react";
 import { exportDownloadUrl } from "../api/client";
-import type { JobStatus } from "../api/types";
+import type { JobClearScope, JobStatus } from "../api/types";
 import { useAuth } from "../stores/authStore";
 import { useI18n } from "../stores/i18nStore";
 import { useJobs } from "../stores/jobStore";
 
+type PendingDeleteTarget =
+  | { kind: "single"; jobId: string }
+  | { kind: "batch"; scope: JobClearScope; count: number };
+
 export const JobCenterDrawer: React.FC = () => {
   const { isLead, token } = useAuth();
   const { t } = useI18n();
-  const { jobs, drawerOpen, setDrawerOpen, refreshJobs, cancelJob, artifactDownloadUrl } =
-    useJobs();
+  const {
+    jobs,
+    totalJobs,
+    statusCounts,
+    drawerOpen,
+    setDrawerOpen,
+    refreshJobs,
+    cancelJob,
+    deleteJob,
+    clearJobs,
+    artifactDownloadUrl,
+  } = useJobs();
   const [cancellingIds, setCancellingIds] = useState<Record<string, boolean>>({});
+  const [pendingDelete, setPendingDelete] = useState<PendingDeleteTarget | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const formatJobStatusLabel = (status: JobStatus["status"]): string => {
     switch (status) {
@@ -44,16 +60,45 @@ export const JobCenterDrawer: React.FC = () => {
     }
   };
 
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
+    try {
+      if (pendingDelete.kind === "single") {
+        await deleteJob(pendingDelete.jobId);
+      } else {
+        await clearJobs(pendingDelete.scope);
+      }
+      setPendingDelete(null);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   useEffect(() => {
-    if (!drawerOpen) return;
+    if (!drawerOpen) {
+      setPendingDelete(null);
+      return;
+    }
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setDrawerOpen(false);
+      if (e.key === "Escape") {
+        if (pendingDelete) {
+          setPendingDelete(null);
+        } else {
+          setDrawerOpen(false);
+        }
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [drawerOpen, setDrawerOpen]);
+  }, [drawerOpen, pendingDelete, setDrawerOpen]);
 
   if (!isLead || !drawerOpen) return null;
+
+  const finishedCount =
+    statusCounts.completed + statusCounts.failed + statusCounts.cancelled;
+  const failedCancelledCount = statusCounts.failed + statusCounts.cancelled;
+  const displayTotal = Math.max(totalJobs, jobs.length);
 
   return (
     <div
@@ -66,7 +111,7 @@ export const JobCenterDrawer: React.FC = () => {
       <aside className="drawer-panel" data-testid="job-center-drawer" aria-label={t("jobs.drawerAria")}>
         <div className="drawer-header">
           <h3>
-            <Activity size={16} /> {t("jobs.drawerTitle", { count: jobs.length })}
+            <Activity size={16} /> {t("jobs.drawerTitle", { count: displayTotal })}
           </h3>
           <div className="header-actions">
             <button
@@ -88,6 +133,82 @@ export const JobCenterDrawer: React.FC = () => {
             </button>
           </div>
         </div>
+
+        {finishedCount > 0 && (
+          <div className="job-drawer-toolbar" data-testid="job-drawer-cleanup-bar">
+            <button
+              type="button"
+              className="secondary-btn compact"
+              disabled={deleting}
+              data-testid="clear-finished-jobs-btn"
+              onClick={() =>
+                setPendingDelete({
+                  kind: "batch",
+                  scope: "finished",
+                  count: finishedCount,
+                })
+              }
+            >
+              <Trash2 size={12} /> {t("jobs.clearFinished", { count: finishedCount })}
+            </button>
+            {failedCancelledCount > 0 && (
+              <button
+                type="button"
+                className="secondary-btn compact"
+                disabled={deleting}
+                data-testid="clear-failed-jobs-btn"
+                onClick={() =>
+                  setPendingDelete({
+                    kind: "batch",
+                    scope: "failed_cancelled",
+                    count: failedCancelledCount,
+                  })
+                }
+              >
+                <Trash2 size={12} />{" "}
+                {t("jobs.clearFailedCancelled", { count: failedCancelledCount })}
+              </button>
+            )}
+          </div>
+        )}
+
+        {pendingDelete && (
+          <div className="job-confirm-box" role="alertdialog" data-testid="job-delete-confirm-box">
+            <div className="job-confirm-title">
+              <AlertTriangle size={14} />
+              <span>
+                {pendingDelete.kind === "single"
+                  ? t("jobs.confirmDeleteSingle", { id: pendingDelete.jobId })
+                  : pendingDelete.scope === "finished"
+                    ? t("jobs.confirmClearFinished", { count: pendingDelete.count })
+                    : t("jobs.confirmClearFailedCancelled", { count: pendingDelete.count })}
+              </span>
+            </div>
+            <p className="small muted" style={{ margin: 0 }}>
+              {t("jobs.deleteSafetyNote")}
+            </p>
+            <div className="header-actions" style={{ justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                className="secondary-btn compact"
+                disabled={deleting}
+                data-testid="cancel-delete-jobs-btn"
+                onClick={() => setPendingDelete(null)}
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="button"
+                className="danger-btn compact"
+                disabled={deleting}
+                data-testid="confirm-delete-jobs-btn"
+                onClick={() => void handleConfirmDelete()}
+              >
+                <Trash2 size={12} /> {deleting ? t("jobs.deleting") : t("jobs.confirmDeleteBtn")}
+              </button>
+            </div>
+          </div>
+        )}
 
         <div className="drawer-body">
           {jobs.length === 0 ? (
@@ -139,7 +260,7 @@ export const JobCenterDrawer: React.FC = () => {
                       {t("jobs.progress", { done, total, pct })}
                     </span>
                     <div className="header-actions">
-                      {isActive && (
+                      {isActive ? (
                         <button
                           type="button"
                           className="danger-btn compact"
@@ -149,6 +270,18 @@ export const JobCenterDrawer: React.FC = () => {
                         >
                           <XCircle size={12} />{" "}
                           {cancellingIds[job.job_id] ? t("jobs.cancelling") : t("common.cancel")}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="mini-btn"
+                          disabled={deleting}
+                          data-testid={`drawer-delete-job-${job.job_id}`}
+                          onClick={() =>
+                            setPendingDelete({ kind: "single", jobId: job.job_id })
+                          }
+                        >
+                          <Trash2 size={12} /> {t("jobs.delete")}
                         </button>
                       )}
                       {job.status === "completed" &&
@@ -178,6 +311,10 @@ export const JobCenterDrawer: React.FC = () => {
                       )}
                     </div>
                   </div>
+
+                  {job.summary?.error === "interrupted_by_server_restart" && (
+                    <div className="small muted">{t("jobs.interruptedByRestart")}</div>
+                  )}
 
                   {job.job_type === "ingest" &&
                     typeof job.summary?.discovered === "number" && (

@@ -557,6 +557,35 @@ textarea {
   gap: 8px;
 }
 
+.job-drawer-toolbar {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.job-confirm-box {
+  margin: 12px 16px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--warn-border, #f59e0b);
+  background: var(--warn-bg, rgba(245, 158, 11, 0.1));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.job-confirm-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .drawer-body {
   flex: 1;
   overflow-y: auto;

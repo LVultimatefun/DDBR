@@ -7,6 +7,7 @@ import type {
   CheckSpliceRequest,
   CheckSpliceResponse,
   CreateJobRequest,
+  DeleteJobsResponse,
   DiagnosisReport,
   EpisodeFacets,
   EpisodeListItem,
@@ -27,8 +28,10 @@ import type {
   InferSubtasksRequest,
   InferSubtasksResponse,
   IngestBrowseResponse,
+  JobClearScope,
   JobRunStatus,
   JobStatus,
+  JobStatusCounts,
   JobType,
   LabHistoryDiffResponse,
   LabHistoryItem,
@@ -452,7 +455,7 @@ export async function listJobs(params?: {
   job_type?: JobType | string;
   limit?: number;
   offset?: number;
-}): Promise<{ items: JobStatus[]; total: number }> {
+}): Promise<{ items: JobStatus[]; total: number; status_counts?: JobStatusCounts }> {
   const qs = new URLSearchParams();
   if (params?.status) qs.set("status", params.status);
   if (params?.job_type) qs.set("job_type", params.job_type);
@@ -461,11 +464,13 @@ export async function listJobs(params?: {
   const q = qs.toString();
   const data = await apiFetch<unknown>(`/api/jobs${q ? `?${q}` : ""}`);
   const items = unwrapItems<JobStatus>(data);
-  const total =
-    data && typeof data === "object" && typeof (data as Record<string, unknown>).total === "number"
-      ? ((data as Record<string, unknown>).total as number)
-      : items.length;
-  return { items, total };
+  const rec = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+  const total = rec && typeof rec.total === "number" ? (rec.total as number) : items.length;
+  const status_counts =
+    rec && rec.status_counts && typeof rec.status_counts === "object"
+      ? (rec.status_counts as JobStatusCounts)
+      : undefined;
+  return { items, total, status_counts };
 }
 
 export async function getJob(jobId: string): Promise<JobStatus> {
@@ -475,6 +480,23 @@ export async function getJob(jobId: string): Promise<JobStatus> {
 export async function cancelJob(jobId: string): Promise<JobStatus> {
   return apiFetch<JobStatus>(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
     method: "POST",
+  });
+}
+
+export async function deleteJob(jobId: string): Promise<DeleteJobsResponse> {
+  return apiFetch<DeleteJobsResponse>(`/api/jobs/${encodeURIComponent(jobId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function clearTerminalJobs(
+  scope: JobClearScope = "finished",
+  jobType?: JobType | string,
+): Promise<DeleteJobsResponse> {
+  const qs = new URLSearchParams({ scope });
+  if (jobType) qs.set("job_type", jobType);
+  return apiFetch<DeleteJobsResponse>(`/api/jobs?${qs.toString()}`, {
+    method: "DELETE",
   });
 }
 

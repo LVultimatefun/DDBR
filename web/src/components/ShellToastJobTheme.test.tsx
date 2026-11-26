@@ -349,4 +349,172 @@ describe("Shell, Theme, Toast, Live Job Pill & JobCenterDrawer", () => {
     expect(window.localStorage.getItem("robo_vlm_qc.locale")).toBe("en");
     expect(screen.getByTestId("nav-export")).toHaveTextContent("Export Studio");
   });
+
+  it("requires manual confirmation to delete terminal job records, clears DB-wide terminal jobs, and syncs SSE jobs_deleted", async () => {
+    const instances: Array<{
+      url: string;
+      onmessage: ((evt: MessageEvent) => void) | null;
+      close: () => void;
+    }> = [];
+    class MockEventSource {
+      url: string;
+      onopen: (() => void) | null = null;
+      onmessage: ((evt: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      close = vi.fn();
+      constructor(url: string) {
+        this.url = url;
+        instances.push(this);
+      }
+    }
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    const runningJob = makeJobStatus({
+      job_id: "job_active_1",
+      job_type: "batch_vlm",
+      status: "running",
+      progress_done: 1,
+      progress_total: 3,
+    });
+    const completedJob = makeJobStatus({
+      job_id: "job_done_1",
+      job_type: "export",
+      status: "completed",
+      progress_done: 1,
+      progress_total: 1,
+    });
+    const failedJob = makeJobStatus({
+      job_id: "job_fail_1",
+      job_type: "batch_vlm",
+      status: "failed",
+      progress_done: 0,
+      progress_total: 2,
+      summary: { error: "interrupted_by_server_restart" },
+    });
+
+    let currentItems = [runningJob, completedJob, failedJob];
+    let currentCounts = { queued: 0, running: 1, completed: 18, failed: 5, cancelled: 2 };
+    const deleteCalls: Array<{ url: string; method: string }> = [];
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (method === "DELETE" && url === "/api/jobs/job_done_1") {
+          deleteCalls.push({ url, method });
+          currentItems = currentItems.filter((j) => j.job_id !== "job_done_1");
+          currentCounts = { ...currentCounts, completed: currentCounts.completed - 1 };
+          return new Response(
+            JSON.stringify({
+              deleted: 1,
+              job_ids: ["job_done_1"],
+              scope: "single",
+              status_counts: currentCounts,
+            }),
+            { status: 200 },
+          );
+        }
+        if (method === "DELETE" && url.startsWith("/api/jobs?scope=failed_cancelled")) {
+          deleteCalls.push({ url, method });
+          currentItems = currentItems.filter(
+            (j) => j.status !== "failed" && j.status !== "cancelled",
+          );
+          const cleared = currentCounts.failed + currentCounts.cancelled;
+          currentCounts = { ...currentCounts, failed: 0, cancelled: 0 };
+          return new Response(
+            JSON.stringify({
+              deleted: cleared,
+              job_ids: ["job_fail_1"],
+              scope: "failed_cancelled",
+              status_counts: currentCounts,
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.startsWith("/api/jobs")) {
+          const total =
+            currentCounts.queued +
+            currentCounts.running +
+            currentCounts.completed +
+            currentCounts.failed +
+            currentCounts.cancelled;
+          return new Response(
+            JSON.stringify({
+              items: currentItems,
+              total,
+              status_counts: currentCounts,
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+      }),
+    );
+
+    render(
+      <AuthProvider initialAuth={{ token: "lead-token", username: "lead_1", role: "lead" }}>
+        <MemoryRouter initialEntries={["/"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    const pill = await screen.findByTestId("live-job-pill");
+    fireEvent.click(pill);
+    const drawer = await screen.findByTestId("job-center-drawer");
+
+    // Drawer shows DB-wide finished count (18+5+2=25) & failed/cancelled count (7)
+    expect(screen.getByTestId("clear-finished-jobs-btn")).toHaveTextContent("Clear Finished (25)");
+    expect(screen.getByTestId("clear-failed-jobs-btn")).toHaveTextContent(
+      "Clear Failed / Cancelled (7)",
+    );
+    expect(drawer).toHaveTextContent("Interrupted by server restart");
+
+    // Active running job has NO delete button; terminal jobs DO
+    expect(screen.queryByTestId("drawer-delete-job-job_active_1")).toBeNull();
+    expect(screen.getByTestId("drawer-delete-job-job_done_1")).toBeInTheDocument();
+
+    // Clicking single delete requires manual confirmation (cancel does NOT delete)
+    fireEvent.click(screen.getByTestId("drawer-delete-job-job_done_1"));
+    const confirmBox = await screen.findByTestId("job-delete-confirm-box");
+    expect(confirmBox).toHaveTextContent("job_done_1");
+    expect(confirmBox).toHaveTextContent("Only SQLite job history records are deleted");
+    fireEvent.click(screen.getByTestId("cancel-delete-jobs-btn"));
+    expect(screen.queryByTestId("job-delete-confirm-box")).toBeNull();
+    expect(deleteCalls).toHaveLength(0);
+
+    // Confirming single delete calls DELETE /api/jobs/job_done_1 and removes the card
+    fireEvent.click(screen.getByTestId("drawer-delete-job-job_done_1"));
+    fireEvent.click(await screen.findByTestId("confirm-delete-jobs-btn"));
+    await waitFor(() => expect(deleteCalls).toHaveLength(1));
+    await waitFor(() => expect(screen.queryByTestId("drawer-job-job_done_1")).toBeNull());
+    expect(screen.getByTestId("clear-finished-jobs-btn")).toHaveTextContent("Clear Finished (24)");
+
+    // Clicking batch Clear Failed / Cancelled requires manual confirmation with exact count 7
+    fireEvent.click(screen.getByTestId("clear-failed-jobs-btn"));
+    const batchBox = await screen.findByTestId("job-delete-confirm-box");
+    expect(batchBox).toHaveTextContent("7");
+    fireEvent.click(screen.getByTestId("confirm-delete-jobs-btn"));
+    await waitFor(() => expect(deleteCalls).toHaveLength(2));
+    await waitFor(() => expect(screen.queryByTestId("drawer-job-job_fail_1")).toBeNull());
+    expect(screen.getByTestId("drawer-job-job_active_1")).toBeInTheDocument();
+
+    // SSE jobs_deleted from another tab updates counts/list immediately
+    const eventStreams = instances.filter((es) => es.url.includes("/api/events"));
+    expect(eventStreams.length).toBeGreaterThanOrEqual(1);
+    act(() => {
+      for (const es of eventStreams) {
+        es.onmessage?.({
+          data: JSON.stringify({
+            type: "jobs_deleted",
+            job_ids: ["job_active_1"],
+            scope: "single",
+            status_counts: { queued: 0, running: 0, completed: 0, failed: 0, cancelled: 0 },
+          }),
+        } as MessageEvent);
+      }
+    });
+    await waitFor(() => expect(screen.queryByTestId("drawer-job-job_active_1")).toBeNull());
+  });
 });

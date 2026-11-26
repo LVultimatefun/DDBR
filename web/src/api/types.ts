@@ -442,6 +442,22 @@ export interface ExportManifest {
 
 export type JobType = "batch_vlm" | "eval_gt" | "export" | "render_mp4" | "ingest";
 export type JobRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type JobClearScope = "finished" | "failed_cancelled";
+
+export interface JobStatusCounts {
+  queued: number;
+  running: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+}
+
+export interface DeleteJobsResponse {
+  deleted: number;
+  job_ids: string[];
+  scope?: string;
+  status_counts?: JobStatusCounts;
+}
 
 export interface JobArtifactItem {
   name: string;
@@ -455,6 +471,7 @@ export interface JobSummary {
   artifacts?: JobArtifactItem[];
   results?: Array<Record<string, unknown>>;
   errors?: Array<{ episode_id?: string; error?: string }>;
+  error?: string;
   eval_run_id?: string | null;
   eval_id?: string | null;
   report?: EvalRunReport | null;
